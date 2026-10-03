@@ -129,14 +129,22 @@ def is_pid_alive(pid: int | None) -> bool:
         return False
 
 
-def get_safe_pane_id(raw_id: str | None) -> str:
+def is_disabled() -> bool:
+    try:
+        return (get_state_dir() / "DISABLED").exists()
+    except Exception:
+        return False
+
+
+def get_hex_pane_id(raw_id: str | None) -> str:
     if not raw_id:
         return "default"
-    clean = re.sub(r'[^a-zA-Z0-9_-]', '_', str(raw_id))
-    return clean[:32] or "default"
+    return str(raw_id).encode("utf-8").hex()
 
 
 def touch_heartbeat():
+    if is_disabled():
+        return
     try:
         marker = get_state_dir() / "plugin-active"
         marker.touch(exist_ok=True)
@@ -154,13 +162,15 @@ def remove_heartbeat():
 
 
 def touch_pane_marker(pane_id: str):
-    if not pane_id:
+    if not pane_id or is_disabled():
         return
     try:
         panes_dir = get_state_dir() / "panes"
         panes_dir.mkdir(parents=True, exist_ok=True)
-        safe_id = get_safe_pane_id(pane_id)
-        (panes_dir / safe_id).touch(exist_ok=True)
+        hex_id = get_hex_pane_id(pane_id)
+        marker_path = panes_dir / hex_id
+        with open(marker_path, "w", encoding="utf-8") as f:
+            f.write(str(int(time.time())))
     except Exception:
         pass
 
@@ -169,8 +179,8 @@ def remove_pane_marker(pane_id: str):
     if not pane_id:
         return
     try:
-        safe_id = get_safe_pane_id(pane_id)
-        marker = get_state_dir() / "panes" / safe_id
+        hex_id = get_hex_pane_id(pane_id)
+        marker = get_state_dir() / "panes" / hex_id
         if marker.exists():
             marker.unlink()
     except Exception:
@@ -351,36 +361,54 @@ def normalize_pane_id(raw_pane_id: str, workspace_id: str | None) -> str:
     return f"{ws}:{raw_pane_id}"
 
 
-def claim_and_replay_spool(state_dir: Path, bridge_url: str | None = None):
-    spool_file = state_dir / "spool.jsonl"
-    if not spool_file.exists():
-        return
-    claimed_file = state_dir / f"spool.{os.getpid()}.claimed"
+def enqueue_spool(event_name: str, event_data: dict, context: dict):
     try:
-        os.rename(spool_file, claimed_file)
-    except FileNotFoundError:
-        return
+        spool_dir = get_state_dir() / "spool"
+        spool_dir.mkdir(parents=True, exist_ok=True)
+        envelope = {
+            "event_name": event_name,
+            "event_data": event_data,
+            "context": context,
+            "enqueued_at": time.time(),
+            "enqueued_ns": time.time_ns(),
+        }
+        filename = f"{time.time_ns()}_{os.getpid()}_{int(time.monotonic() * 1000)}.json"
+        tmp_file = spool_dir / f"{filename}.tmp"
+        final_file = spool_dir / filename
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(envelope, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, final_file)
     except Exception as e:
-        log_debug(f"Failed to claim spool: {e}")
-        return
+        log_debug(f"Failed to enqueue spool: {e}")
 
-    try:
-        with open(claimed_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    payload = json.loads(line)
-                    post_bartender_event(payload, bridge_url=bridge_url)
-                except Exception as e:
-                    log_debug(f"Failed to replay spooled event: {e}")
-    finally:
+
+def replay_spool_dir(state_dir: Path, bridge_url: str | None = None, max_batch: int = 20):
+    spool_dir = state_dir / "spool"
+    if not spool_dir.exists():
+        return
+    files = sorted(spool_dir.glob("*.json"))
+    for file_path in files[:max_batch]:
         try:
-            if claimed_file.exists():
-                claimed_file.unlink()
-        except Exception:
-            pass
+            with open(file_path, "r", encoding="utf-8") as f:
+                envelope = json.load(f)
+            ename = envelope.get("event_name", "")
+            edata = envelope.get("event_data", {})
+            econtext = envelope.get("context", {})
+            if ename == "pane.agent_status_changed":
+                handle_agent_status_changed(edata, econtext, bridge_url=bridge_url)
+            elif ename == "pane.closed":
+                handle_pane_closed(edata, econtext, bridge_url=bridge_url)
+            elif ename == "tab.closed":
+                handle_tab_closed(edata, econtext, bridge_url=bridge_url)
+            elif ename == "workspace.closed":
+                handle_workspace_closed(edata, econtext, bridge_url=bridge_url)
+            elif ename == "direct_post":
+                post_bartender_event(edata, bridge_url=bridge_url)
+            file_path.unlink()
+        except Exception as e:
+            log_debug(f"Error replaying spool file {file_path}: {e}")
 
 
 def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
@@ -393,14 +421,21 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
             return
 
         panes_dir = state_dir / "panes"
-        active_pane_markers = set()
-        if panes_dir.exists():
-            active_pane_markers = {p.name for p in panes_dir.iterdir()}
 
         for sid, s in list(sessions.items()):
             pane_id = s.get("pane_id")
-            safe_id = get_safe_pane_id(pane_id)
-            if safe_id not in active_pane_markers and s.get("desired_state") != "Ended":
+            hex_id = get_hex_pane_id(pane_id)
+            marker_path = panes_dir / hex_id
+            is_marker_fresh = False
+            if marker_path.exists():
+                try:
+                    mtime = marker_path.stat().st_mtime
+                    if now_wall - mtime <= 10.0:
+                        is_marker_fresh = True
+                except Exception:
+                    pass
+
+            if not is_marker_fresh and s.get("desired_state") != "Ended":
                 s["desired_state"] = "Ended"
                 s["seq"] = int(s.get("seq", 0)) + 1
                 s["desired_payload"] = {
@@ -409,7 +444,8 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
                     "session_id": sid,
                 }
 
-            if (now_wall - s.get("last_event_at", now_wall) > 86400) and s.get("desired_state") != "Ended":
+            # Check for stale session (> 24 hours). EXEMPT Waiting sessions!
+            if s.get("desired_state") in ("Idle", "Done") and (now_wall - s.get("last_event_at", now_wall) > 86400):
                 s["desired_state"] = "Ended"
                 s["seq"] = int(s.get("seq", 0)) + 1
                 s["desired_payload"] = {
@@ -467,13 +503,20 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
 
 
 def run_reconcile_background(bridge_url: str | None = None):
+    if is_disabled():
+        return
     state_dir = get_state_dir()
     lock_file = state_dir / "reconciler.lock"
+    pending_file = state_dir / "reconciler.pending"
     lock_fd = None
     try:
         lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError):
+        try:
+            pending_file.touch(exist_ok=True)
+        except Exception:
+            pass
         if lock_fd is not None:
             try:
                 os.close(lock_fd)
@@ -482,8 +525,20 @@ def run_reconcile_background(bridge_url: str | None = None):
         return
 
     try:
-        claim_and_replay_spool(state_dir, bridge_url=bridge_url)
-        reconcile_active_sessions(state_dir, bridge_url=bridge_url)
+        while not is_disabled():
+            if pending_file.exists():
+                try:
+                    pending_file.unlink()
+                except Exception:
+                    pass
+
+            replay_spool_dir(state_dir, bridge_url=bridge_url)
+            reconcile_active_sessions(state_dir, bridge_url=bridge_url)
+
+            spool_dir = state_dir / "spool"
+            has_spool = spool_dir.exists() and any(spool_dir.glob("*.json"))
+            if not pending_file.exists() and not has_spool:
+                break
     finally:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -533,13 +588,19 @@ def run_cleanup(bridge_url: str | None = None) -> bool:
 def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str | None = None):
     touch_heartbeat()
     raw_pane = event_data.get("pane_id") or context.get("focused_pane_id")
-    workspace_id = event_data.get("workspace_id") or context.get("workspace_id") or "w1"
+    workspace_id = event_data.get("workspace_id") or context.get("workspace_id")
     agent_status = event_data.get("agent_status")
 
     if not raw_pane:
         return
 
     canonical_pane = normalize_pane_id(raw_pane, workspace_id)
+    if not workspace_id:
+        if ":" in canonical_pane:
+            workspace_id = canonical_pane.split(":", 1)[0]
+        else:
+            workspace_id = None
+
     host = get_sanitized_hostname()
     session_id = f"herdr:{host}:{canonical_pane}"
 
@@ -558,7 +619,11 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             return
 
         # Qualification filter: pane must have agent metadata or already exist in cache
-        if not raw_agent and session_id not in sessions:
+        existing_session = sessions.get(session_id)
+        if existing_session and existing_session.get("desired_state") == "Ended":
+            if not raw_agent:
+                return  # Bare prompt does not resurrect an Ended session
+        elif not raw_agent and session_id not in sessions:
             return
 
         mapped_state = STATUS_MAP.get(agent_status)
@@ -734,7 +799,8 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
     with cache_mgr as data:
         sessions = data.get("sessions", {})
         for sid, info in list(sessions.items()):
-            if info.get("tab_id") == tab_id or (tab_id.endswith(str(info.get("tab_id")))):
+            s_tab = info.get("tab_id")
+            if s_tab and (s_tab == tab_id or tab_id.endswith(str(s_tab))):
                 seq = int(info.get("seq", 0)) + 1
                 info["desired_state"] = "Ended"
                 info["seq"] = seq
@@ -768,7 +834,8 @@ def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | N
     with cache_mgr as data:
         sessions = data.get("sessions", {})
         for sid, info in list(sessions.items()):
-            if info.get("workspace_id") == workspace_id or f":{workspace_id}:" in sid:
+            s_ws = info.get("workspace_id")
+            if s_ws and (s_ws == workspace_id or f":{workspace_id}:" in sid):
                 seq = int(info.get("seq", 0)) + 1
                 info["desired_state"] = "Ended"
                 info["seq"] = seq
@@ -982,39 +1049,82 @@ def run_unit_tests():
 
     MockBartenderHandler.delay = 0.0
 
-    # 9. Atomic spool claim protocol
-    spool_file = get_state_dir() / "spool.jsonl"
-    with open(spool_file, "w") as f:
-        f.write(json.dumps({"state": "Working", "agent": "SpoolAgent", "session_id": "spool-session-1"}) + "\n")
-        f.write(json.dumps({"state": "Done", "agent": "SpoolAgent", "session_id": "spool-session-1"}) + "\n")
-    claim_and_replay_spool(get_state_dir(), bridge_url=mock_url)
-    assert not spool_file.exists(), "spool.jsonl should be consumed"
-    claimed_files = list(get_state_dir().glob("spool.*.claimed"))
-    assert len(claimed_files) == 0, "No claimed spool files should remain"
+    # 9. Atomic spool directory enqueue and ingestion
+    spool_dir = get_state_dir() / "spool"
+    if spool_dir.exists():
+        for f in spool_dir.glob("*.json*"):
+            f.unlink()
+    enqueue_spool("direct_post", {"state": "Working", "agent": "SpoolAgent", "session_id": "spool-session-1"}, {})
+    enqueue_spool("direct_post", {"state": "Done", "agent": "SpoolAgent", "session_id": "spool-session-1"}, {})
+    spool_files = list(spool_dir.glob("*.json"))
+    assert len(spool_files) == 2, f"Expected 2 spooled files, got {len(spool_files)}"
+    replay_spool_dir(get_state_dir(), bridge_url=mock_url)
+    assert len(list(spool_dir.glob("*.json"))) == 0, "All spool files should be ingested and unlinked"
     spool_events = [e for e in MockBartenderHandler.history if e.get("session_id") == "spool-session-1"]
     assert len(spool_events) == 2, f"Expected 2 spooled events delivered, got {len(spool_events)}"
-    print("[PASS] Atomic spool claim and replay protocol")
+    print("[PASS] Atomic spool directory enqueue and ingestion protocol")
 
-    # 10. Reconciler singleton lock
+    # 10. Reconciler singleton with pending work re-scan
     lock_file = get_state_dir() / "reconciler.lock"
+    pending_file = get_state_dir() / "reconciler.pending"
     test_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR, 0o600)
     fcntl.flock(test_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    # Background reconciler should detect held lock and return cleanly
     run_reconcile_background(bridge_url=mock_url)
+    assert pending_file.exists(), "Reconciler should touch reconciler.pending when lock is held"
     fcntl.flock(test_fd, fcntl.LOCK_UN)
     os.close(test_fd)
-    print("[PASS] Background reconciler singleton lock guard")
+    run_reconcile_background(bridge_url=mock_url)
+    assert not pending_file.exists(), "Reconciler should consume and unlink reconciler.pending"
+    print("[PASS] Background reconciler singleton and pending-work re-scan loop")
 
-    # 11. Per-pane marker lifecycle & sanitization
+    # 11. Injective hex-encoded pane marker lifecycle & freshness
     test_pane = "w1:test/dangerous:pane..id"
-    safe_pane = get_safe_pane_id(test_pane)
-    assert "/" not in safe_pane and ".." not in safe_pane, f"Unsafe characters in {safe_pane}"
+    hex_id = get_hex_pane_id(test_pane)
+    assert "/" not in hex_id and ".." not in hex_id and ":" not in hex_id, f"Unsafe chars in {hex_id}"
     touch_pane_marker(test_pane)
-    marker_path = get_state_dir() / "panes" / safe_pane
+    marker_path = get_state_dir() / "panes" / hex_id
     assert marker_path.exists(), f"Expected marker at {marker_path}"
+    mtime_str = marker_path.read_text().strip()
+    assert int(mtime_str) > 0, "Marker should store unix timestamp"
     remove_pane_marker(test_pane)
     assert not marker_path.exists(), f"Marker should be removed from {marker_path}"
-    print("[PASS] Per-pane marker lifecycle and identity sanitization")
+    print("[PASS] Injective hex-encoded pane marker lifecycle and freshness timestamp")
+
+    # 12. Tombstone DISABLED flag
+    disabled_path = get_state_dir() / "DISABLED"
+    disabled_path.touch()
+    assert is_disabled() is True, "DISABLED flag should be recognized"
+    disabled_path.unlink()
+    assert is_disabled() is False, "DISABLED flag removal should be recognized"
+    print("[PASS] Tombstone DISABLED flag enforcement")
+
+    # 13. Waiting sessions exempt from 24h TTL eviction
+    with cache_mgr as data:
+        data["sessions"]["herdr:macbook:wWait"] = {
+            "desired_state": "Waiting",
+            "seq": 1,
+            "delivered_seq": 1,
+            "last_event_at": time.time() - 90000,
+            "pane_id": "w1:pWait",
+            "agent": "Claude (Herdr)",
+        }
+        data["sessions"]["herdr:macbook:wIdle"] = {
+            "desired_state": "Idle",
+            "seq": 1,
+            "delivered_seq": 1,
+            "last_event_at": time.time() - 90000,
+            "pane_id": "w1:pIdle",
+            "agent": "Claude (Herdr)",
+        }
+        cache_mgr.save(data)
+    touch_pane_marker("w1:pWait")
+    touch_pane_marker("w1:pIdle")
+    reconcile_active_sessions(get_state_dir(), bridge_url=mock_url)
+    with cache_mgr as data:
+        assert "herdr:macbook:wWait" in data["sessions"], "Waiting session must remain in cache"
+        assert data["sessions"]["herdr:macbook:wWait"]["desired_state"] == "Waiting", "Waiting sessions must be exempt from TTL"
+        assert "herdr:macbook:wIdle" not in data["sessions"], "Idle sessions must transition to Ended and be evicted on confirmed delivery"
+    print("[PASS] Waiting session exemption from 24h TTL eviction")
 
     server.shutdown()
     print("=== ALL COMPREHENSIVE UNIT TESTS PASSED ===")
@@ -1107,6 +1217,9 @@ def main():
     if "--reconcile-background" in args:
         run_reconcile_background()
         return
+
+    if is_disabled():
+        sys.exit(0)
 
     # Normal Herdr event dispatch
     arm_watchdog()
