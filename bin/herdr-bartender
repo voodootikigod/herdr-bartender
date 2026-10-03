@@ -121,6 +121,15 @@ def touch_heartbeat():
         pass
 
 
+def remove_heartbeat():
+    try:
+        marker = get_state_dir() / "plugin-active"
+        if marker.exists():
+            marker.unlink()
+    except Exception:
+        pass
+
+
 def log_debug(msg: str):
     try:
         log_file = get_state_dir() / "plugin.log"
@@ -455,19 +464,27 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
                 s.pop("last_error", None)
                 data["last_successful_delivery"] = time.time()
                 data["consecutive_failures"] = 0
+                touch_heartbeat()
+
+                # Active Supersession check on Ended: only evict if no newer state was requested
+                if transmitting_state == "Ended" and s.get("seq") == transmitting_seq:
+                    data.get("sessions", {}).pop(session_id, None)
+                    cache_mgr.save(data)
+                    break
             else:
                 s["last_error"] = "4xx rejected" if is_4xx else "network error"
-                data["consecutive_failures"] = data.get("consecutive_failures", 0) + 1
+                if not is_4xx:
+                    data["consecutive_failures"] = data.get("consecutive_failures", 0) + 1
+                    if data["consecutive_failures"] >= 3:
+                        remove_heartbeat()
 
-            next_payload = s.get("queued_payload")
-            if next_payload and time_remaining() > 0.4:
-                s["desired_payload"] = next_payload
-                s["queued_payload"] = None
+            # Drain check: if a newer state was requested while in-flight, loop and transmit it
+            if s.get("delivered_seq", 0) < s.get("seq", 0) and time_remaining() > 0.3:
                 s["lease_deadline"] = time.time() + 2.0
+                current_payload = s.get("desired_payload")
+                transmitting_state = s.get("desired_state")
+                transmitting_seq = s.get("seq")
                 cache_mgr.save(data)
-                current_payload = next_payload
-                transmitting_state = next_payload.get("state")
-                transmitting_seq = time.time()
             else:
                 s["sending_pid"] = None
                 s["lease_token"] = None
@@ -493,6 +510,7 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
             if info.get("pane_id") == canonical_pane or sid.endswith(f":{canonical_pane}"):
                 target_sessions.append((sid, info))
                 info["desired_state"] = "Ended"
+                info["seq"] = time.time()
         if target_sessions:
             cache_mgr.save(data)
 
@@ -504,8 +522,10 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
         )
         if success or is_4xx:
             with cache_mgr as data:
-                data.get("sessions", {}).pop(sid, None)
-                cache_mgr.save(data)
+                s = data.get("sessions", {}).get(sid)
+                if s and s.get("desired_state") == "Ended":
+                    data.get("sessions", {}).pop(sid, None)
+                    cache_mgr.save(data)
 
 
 def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = None):
@@ -523,6 +543,7 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
             if info.get("tab_id") == tab_id or (tab_id.endswith(str(info.get("tab_id")))):
                 target_sessions.append((sid, info))
                 info["desired_state"] = "Ended"
+                info["seq"] = time.time()
         if target_sessions:
             cache_mgr.save(data)
 
@@ -533,8 +554,10 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
         )
         if success or is_4xx:
             with cache_mgr as data:
-                data.get("sessions", {}).pop(sid, None)
-                cache_mgr.save(data)
+                s = data.get("sessions", {}).get(sid)
+                if s and s.get("desired_state") == "Ended":
+                    data.get("sessions", {}).pop(sid, None)
+                    cache_mgr.save(data)
 
 
 def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | None = None):
@@ -552,6 +575,7 @@ def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | N
             if info.get("workspace_id") == workspace_id or f":{workspace_id}:" in sid:
                 target_sessions.append((sid, info))
                 info["desired_state"] = "Ended"
+                info["seq"] = time.time()
         if target_sessions:
             cache_mgr.save(data)
 
@@ -562,8 +586,10 @@ def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | N
         )
         if success or is_4xx:
             with cache_mgr as data:
-                data.get("sessions", {}).pop(sid, None)
-                cache_mgr.save(data)
+                s = data.get("sessions", {}).get(sid)
+                if s and s.get("desired_state") == "Ended":
+                    data.get("sessions", {}).pop(sid, None)
+                    cache_mgr.save(data)
 
 
 # ==============================================================================
