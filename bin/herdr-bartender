@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""
+herdr-bartender: Herdr plugin to synchronize agent status and pane notifications
+into Bartender Pro's Top Shelf (NotchBar) HTTP bridge.
+"""
+
+import sys
+import os
+import json
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 7823
+
+AGENT_NAME_OVERRIDES = {
+    "claude": "Claude",
+    "codex": "Codex",
+    "kilo": "Kilo",
+    "grok": "Grok",
+    "cursor": "Cursor",
+    "copilot": "Copilot",
+    "kimi": "Kimi",
+    "opencode": "OpenCode",
+}
+
+STATUS_MAP = {
+    "blocked": "Waiting",   # Awaiting user input / permission -> NotchBar highlight
+    "working": "Working",   # Turn or tool running
+    "done": "Done",         # Completed
+    "idle": "Idle",         # Idle at prompt
+}
+
+
+def get_bridge_url() -> str:
+    host = os.environ.get("NOTCHBAR_AGENTS_HOST") or DEFAULT_HOST
+    port = os.environ.get("NOTCHBAR_AGENTS_PORT") or str(DEFAULT_PORT)
+    return f"http://{host}:{port}"
+
+
+def post_bartender_event(payload: dict, timeout: float = 1.0) -> bool:
+    url = f"{get_bridge_url()}/event"
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def check_bridge_health(timeout: float = 1.0) -> dict | None:
+    url = f"{get_bridge_url()}/health"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        pass
+    return None
+
+
+def get_state_dir() -> Path:
+    state_env = os.environ.get("HERDR_PLUGIN_STATE_DIR")
+    if state_env:
+        p = Path(state_env)
+    else:
+        p = Path.home() / ".local" / "state" / "herdr" / "plugins" / "herdr-bartender"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def load_sessions(state_file: Path) -> dict:
+    if not state_file.exists():
+        return {}
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("sessions", {})
+    except Exception:
+        return {}
+
+
+def save_sessions(state_file: Path, sessions: dict):
+    try:
+        tmp_file = state_file.with_suffix(".tmp")
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump({"sessions": sessions}, f, indent=2)
+        tmp_file.replace(state_file)
+    except Exception:
+        pass
+
+
+def format_agent_name(raw_agent: str | None) -> str:
+    if not raw_agent or not raw_agent.strip():
+        return "Herdr"
+    clean = raw_agent.strip().lower()
+    pretty = AGENT_NAME_OVERRIDES.get(clean, clean.capitalize())
+    return f"{pretty} (Herdr)"
+
+
+def run_cleanup():
+    state_file = get_state_dir() / "active-sessions.json"
+    sessions = load_sessions(state_file)
+    for session_id, info in sessions.items():
+        payload = {
+            "state": "Ended",
+            "agent": info.get("agent", "Herdr"),
+            "session_id": session_id,
+        }
+        post_bartender_event(payload)
+    if state_file.exists():
+        try:
+            state_file.unlink()
+        except Exception:
+            pass
+
+
+def handle_agent_status_changed(event_data: dict, context: dict):
+    agent_status = event_data.get("agent_status")
+    pane_id = event_data.get("pane_id") or context.get("focused_pane_id")
+    workspace_id = event_data.get("workspace_id") or context.get("workspace_id") or "w1"
+    tab_id = context.get("tab_id") or "t1"
+
+    if not pane_id:
+        return
+
+    session_id = f"herdr:{workspace_id}:{pane_id}"
+    state_file = get_state_dir() / "active-sessions.json"
+    sessions = load_sessions(state_file)
+
+    raw_agent = event_data.get("agent") or context.get("focused_pane_agent")
+    
+    # If no agent detected and not already tracked, ignore normal shell churn
+    if not raw_agent and session_id not in sessions:
+        if agent_status in ("idle", "unknown", None):
+            return
+
+    mapped_state = STATUS_MAP.get(agent_status)
+    if not mapped_state:
+        if agent_status == "unknown" and session_id in sessions:
+            # Agent released / exited
+            post_bartender_event({
+                "state": "Ended",
+                "agent": sessions[session_id].get("agent", "Herdr"),
+                "session_id": session_id,
+            })
+            del sessions[session_id]
+            save_sessions(state_file, sessions)
+        return
+
+    agent_name = format_agent_name(raw_agent or (sessions.get(session_id, {}).get("raw_agent")))
+    title = event_data.get("title") or context.get("workspace_label") or f"Pane {pane_id}"
+    cwd = context.get("focused_pane_cwd") or context.get("workspace_cwd") or ""
+
+    payload = {
+        "state": mapped_state,
+        "agent": agent_name,
+        "session_id": session_id,
+        "title": title[:120],
+        "cwd": cwd,
+        "terminal": "Herdr",
+        "event": "pane.agent_status_changed",
+    }
+
+    if post_bartender_event(payload):
+        sessions[session_id] = {
+            "pane_id": pane_id,
+            "workspace_id": workspace_id,
+            "tab_id": tab_id,
+            "agent": agent_name,
+            "raw_agent": raw_agent,
+            "title": title,
+            "state": mapped_state,
+        }
+        save_sessions(state_file, sessions)
+
+
+def handle_pane_closed(event_data: dict, context: dict):
+    pane_id = event_data.get("pane_id") or context.get("focused_pane_id")
+    workspace_id = event_data.get("workspace_id") or context.get("workspace_id") or ""
+    state_file = get_state_dir() / "active-sessions.json"
+    sessions = load_sessions(state_file)
+
+    target_sessions = []
+    for sid, info in list(sessions.items()):
+        if info.get("pane_id") == pane_id or sid.endswith(f":{pane_id}"):
+            target_sessions.append((sid, info))
+
+    for sid, info in target_sessions:
+        post_bartender_event({
+            "state": "Ended",
+            "agent": info.get("agent", "Herdr"),
+            "session_id": sid,
+        })
+        sessions.pop(sid, None)
+
+    save_sessions(state_file, sessions)
+
+
+def handle_tab_closed(event_data: dict, context: dict):
+    tab_id = event_data.get("tab_id") or context.get("tab_id")
+    if not tab_id:
+        return
+    state_file = get_state_dir() / "active-sessions.json"
+    sessions = load_sessions(state_file)
+
+    target_sessions = []
+    for sid, info in list(sessions.items()):
+        if info.get("tab_id") == tab_id:
+            target_sessions.append((sid, info))
+
+    for sid, info in target_sessions:
+        post_bartender_event({
+            "state": "Ended",
+            "agent": info.get("agent", "Herdr"),
+            "session_id": sid,
+        })
+        sessions.pop(sid, None)
+
+    save_sessions(state_file, sessions)
+
+
+def handle_workspace_closed(event_data: dict, context: dict):
+    workspace_id = event_data.get("workspace_id") or context.get("workspace_id")
+    if not workspace_id:
+        return
+    state_file = get_state_dir() / "active-sessions.json"
+    sessions = load_sessions(state_file)
+
+    target_sessions = []
+    for sid, info in list(sessions.items()):
+        if info.get("workspace_id") == workspace_id or sid.startswith(f"herdr:{workspace_id}:"):
+            target_sessions.append((sid, info))
+
+    for sid, info in target_sessions:
+        post_bartender_event({
+            "state": "Ended",
+            "agent": info.get("agent", "Herdr"),
+            "session_id": sid,
+        })
+        sessions.pop(sid, None)
+
+    save_sessions(state_file, sessions)
+
+
+def run_test():
+    print(f"Checking Bartender bridge at {get_bridge_url()}...")
+    health = check_bridge_health()
+    if not health:
+        print("[-] Error: Bartender bridge not reachable. Make sure Bartender 6 is running with Top Shelf enabled.")
+        sys.exit(1)
+    print(f"[+] Bartender bridge is healthy: {health}")
+
+    test_session = "herdr:test_workspace:test_pane_1"
+    print("\n1. Emitting 'Working' state...")
+    post_bartender_event({
+        "state": "Working",
+        "agent": "Claude (Herdr)",
+        "session_id": test_session,
+        "title": "Unit test running in Herdr",
+        "terminal": "Herdr",
+    })
+    print("   Sent Working. Top Shelf should show active spinner.")
+
+    import time
+    time.sleep(1.5)
+
+    print("\n2. Emitting 'Waiting' state (Awaiting input / attention)...")
+    post_bartender_event({
+        "state": "Waiting",
+        "agent": "Claude (Herdr)",
+        "session_id": test_session,
+        "title": "Awaiting user confirmation in Herdr",
+        "terminal": "Herdr",
+    })
+    print("   Sent Waiting. Top Shelf NotchBar should highlight attention banner.")
+
+    time.sleep(1.5)
+
+    print("\n3. Emitting 'Done' state...")
+    post_bartender_event({
+        "state": "Done",
+        "agent": "Claude (Herdr)",
+        "session_id": test_session,
+        "title": "Task completed successfully",
+        "terminal": "Herdr",
+    })
+    print("   Sent Done. Top Shelf should show completion.")
+
+    time.sleep(1.5)
+
+    print("\n4. Emitting 'Ended' state (Pane closed)...")
+    post_bartender_event({
+        "state": "Ended",
+        "agent": "Claude (Herdr)",
+        "session_id": test_session,
+    })
+    print("   Sent Ended. Session removed from Top Shelf.")
+
+    final_health = check_bridge_health()
+    print(f"\n[+] Test complete! Final bridge health: {final_health}")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if "--test" in args:
+        run_test()
+        return
+
+    if "--health" in args:
+        h = check_bridge_health()
+        print(json.dumps(h or {"error": "unreachable"}))
+        return
+
+    if "--cleanup" in args:
+        run_cleanup()
+        return
+
+    if "--sessions" in args:
+        state_file = get_state_dir() / "active-sessions.json"
+        print(json.dumps(load_sessions(state_file), indent=2))
+        return
+
+    # Normal Herdr event dispatch
+    event_name = os.environ.get("HERDR_PLUGIN_EVENT", "")
+    event_json_raw = os.environ.get("HERDR_PLUGIN_EVENT_JSON", "{}")
+    context_json_raw = os.environ.get("HERDR_PLUGIN_CONTEXT_JSON", "{}")
+
+    try:
+        envelope = json.loads(event_json_raw)
+    except Exception:
+        envelope = {}
+
+    try:
+        context = json.loads(context_json_raw)
+    except Exception:
+        context = {}
+
+    data = envelope.get("data", {})
+
+    if event_name == "pane.agent_status_changed":
+        handle_agent_status_changed(data, context)
+    elif event_name == "pane.closed":
+        handle_pane_closed(data, context)
+    elif event_name == "tab.closed":
+        handle_tab_closed(data, context)
+    elif event_name == "workspace.closed":
+        handle_workspace_closed(data, context)
+
+
+if __name__ == "__main__":
+    main()
