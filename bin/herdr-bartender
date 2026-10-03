@@ -130,6 +130,28 @@ def remove_heartbeat():
         pass
 
 
+def touch_pane_marker(pane_id: str):
+    if not pane_id:
+        return
+    try:
+        panes_dir = get_state_dir() / "panes"
+        panes_dir.mkdir(parents=True, exist_ok=True)
+        (panes_dir / pane_id).touch(exist_ok=True)
+    except Exception:
+        pass
+
+
+def remove_pane_marker(pane_id: str):
+    if not pane_id:
+        return
+    try:
+        marker = get_state_dir() / "panes" / pane_id
+        if marker.exists():
+            marker.unlink()
+    except Exception:
+        pass
+
+
 def log_debug(msg: str):
     try:
         log_file = get_state_dir() / "plugin.log"
@@ -392,11 +414,13 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
         tab_id = event_data.get("tab_id") or context.get("tab_id")
 
         now_wall = time.time()
-        event_seq = event_data.get("seq") or now_wall
-        prev_seq = sessions.get(session_id, {}).get("seq", 0)
-        # Drop stale out-of-order events
-        if prev_seq > event_seq:
+        source_ts = event_data.get("timestamp")
+        last_source_ts = sessions.get(session_id, {}).get("last_source_timestamp", 0)
+        if source_ts and last_source_ts and source_ts < last_source_ts:
             return
+
+        new_seq = sessions.get(session_id, {}).get("seq", 0) + 1
+        touch_pane_marker(canonical_pane)
 
         payload = {
             "state": mapped_state,
@@ -420,7 +444,8 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             "cwd": cwd,
             "desired_state": mapped_state,
             "desired_payload": payload,
-            "seq": event_seq,
+            "seq": new_seq,
+            "last_source_timestamp": source_ts or now_wall,
         })
 
         active_lease = session_record.get("lease_deadline") or 0
@@ -430,8 +455,7 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             active_lease = 0
 
         if active_lease and (now_wall < active_lease) and is_pid_alive(sending_pid):
-            # Active in-flight transmission for this session; stage into queued_payload and exit immediately
-            session_record["queued_payload"] = payload
+            # Active in-flight transmission for this session; state is staged, active sender will drain it
             cache_mgr.save(data)
             return
 
@@ -440,11 +464,10 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
         session_record["lease_token"] = my_token
         session_record["sending_pid"] = os.getpid()
         session_record["lease_deadline"] = now_wall + 2.0
-        session_record["queued_payload"] = None
         cache_mgr.save(data)
         current_payload = payload
         transmitting_state = mapped_state
-        transmitting_seq = event_seq
+        transmitting_seq = new_seq
 
     # 2. Outside lock: transmit and drain queue with lease ownership verification
     while current_payload:
@@ -715,16 +738,16 @@ def run_unit_tests():
     assert len(MockBartenderHandler.sessions) == 0
     print("[PASS] Container cascades (pane, tab & workspace)")
 
-    # 4. Out-of-order monotonic sequencing
+    # 4. Out-of-order source timestamp sequencing
     t_base = time.time()
     handle_agent_status_changed(
-        {"agent_status": "working", "pane_id": "w1:pSeq", "workspace_id": "w1", "agent": "claude", "seq": t_base + 10},
+        {"agent_status": "working", "pane_id": "w1:pSeq", "workspace_id": "w1", "agent": "claude", "timestamp": t_base + 10},
         {},
         bridge_url=mock_url
     )
-    # Stale event with older seq should be rejected
+    # Stale event with older timestamp should be rejected
     handle_agent_status_changed(
-        {"agent_status": "idle", "pane_id": "w1:pSeq", "workspace_id": "w1", "agent": "claude", "seq": t_base + 2},
+        {"agent_status": "idle", "pane_id": "w1:pSeq", "workspace_id": "w1", "agent": "claude", "timestamp": t_base + 2},
         {},
         bridge_url=mock_url
     )
@@ -732,7 +755,8 @@ def run_unit_tests():
     with cache_mgr as data:
         sid = f"herdr:{get_sanitized_hostname()}:w1:pSeq"
         assert data["sessions"][sid]["desired_state"] == "Working", "Stale event must not overwrite state"
-    print("[PASS] Out-of-order monotonic event suppression")
+        assert data["sessions"][sid]["seq"] >= 1, "Integer seq must be incremented"
+    print("[PASS] Out-of-order source timestamp suppression")
 
     # 5. Failed Ended & Active Supersession
     MockBartenderHandler.return_code = 500
