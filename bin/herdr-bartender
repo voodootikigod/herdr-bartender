@@ -11,6 +11,7 @@ import socket
 import re
 import fcntl
 import time
+import signal
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -41,6 +42,23 @@ STATUS_MAP = {
 
 ANSI_REGEX = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
 START_TIME = time.monotonic()
+
+
+def _timeout_watchdog(signum, frame):
+    log_debug("Watchdog deadline exceeded (SIGALRM)")
+    sys.exit(0)
+
+
+def arm_watchdog():
+    if hasattr(signal, "SIGALRM"):
+        try:
+            signal.signal(signal.SIGALRM, _timeout_watchdog)
+            if hasattr(signal, "setitimer"):
+                signal.setitimer(signal.ITIMER_REAL, PROCESS_DEADLINE_SECONDS)
+            else:
+                signal.alarm(int(PROCESS_DEADLINE_SECONDS) + 1)
+        except Exception:
+            pass
 
 
 def time_remaining() -> float:
@@ -96,7 +114,8 @@ def log_debug(msg: str):
         pass
 
 
-def post_bartender_event(payload: dict, timeout: float = 0.8, bridge_url: str | None = None) -> bool:
+def post_bartender_event(payload: dict, timeout: float = 0.8, bridge_url: str | None = None) -> tuple[bool, bool]:
+    """Posts event to Bartender Pro bridge. Returns (success: bool, is_4xx: bool)."""
     eff_timeout = min(timeout, time_remaining())
     url = f"{bridge_url or get_bridge_url()}/event"
     data = json.dumps(payload).encode("utf-8")
@@ -110,11 +129,16 @@ def post_bartender_event(payload: dict, timeout: float = 0.8, bridge_url: str | 
         with urllib.request.urlopen(req, timeout=eff_timeout) as resp:
             if resp.status == 200:
                 res_body = json.loads(resp.read().decode("utf-8", errors="ignore"))
-                return res_body.get("ok") is True
-            return False
+                return (res_body.get("ok") is True, False)
+            is_4xx = 400 <= resp.status < 500
+            return (False, is_4xx)
+    except urllib.error.HTTPError as e:
+        log_debug(f"HTTPError {e.code} posting to {url}: {e}")
+        is_4xx = 400 <= e.code < 500
+        return (False, is_4xx)
     except Exception as e:
         log_debug(f"Failed to post event to {url}: {e}")
-        return False
+        return (False, False)
 
 
 def check_bridge_health(timeout: float = 0.8, bridge_url: str | None = None) -> dict | None:
@@ -220,31 +244,79 @@ def normalize_pane_id(raw_pane_id: str, workspace_id: str | None) -> str:
 
 
 def retry_tombstones(cache_mgr: BoundedSessionCache, bridge_url: str | None = None):
+    """Retries pending Ended deliveries with TTL and max attempts, dropping on 4xx."""
+    now = time.time()
     with cache_mgr as data:
         tombstones = data.get("tombstones", {})
         if not tombstones:
             return
         to_remove = []
         for sid, info in list(tombstones.items()):
-            payload = {"state": "Ended", "agent": info.get("agent", "Herdr"), "session_id": sid}
-            if post_bartender_event(payload, bridge_url=bridge_url):
+            created = info.get("created_at", now)
+            attempts = info.get("attempts", 1)
+            # Expire tombstones older than 300s or exceeding 5 attempts
+            if (now - created > 300) or attempts >= 5:
+                log_debug(f"Dropping expired tombstone for {sid} (attempts={attempts})")
                 to_remove.append(sid)
+                continue
+
+            payload = {"state": "Ended", "agent": info.get("agent", "Herdr"), "session_id": sid}
+            success, is_4xx = post_bartender_event(payload, bridge_url=bridge_url)
+            if success or is_4xx:
+                # 200 Success OR 4xx Client Error -> Drop immediately (non-retryable)
+                to_remove.append(sid)
+            else:
+                info["attempts"] = attempts + 1
+                info["last_attempt"] = now
+
         for sid in to_remove:
             tombstones.pop(sid, None)
-        if to_remove:
+        if to_remove or tombstones:
             cache_mgr.save(data)
+
+
+def retry_undelivered_sessions(cache_mgr: BoundedSessionCache, bridge_url: str | None = None):
+    """Re-sends undelivered non-ended state for sessions where delivered_state != desired_state."""
+    with cache_mgr as data:
+        sessions = data.get("sessions", {})
+        if not sessions:
+            return
+        now_mono = time.monotonic()
+        for sid, s in list(sessions.items()):
+            if s.get("delivered_state") != s.get("desired_state"):
+                lease = s.get("sending_lease_deadline") or 0
+                if lease and now_mono < lease:
+                    continue  # Active sender already in progress
+                payload = s.get("desired_payload")
+                if payload:
+                    success, is_4xx = post_bartender_event(payload, bridge_url=bridge_url)
+                    if success:
+                        s["delivered_state"] = s.get("desired_state")
+                        s.pop("last_error", None)
+                    elif is_4xx:
+                        s["last_error"] = "4xx rejected"
+                    else:
+                        s["last_error"] = "retryable delivery error"
+        cache_mgr.save(data)
 
 
 def run_cleanup(bridge_url: str | None = None):
     touch_heartbeat()
     cache_mgr = BoundedSessionCache(get_state_dir())
+    now = time.time()
     with cache_mgr as data:
         sessions = data.get("sessions", {})
         tombstones = data.get("tombstones", {})
         for session_id, info in list(sessions.items()):
             payload = {"state": "Ended", "agent": info.get("agent", "Herdr"), "session_id": session_id}
-            if not post_bartender_event(payload, bridge_url=bridge_url):
-                tombstones[session_id] = info
+            success, is_4xx = post_bartender_event(payload, bridge_url=bridge_url)
+            if not success and not is_4xx:
+                tombstones[session_id] = {
+                    "agent": info.get("agent", "Herdr"),
+                    "created_at": now,
+                    "last_attempt": now,
+                    "attempts": 1,
+                }
         sessions.clear()
         cache_mgr.save(data)
     retry_tombstones(cache_mgr, bridge_url=bridge_url)
@@ -265,32 +337,43 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
 
     cache_mgr = BoundedSessionCache(get_state_dir())
     retry_tombstones(cache_mgr, bridge_url=bridge_url)
+    retry_undelivered_sessions(cache_mgr, bridge_url=bridge_url)
 
-    # 1. Critical section: Read and update cache first
+    # 1. Critical section: Update cache & manage per-session monotonic queue
     with cache_mgr as data:
-        sessions = data.get("sessions", {})
-        tombstones = data.get("tombstones", {})
+        # Active Supersession: Any active event supersedes/cancels a pending tombstone
+        data.get("tombstones", {}).pop(session_id, None)
 
+        sessions = data.get("sessions", {})
         raw_agent = event_data.get("agent")
-        # Only check context agent if context focused pane matches this event pane
         if not raw_agent and context.get("focused_pane_id") == canonical_pane:
             raw_agent = context.get("focused_pane_agent")
 
-        # Agent qualification filter
+        # Qualification filter for unassisted shell panes
         if not raw_agent and session_id not in sessions:
             if agent_status in ("idle", "unknown", None):
                 return
 
-        # If agent crashed, exited, or released -> Ended
+        # Agent terminated / released -> Ended
         if agent_status == "unknown":
             if session_id in sessions:
                 info = sessions.pop(session_id)
-                tombstones[session_id] = info
+                data.get("tombstones", {})[session_id] = {
+                    "agent": info.get("agent", "Herdr"),
+                    "created_at": time.time(),
+                    "last_attempt": time.time(),
+                    "attempts": 1,
+                }
                 cache_mgr.save(data)
                 # Network I/O outside lock
-                if post_bartender_event({"state": "Ended", "agent": info.get("agent", "Herdr"), "session_id": session_id}, bridge_url=bridge_url):
-                    tombstones.pop(session_id, None)
-                    cache_mgr.save(data)
+                success, is_4xx = post_bartender_event(
+                    {"state": "Ended", "agent": info.get("agent", "Herdr"), "session_id": session_id},
+                    bridge_url=bridge_url
+                )
+                if success or is_4xx:
+                    with cache_mgr as d2:
+                        d2.get("tombstones", {}).pop(session_id, None)
+                        cache_mgr.save(d2)
             return
 
         mapped_state = STATUS_MAP.get(agent_status)
@@ -304,9 +387,11 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
         tab_id = event_data.get("tab_id") or context.get("tab_id")
 
         now = time.time()
-        # Drop stale out-of-order events
+        now_mono = time.monotonic()
+        event_seq = event_data.get("seq") or now
         prev_seq = sessions.get(session_id, {}).get("seq", 0)
-        if prev_seq > now:
+        # Drop stale out-of-order events
+        if prev_seq > event_seq:
             return
 
         payload = {
@@ -319,7 +404,8 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             "event": "pane.agent_status_changed",
         }
 
-        sessions[session_id] = {
+        session_record = sessions.setdefault(session_id, {})
+        session_record.update({
             "pane_id": canonical_pane,
             "workspace_id": workspace_id,
             "tab_id": tab_id,
@@ -328,13 +414,50 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             "raw_agent": raw_agent,
             "title": title,
             "cwd": cwd,
-            "state": mapped_state,
-            "seq": now,
-        }
-        cache_mgr.save(data)
+            "desired_state": mapped_state,
+            "desired_payload": payload,
+            "seq": event_seq,
+        })
 
-    # 2. Network I/O performed AFTER lock release
-    post_bartender_event(payload, bridge_url=bridge_url)
+        active_lease = session_record.get("sending_lease_deadline") or 0
+        if active_lease and now_mono < active_lease:
+            # Active in-flight transmission for this session; stage into queued_payload and exit immediately
+            session_record["queued_payload"] = payload
+            cache_mgr.save(data)
+            return
+
+        # Claim sending lease
+        session_record["sending_pid"] = os.getpid()
+        session_record["sending_lease_deadline"] = now_mono + 1.2
+        session_record["queued_payload"] = None
+        cache_mgr.save(data)
+        current_payload = payload
+
+    # 2. Outside lock: transmit and drain queue monotonically
+    while current_payload:
+        success, is_4xx = post_bartender_event(current_payload, bridge_url=bridge_url)
+        with cache_mgr as data:
+            s = data.get("sessions", {}).get(session_id)
+            if not s:
+                break
+            if success:
+                s["delivered_state"] = s.get("desired_state")
+                s.pop("last_error", None)
+            else:
+                s["last_error"] = "4xx rejected" if is_4xx else "network error"
+
+            next_payload = s.get("queued_payload")
+            if next_payload:
+                s["desired_payload"] = next_payload
+                s["queued_payload"] = None
+                s["sending_lease_deadline"] = time.monotonic() + 1.2
+                cache_mgr.save(data)
+                current_payload = next_payload
+            else:
+                s["sending_pid"] = None
+                s["sending_lease_deadline"] = None
+                cache_mgr.save(data)
+                current_payload = None
 
 
 def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None = None):
@@ -347,6 +470,7 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
     canonical_pane = normalize_pane_id(raw_pane, workspace_id)
     cache_mgr = BoundedSessionCache(get_state_dir())
     target_sessions = []
+    now = time.time()
 
     with cache_mgr as data:
         sessions = data.get("sessions", {})
@@ -355,13 +479,22 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
             if info.get("pane_id") == canonical_pane or sid.endswith(f":{canonical_pane}"):
                 target_sessions.append((sid, info))
                 sessions.pop(sid, None)
-                tombstones[sid] = info
+                tombstones[sid] = {
+                    "agent": info.get("agent", "Herdr"),
+                    "created_at": now,
+                    "last_attempt": now,
+                    "attempts": 1,
+                }
         if target_sessions:
             cache_mgr.save(data)
 
     # Dispatch Ended outside lock
     for sid, info in target_sessions:
-        if post_bartender_event({"state": "Ended", "agent": info.get("agent", "Herdr"), "session_id": sid}, bridge_url=bridge_url):
+        success, is_4xx = post_bartender_event(
+            {"state": "Ended", "agent": info.get("agent", "Herdr"), "session_id": sid},
+            bridge_url=bridge_url
+        )
+        if success or is_4xx:
             with cache_mgr as data:
                 data.get("tombstones", {}).pop(sid, None)
                 cache_mgr.save(data)
@@ -375,6 +508,7 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
 
     cache_mgr = BoundedSessionCache(get_state_dir())
     target_sessions = []
+    now = time.time()
 
     with cache_mgr as data:
         sessions = data.get("sessions", {})
@@ -383,12 +517,21 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
             if info.get("tab_id") == tab_id or (tab_id.endswith(str(info.get("tab_id")))):
                 target_sessions.append((sid, info))
                 sessions.pop(sid, None)
-                tombstones[sid] = info
+                tombstones[sid] = {
+                    "agent": info.get("agent", "Herdr"),
+                    "created_at": now,
+                    "last_attempt": now,
+                    "attempts": 1,
+                }
         if target_sessions:
             cache_mgr.save(data)
 
     for sid, info in target_sessions:
-        if post_bartender_event({"state": "Ended", "agent": info.get("agent", "Herdr"), "session_id": sid}, bridge_url=bridge_url):
+        success, is_4xx = post_bartender_event(
+            {"state": "Ended", "agent": info.get("agent", "Herdr"), "session_id": sid},
+            bridge_url=bridge_url
+        )
+        if success or is_4xx:
             with cache_mgr as data:
                 data.get("tombstones", {}).pop(sid, None)
                 cache_mgr.save(data)
@@ -402,6 +545,7 @@ def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | N
 
     cache_mgr = BoundedSessionCache(get_state_dir())
     target_sessions = []
+    now = time.time()
 
     with cache_mgr as data:
         sessions = data.get("sessions", {})
@@ -410,12 +554,21 @@ def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | N
             if info.get("workspace_id") == workspace_id or f":{workspace_id}:" in sid:
                 target_sessions.append((sid, info))
                 sessions.pop(sid, None)
-                tombstones[sid] = info
+                tombstones[sid] = {
+                    "agent": info.get("agent", "Herdr"),
+                    "created_at": now,
+                    "last_attempt": now,
+                    "attempts": 1,
+                }
         if target_sessions:
             cache_mgr.save(data)
 
     for sid, info in target_sessions:
-        if post_bartender_event({"state": "Ended", "agent": info.get("agent", "Herdr"), "session_id": sid}, bridge_url=bridge_url):
+        success, is_4xx = post_bartender_event(
+            {"state": "Ended", "agent": info.get("agent", "Herdr"), "session_id": sid},
+            bridge_url=bridge_url
+        )
+        if success or is_4xx:
             with cache_mgr as data:
                 data.get("tombstones", {}).pop(sid, None)
                 cache_mgr.save(data)
@@ -475,6 +628,11 @@ class MockBartenderHandler(BaseHTTPRequestHandler):
 
 def run_unit_tests():
     print("=== Running Comprehensive Hardened Unit Test Suite ===")
+    MockBartenderHandler.sessions = {}
+    MockBartenderHandler.history = []
+    MockBartenderHandler.delay = 0.0
+    MockBartenderHandler.return_code = 200
+
     server = HTTPServer(("127.0.0.1", 0), MockBartenderHandler)
     mock_port = server.server_port
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -535,28 +693,53 @@ def run_unit_tests():
     assert len(MockBartenderHandler.sessions) == 0
     print("[PASS] Container cascades (tab & workspace)")
 
-    # 4. Tombstone retry verification on bridge failure
-    MockBartenderHandler.return_code = 500
+    # 4. Out-of-order monotonic sequencing
+    t_base = time.time()
     handle_agent_status_changed(
-        {"agent_status": "working", "pane_id": "w1:pFail", "workspace_id": "w1", "agent": "claude"},
+        {"agent_status": "working", "pane_id": "w1:pSeq", "workspace_id": "w1", "agent": "claude", "seq": t_base + 10},
         {},
         bridge_url=mock_url
     )
-    handle_pane_closed({"pane_id": "w1:pFail", "workspace_id": "w1"}, {}, bridge_url=mock_url)
-
+    # Stale event with older seq should be rejected
+    handle_agent_status_changed(
+        {"agent_status": "idle", "pane_id": "w1:pSeq", "workspace_id": "w1", "agent": "claude", "seq": t_base + 2},
+        {},
+        bridge_url=mock_url
+    )
     cache_mgr = BoundedSessionCache(get_state_dir())
     with cache_mgr as data:
-        assert len(data.get("tombstones", {})) > 0, "Expected tombstone entry for failed Ended"
-    print("[PASS] Tombstone recorded on failed Ended delivery")
+        sid = f"herdr:{get_sanitized_hostname()}:w1:pSeq"
+        assert data["sessions"][sid]["desired_state"] == "Working", "Stale event must not overwrite state"
+    print("[PASS] Out-of-order monotonic event suppression")
 
-    # Recover server and retry
-    MockBartenderHandler.return_code = 200
-    retry_tombstones(cache_mgr, bridge_url=mock_url)
+    # 5. Tombstone Active Supersession & 4xx dropping
+    MockBartenderHandler.return_code = 500
+    handle_pane_closed({"pane_id": "w1:pSeq", "workspace_id": "w1"}, {}, bridge_url=mock_url)
     with cache_mgr as data:
-        assert len(data.get("tombstones", {})) == 0, "Expected tombstone to be retried and cleared"
-    print("[PASS] Tombstone retry and recovery")
+        assert sid in data.get("tombstones", {}), "Failed Ended must create tombstone"
+    print("[PASS] Failed Ended creates tombstone")
 
-    # 5. Corrupt cache quarantine
+    # A new turn arrives for the same pane -> Tombstone must be canceled immediately
+    MockBartenderHandler.return_code = 200
+    handle_agent_status_changed(
+        {"agent_status": "working", "pane_id": "w1:pSeq", "workspace_id": "w1", "agent": "claude", "seq": t_base + 20},
+        {},
+        bridge_url=mock_url
+    )
+    with cache_mgr as data:
+        assert sid not in data.get("tombstones", {}), "Active event must supersede and delete tombstone"
+        assert sid in data.get("sessions", {}), "Session must be active"
+    print("[PASS] Active event supersedes and cancels tombstone")
+
+    # 6. HTTP 4xx drops tombstone immediately (non-retryable)
+    MockBartenderHandler.return_code = 400
+    handle_pane_closed({"pane_id": "w1:pSeq", "workspace_id": "w1"}, {}, bridge_url=mock_url)
+    with cache_mgr as data:
+        assert sid not in data.get("tombstones", {}), "HTTP 4xx must drop tombstone immediately"
+    print("[PASS] HTTP 4xx non-retryable tombstone dropping")
+
+    # 7. Corrupt cache quarantine
+    MockBartenderHandler.return_code = 200
     cache_file = get_state_dir() / "active-sessions.json"
     with open(cache_file, "w") as f:
         f.write("{invalid json: corrupt...")
@@ -564,9 +747,9 @@ def run_unit_tests():
         assert data.get("sessions") == {}, "Expected fresh cache on corrupt file"
     corrupt_files = list(get_state_dir().glob("active-sessions.json.corrupt.*"))
     assert len(corrupt_files) > 0, "Expected corrupt cache to be quarantined"
-    print("[PASS] Corrupt cache quarantine")
+    print("[PASS] Corrupt cache quarantine under lock")
 
-    # 6. Process deadline enforcement under slow network
+    # 8. Process deadline enforcement under slow network
     MockBartenderHandler.delay = 3.0
     t0 = time.monotonic()
     post_bartender_event({"state": "Working", "agent": "Test", "session_id": "timeout-test"}, timeout=0.5, bridge_url=mock_url)
@@ -664,6 +847,7 @@ def main():
         return
 
     # Normal Herdr event dispatch
+    arm_watchdog()
     touch_heartbeat()
     event_name = os.environ.get("HERDR_PLUGIN_EVENT", "")
     event_json_raw = os.environ.get("HERDR_PLUGIN_EVENT_JSON", "{}")
