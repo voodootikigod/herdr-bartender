@@ -15,8 +15,9 @@ import signal
 import urllib.request
 import urllib.error
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 import threading
+import subprocess
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7823
@@ -46,41 +47,18 @@ IN_CRITICAL_SECTION = False
 PENDING_WATCHDOG_EXIT = False
 
 
-def _timeout_watchdog(signum, frame):
-    global PENDING_WATCHDOG_EXIT
-    if IN_CRITICAL_SECTION:
-        PENDING_WATCHDOG_EXIT = True
-        return
-    log_debug("Watchdog deadline exceeded (SIGALRM)")
-    sys.exit(0)
-
-
-def arm_watchdog():
-    if hasattr(signal, "SIGALRM"):
-        try:
-            signal.signal(signal.SIGALRM, _timeout_watchdog)
-            if hasattr(signal, "setitimer"):
-                signal.setitimer(signal.ITIMER_REAL, PROCESS_DEADLINE_SECONDS)
-            else:
-                signal.alarm(int(PROCESS_DEADLINE_SECONDS) + 1)
-        except Exception:
-            pass
-
-
-def is_pid_alive(pid: int | None) -> bool:
-    if not pid or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
-def time_remaining() -> float:
-    elapsed = time.monotonic() - START_TIME
-    rem = PROCESS_DEADLINE_SECONDS - elapsed
-    return max(0.1, rem)
+def get_state_dir() -> Path:
+    state_env = os.environ.get("HERDR_PLUGIN_STATE_DIR")
+    if state_env:
+        p = Path(state_env)
+    else:
+        xdg_state = os.environ.get("XDG_STATE_HOME")
+        if xdg_state:
+            p = Path(xdg_state) / "herdr" / "plugins" / "herdr-bartender"
+        else:
+            p = Path.home() / ".local" / "state" / "herdr" / "plugins" / "herdr-bartender"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 def get_sanitized_hostname() -> str:
@@ -99,18 +77,63 @@ def get_bridge_url() -> str:
     return f"http://{host}:{port}"
 
 
-def get_state_dir() -> Path:
-    state_env = os.environ.get("HERDR_PLUGIN_STATE_DIR")
-    if state_env:
-        p = Path(state_env)
-    else:
-        xdg_state = os.environ.get("XDG_STATE_HOME")
-        if xdg_state:
-            p = Path(xdg_state) / "herdr" / "plugins" / "herdr-bartender"
-        else:
-            p = Path.home() / ".local" / "state" / "herdr" / "plugins" / "herdr-bartender"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+def time_remaining() -> float:
+    elapsed = time.monotonic() - START_TIME
+    rem = PROCESS_DEADLINE_SECONDS - elapsed
+    return max(0.1, rem)
+
+
+def _timeout_watchdog(signum, frame):
+    global PENDING_WATCHDOG_EXIT
+    if IN_CRITICAL_SECTION:
+        PENDING_WATCHDOG_EXIT = True
+        return
+    log_debug("Watchdog deadline exceeded (SIGALRM)")
+    # Non-blocking handoff to background helper before exit
+    try:
+        cache_file = get_state_dir() / "active-sessions.json"
+        if cache_file.exists():
+            with open(cache_file, "r") as f:
+                d = json.load(f)
+                for s in d.get("sessions", {}).values():
+                    if s.get("delivered_seq", 0) < s.get("seq", 0) or s.get("desired_state") == "Ended":
+                        subprocess.Popen(
+                            [sys.executable, str(Path(__file__).resolve()), "--reconcile-background"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            start_new_session=True,
+                        )
+                        break
+    except Exception:
+        pass
+    sys.exit(0)
+
+
+def arm_watchdog():
+    if hasattr(signal, "SIGALRM"):
+        try:
+            signal.signal(signal.SIGALRM, _timeout_watchdog)
+            if hasattr(signal, "setitimer"):
+                signal.setitimer(signal.ITIMER_REAL, PROCESS_DEADLINE_SECONDS)
+        except Exception:
+            pass
+
+
+def is_pid_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def get_safe_pane_id(raw_id: str | None) -> str:
+    if not raw_id:
+        return "default"
+    clean = re.sub(r'[^a-zA-Z0-9_-]', '_', str(raw_id))
+    return clean[:32] or "default"
 
 
 def touch_heartbeat():
@@ -136,7 +159,8 @@ def touch_pane_marker(pane_id: str):
     try:
         panes_dir = get_state_dir() / "panes"
         panes_dir.mkdir(parents=True, exist_ok=True)
-        (panes_dir / pane_id).touch(exist_ok=True)
+        safe_id = get_safe_pane_id(pane_id)
+        (panes_dir / safe_id).touch(exist_ok=True)
     except Exception:
         pass
 
@@ -145,7 +169,8 @@ def remove_pane_marker(pane_id: str):
     if not pane_id:
         return
     try:
-        marker = get_state_dir() / "panes" / pane_id
+        safe_id = get_safe_pane_id(pane_id)
+        marker = get_state_dir() / "panes" / safe_id
         if marker.exists():
             marker.unlink()
     except Exception:
@@ -161,8 +186,8 @@ def log_debug(msg: str):
         pass
 
 
-def post_bartender_event(payload: dict, timeout: float = 0.6, bridge_url: str | None = None) -> tuple[bool, bool]:
-    """Posts event to Bartender Pro bridge. Returns (success: bool, is_4xx: bool)."""
+def post_bartender_event(payload: dict, timeout: float = 0.5, bridge_url: str | None = None) -> tuple[bool, bool]:
+    """Posts event to Bartender Pro bridge. Returns (success: bool, is_non_retryable: bool)."""
     eff_timeout = min(timeout, time_remaining())
     url = f"{bridge_url or get_bridge_url()}/event"
     data = json.dumps(payload).encode("utf-8")
@@ -175,14 +200,23 @@ def post_bartender_event(payload: dict, timeout: float = 0.6, bridge_url: str | 
     try:
         with urllib.request.urlopen(req, timeout=eff_timeout) as resp:
             if resp.status == 200:
-                res_body = json.loads(resp.read().decode("utf-8", errors="ignore"))
-                return (res_body.get("ok") is True, False)
-            is_4xx = 400 <= resp.status < 500
-            return (False, is_4xx)
+                try:
+                    res_body = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                    if res_body.get("ok") is True:
+                        return (True, False)
+                    # 200 with ok:false is non-retryable bridge rejection
+                    return (False, True)
+                except Exception:
+                    return (True, False)
+            elif 300 <= resp.status < 500:
+                return (False, True)
+            else:
+                return (False, False)
     except urllib.error.HTTPError as e:
         log_debug(f"HTTPError {e.code} posting to {url}: {e}")
-        is_4xx = 400 <= e.code < 500
-        return (False, is_4xx)
+        if 300 <= e.code < 500:
+            return (False, True)
+        return (False, False)
     except Exception as e:
         log_debug(f"Failed to post event to {url}: {e}")
         return (False, False)
@@ -317,57 +351,182 @@ def normalize_pane_id(raw_pane_id: str, workspace_id: str | None) -> str:
     return f"{ws}:{raw_pane_id}"
 
 
-def retry_undelivered_sessions(cache_mgr: BoundedSessionCache, bridge_url: str | None = None):
-    """Re-sends undelivered non-ended state for sessions where delivered_state != desired_state."""
+def claim_and_replay_spool(state_dir: Path, bridge_url: str | None = None):
+    spool_file = state_dir / "spool.jsonl"
+    if not spool_file.exists():
+        return
+    claimed_file = state_dir / f"spool.{os.getpid()}.claimed"
+    try:
+        os.rename(spool_file, claimed_file)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        log_debug(f"Failed to claim spool: {e}")
+        return
+
+    try:
+        with open(claimed_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                    post_bartender_event(payload, bridge_url=bridge_url)
+                except Exception as e:
+                    log_debug(f"Failed to replay spooled event: {e}")
+    finally:
+        try:
+            if claimed_file.exists():
+                claimed_file.unlink()
+        except Exception:
+            pass
+
+
+def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
     now_wall = time.time()
+    cache_mgr = BoundedSessionCache(state_dir)
+    targets = []
     with cache_mgr as data:
         sessions = data.get("sessions", {})
         if not sessions:
             return
+
+        panes_dir = state_dir / "panes"
+        active_pane_markers = set()
+        if panes_dir.exists():
+            active_pane_markers = {p.name for p in panes_dir.iterdir()}
+
         for sid, s in list(sessions.items()):
-            if s.get("delivered_state") != s.get("desired_state"):
+            pane_id = s.get("pane_id")
+            safe_id = get_safe_pane_id(pane_id)
+            if safe_id not in active_pane_markers and s.get("desired_state") != "Ended":
+                s["desired_state"] = "Ended"
+                s["seq"] = int(s.get("seq", 0)) + 1
+                s["desired_payload"] = {
+                    "state": "Ended",
+                    "agent": s.get("agent", "Herdr"),
+                    "session_id": sid,
+                }
+
+            if (now_wall - s.get("last_event_at", now_wall) > 86400) and s.get("desired_state") != "Ended":
+                s["desired_state"] = "Ended"
+                s["seq"] = int(s.get("seq", 0)) + 1
+                s["desired_payload"] = {
+                    "state": "Ended",
+                    "agent": s.get("agent", "Herdr"),
+                    "session_id": sid,
+                }
+
+            if s.get("delivered_seq", 0) < s.get("seq", 0) or s.get("desired_state") == "Ended":
+                if s.get("desired_state") == "Ended" and s.get("delivery_attempts", 0) >= 5:
+                    s["orphaned_ended"] = True
+                    continue
+                if s.get("desired_state") != "Ended" and s.get("delivery_attempts", 0) >= 3:
+                    continue
+
                 lease = s.get("lease_deadline") or 0
                 sending_pid = s.get("sending_pid")
                 if lease and (now_wall < lease) and is_pid_alive(sending_pid):
-                    continue  # Active sender already in progress
+                    continue
+
                 payload = s.get("desired_payload")
-                if payload:
-                    success, is_4xx = post_bartender_event(payload, bridge_url=bridge_url)
-                    if success:
-                        s["delivered_state"] = s.get("desired_state")
-                        s.pop("last_error", None)
-                        data["last_successful_delivery"] = now_wall
-                        data["consecutive_failures"] = 0
-                        if s.get("desired_state") == "Ended":
-                            sessions.pop(sid, None)
-                    elif is_4xx:
-                        s["last_error"] = "4xx rejected"
-                        if s.get("desired_state") == "Ended":
-                            sessions.pop(sid, None)
-                    else:
-                        s["last_error"] = "retryable delivery error"
-                        data["consecutive_failures"] = data.get("consecutive_failures", 0) + 1
+                if not payload:
+                    payload = {
+                        "state": s.get("desired_state", "Working"),
+                        "agent": s.get("agent", "Herdr"),
+                        "session_id": sid,
+                    }
+                targets.append((sid, s.get("desired_state"), s.get("seq", 1), pane_id, payload))
         cache_mgr.save(data)
+
+    for sid, target_state, target_seq, pane_id, payload in targets:
+        success, is_non_retryable = post_bartender_event(payload, timeout=0.2, bridge_url=bridge_url)
+        with cache_mgr as data:
+            s = data.get("sessions", {}).get(sid)
+            if not s:
+                continue
+            if success or is_non_retryable:
+                s["delivered_state"] = target_state
+                s["delivered_seq"] = target_seq
+                s["delivery_attempts"] = 0
+                s.pop("delivery_error", None)
+                if success:
+                    data["last_successful_delivery"] = time.time()
+                    data["consecutive_failures"] = 0
+                if target_state == "Ended" and s.get("seq") == target_seq:
+                    data.get("sessions", {}).pop(sid, None)
+                    remove_pane_marker(pane_id)
+            else:
+                s["delivery_attempts"] = s.get("delivery_attempts", 0) + 1
+                s["delivery_error"] = "retryable network error"
+                data["consecutive_failures"] = data.get("consecutive_failures", 0) + 1
+                if s.get("desired_state") == "Ended" and s.get("delivery_attempts", 0) >= 5:
+                    s["orphaned_ended"] = True
+            cache_mgr.save(data)
+
+
+def run_reconcile_background(bridge_url: str | None = None):
+    state_dir = get_state_dir()
+    lock_file = state_dir / "reconciler.lock"
+    lock_fd = None
+    try:
+        lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except Exception:
+                pass
+        return
+
+    try:
+        claim_and_replay_spool(state_dir, bridge_url=bridge_url)
+        reconcile_active_sessions(state_dir, bridge_url=bridge_url)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        except Exception:
+            pass
+
+
+def retry_undelivered_sessions(cache_mgr: BoundedSessionCache, bridge_url: str | None = None):
+    reconcile_active_sessions(cache_mgr.state_dir, bridge_url=bridge_url)
 
 
 def run_cleanup(bridge_url: str | None = None) -> bool:
     touch_heartbeat()
-    cache_mgr = BoundedSessionCache(get_state_dir())
+    state_dir = get_state_dir()
+    cache_mgr = BoundedSessionCache(state_dir)
     now = time.time()
     all_cleared = True
+    target_sessions = []
     with cache_mgr as data:
         sessions = data.get("sessions", {})
         for session_id, info in list(sessions.items()):
-            payload = {"state": "Ended", "agent": info.get("agent", "Herdr"), "session_id": session_id}
-            success, is_4xx = post_bartender_event(payload, bridge_url=bridge_url)
-            if success or is_4xx:
-                sessions.pop(session_id, None)
-            else:
-                all_cleared = False
-                info["desired_state"] = "Ended"
-                info["delivery_attempts"] = info.get("delivery_attempts", 0) + 1
-                info["last_attempt"] = now
+            seq = int(info.get("seq", 0)) + 1
+            info["seq"] = seq
+            info["desired_state"] = "Ended"
+            target_sessions.append((session_id, info.get("pane_id"), info.get("agent", "Herdr"), seq))
         cache_mgr.save(data)
+
+    for sid, pane_id, agent_name, target_seq in target_sessions:
+        payload = {"state": "Ended", "agent": agent_name, "session_id": sid}
+        success, is_non_retryable = post_bartender_event(payload, timeout=0.2, bridge_url=bridge_url)
+        with cache_mgr as data:
+            s = data.get("sessions", {}).get(sid)
+            if s:
+                if success or is_non_retryable:
+                    if s.get("seq") == target_seq:
+                        data.get("sessions", {}).pop(sid, None)
+                        remove_pane_marker(pane_id)
+                else:
+                    all_cleared = False
+                    s["delivery_attempts"] = s.get("delivery_attempts", 0) + 1
+                    s["last_attempt"] = now
+            cache_mgr.save(data)
     return all_cleared
 
 
@@ -394,7 +553,6 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             raw_agent = context.get("focused_pane_agent")
 
         # Anti-Flap Rule: Herdr may report unknown transiently during reattach/startup.
-        # Do not evict; retain existing session state until pane.closed is received.
         if agent_status == "unknown":
             log_debug(f"Debouncing transient unknown status for pane {canonical_pane}")
             return
@@ -419,7 +577,7 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
         if source_ts and last_source_ts and source_ts < last_source_ts:
             return
 
-        new_seq = sessions.get(session_id, {}).get("seq", 0) + 1
+        new_seq = int(sessions.get(session_id, {}).get("seq", 0)) + 1
         touch_pane_marker(canonical_pane)
 
         payload = {
@@ -445,17 +603,17 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             "desired_state": mapped_state,
             "desired_payload": payload,
             "seq": new_seq,
-            "last_source_timestamp": source_ts or now_wall,
+            "last_event_at": now_wall,
         })
+        if source_ts:
+            session_record["last_source_timestamp"] = source_ts
 
         active_lease = session_record.get("lease_deadline") or 0
         sending_pid = session_record.get("sending_pid")
-        # Wall clock sanity: if lease_deadline is > 5s in future, consider invalid
         if active_lease and (active_lease > now_wall + 5.0):
             active_lease = 0
 
         if active_lease and (now_wall < active_lease) and is_pid_alive(sending_pid):
-            # Active in-flight transmission for this session; state is staged, active sender will drain it
             cache_mgr.save(data)
             return
 
@@ -471,35 +629,35 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
 
     # 2. Outside lock: transmit and drain queue with lease ownership verification
     while current_payload:
-        success, is_4xx = post_bartender_event(current_payload, bridge_url=bridge_url)
+        success, is_non_retryable = post_bartender_event(current_payload, bridge_url=bridge_url)
         with cache_mgr as data:
             s = data.get("sessions", {}).get(session_id)
             if not s:
                 break
-            # Ownership verification: ensure our lease token was not superseded
             if s.get("lease_token") != my_token:
                 log_debug(f"Lease token superseded for {session_id}, exiting drain loop")
                 break
 
-            if success:
+            if success or is_non_retryable:
                 s["delivered_state"] = transmitting_state
                 s["delivered_seq"] = transmitting_seq
                 s.pop("last_error", None)
-                data["last_successful_delivery"] = time.time()
-                data["consecutive_failures"] = 0
-                touch_heartbeat()
+                if success:
+                    data["last_successful_delivery"] = time.time()
+                    data["consecutive_failures"] = 0
+                    touch_heartbeat()
 
-                # Active Supersession check on Ended: only evict if no newer state was requested
+                # Active Supersession check on Ended
                 if transmitting_state == "Ended" and s.get("seq") == transmitting_seq:
                     data.get("sessions", {}).pop(session_id, None)
+                    remove_pane_marker(canonical_pane)
                     cache_mgr.save(data)
                     break
             else:
-                s["last_error"] = "4xx rejected" if is_4xx else "network error"
-                if not is_4xx:
-                    data["consecutive_failures"] = data.get("consecutive_failures", 0) + 1
-                    if data["consecutive_failures"] >= 3:
-                        remove_heartbeat()
+                s["last_error"] = "retryable network error"
+                data["consecutive_failures"] = data.get("consecutive_failures", 0) + 1
+                if data["consecutive_failures"] >= 3:
+                    remove_heartbeat()
 
             # Drain check: if a newer state was requested while in-flight, loop and transmit it
             if s.get("delivered_seq", 0) < s.get("seq", 0) and time_remaining() > 0.3:
@@ -512,6 +670,17 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
                 s["sending_pid"] = None
                 s["lease_token"] = None
                 s["lease_deadline"] = None
+                if s.get("delivered_seq", 0) < s.get("seq", 0):
+                    # Process ran out of deadline budget; hand off to background helper
+                    try:
+                        subprocess.Popen(
+                            [sys.executable, str(Path(__file__).resolve()), "--reconcile-background"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            start_new_session=True,
+                        )
+                    except Exception:
+                        pass
                 cache_mgr.save(data)
                 current_payload = None
 
@@ -531,23 +700,25 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
         sessions = data.get("sessions", {})
         for sid, info in list(sessions.items()):
             if info.get("pane_id") == canonical_pane or sid.endswith(f":{canonical_pane}"):
-                target_sessions.append((sid, info))
+                seq = int(info.get("seq", 0)) + 1
                 info["desired_state"] = "Ended"
-                info["seq"] = time.time()
+                info["seq"] = seq
+                target_sessions.append((sid, info.get("agent", "Herdr"), seq))
         if target_sessions:
             cache_mgr.save(data)
 
     # Dispatch Ended outside lock
-    for sid, info in target_sessions:
-        success, is_4xx = post_bartender_event(
-            {"state": "Ended", "agent": info.get("agent", "Herdr"), "session_id": sid},
+    for sid, agent_name, target_seq in target_sessions:
+        success, is_non_retryable = post_bartender_event(
+            {"state": "Ended", "agent": agent_name, "session_id": sid},
             bridge_url=bridge_url
         )
-        if success or is_4xx:
+        if success or is_non_retryable:
             with cache_mgr as data:
                 s = data.get("sessions", {}).get(sid)
-                if s and s.get("desired_state") == "Ended":
+                if s and s.get("desired_state") == "Ended" and s.get("seq") == target_seq:
                     data.get("sessions", {}).pop(sid, None)
+                    remove_pane_marker(canonical_pane)
                     cache_mgr.save(data)
 
 
@@ -564,22 +735,24 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
         sessions = data.get("sessions", {})
         for sid, info in list(sessions.items()):
             if info.get("tab_id") == tab_id or (tab_id.endswith(str(info.get("tab_id")))):
-                target_sessions.append((sid, info))
+                seq = int(info.get("seq", 0)) + 1
                 info["desired_state"] = "Ended"
-                info["seq"] = time.time()
+                info["seq"] = seq
+                target_sessions.append((sid, info.get("pane_id"), info.get("agent", "Herdr"), seq))
         if target_sessions:
             cache_mgr.save(data)
 
-    for sid, info in target_sessions:
-        success, is_4xx = post_bartender_event(
-            {"state": "Ended", "agent": info.get("agent", "Herdr"), "session_id": sid},
+    for sid, pane_id, agent_name, target_seq in target_sessions:
+        success, is_non_retryable = post_bartender_event(
+            {"state": "Ended", "agent": agent_name, "session_id": sid},
             bridge_url=bridge_url
         )
-        if success or is_4xx:
+        if success or is_non_retryable:
             with cache_mgr as data:
                 s = data.get("sessions", {}).get(sid)
-                if s and s.get("desired_state") == "Ended":
+                if s and s.get("desired_state") == "Ended" and s.get("seq") == target_seq:
                     data.get("sessions", {}).pop(sid, None)
+                    remove_pane_marker(pane_id)
                     cache_mgr.save(data)
 
 
@@ -596,22 +769,24 @@ def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | N
         sessions = data.get("sessions", {})
         for sid, info in list(sessions.items()):
             if info.get("workspace_id") == workspace_id or f":{workspace_id}:" in sid:
-                target_sessions.append((sid, info))
+                seq = int(info.get("seq", 0)) + 1
                 info["desired_state"] = "Ended"
-                info["seq"] = time.time()
+                info["seq"] = seq
+                target_sessions.append((sid, info.get("pane_id"), info.get("agent", "Herdr"), seq))
         if target_sessions:
             cache_mgr.save(data)
 
-    for sid, info in target_sessions:
-        success, is_4xx = post_bartender_event(
-            {"state": "Ended", "agent": info.get("agent", "Herdr"), "session_id": sid},
+    for sid, pane_id, agent_name, target_seq in target_sessions:
+        success, is_non_retryable = post_bartender_event(
+            {"state": "Ended", "agent": agent_name, "session_id": sid},
             bridge_url=bridge_url
         )
-        if success or is_4xx:
+        if success or is_non_retryable:
             with cache_mgr as data:
                 s = data.get("sessions", {}).get(sid)
-                if s and s.get("desired_state") == "Ended":
+                if s and s.get("desired_state") == "Ended" and s.get("seq") == target_seq:
                     data.get("sessions", {}).pop(sid, None)
+                    remove_pane_marker(pane_id)
                     cache_mgr.save(data)
 
 
@@ -669,12 +844,15 @@ class MockBartenderHandler(BaseHTTPRequestHandler):
 
 def run_unit_tests():
     print("=== Running Comprehensive Hardened Unit Test Suite ===")
+    global PROCESS_DEADLINE_SECONDS, START_TIME
+    PROCESS_DEADLINE_SECONDS = 60.0
+    START_TIME = time.monotonic()
     MockBartenderHandler.sessions = {}
     MockBartenderHandler.history = []
     MockBartenderHandler.delay = 0.0
     MockBartenderHandler.return_code = 200
 
-    server = HTTPServer(("127.0.0.1", 0), MockBartenderHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), MockBartenderHandler)
     mock_port = server.server_port
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
@@ -803,6 +981,41 @@ def run_unit_tests():
     print(f"[PASS] Bounded request timeout enforcement ({elapsed:.2f}s < 1.0s)")
 
     MockBartenderHandler.delay = 0.0
+
+    # 9. Atomic spool claim protocol
+    spool_file = get_state_dir() / "spool.jsonl"
+    with open(spool_file, "w") as f:
+        f.write(json.dumps({"state": "Working", "agent": "SpoolAgent", "session_id": "spool-session-1"}) + "\n")
+        f.write(json.dumps({"state": "Done", "agent": "SpoolAgent", "session_id": "spool-session-1"}) + "\n")
+    claim_and_replay_spool(get_state_dir(), bridge_url=mock_url)
+    assert not spool_file.exists(), "spool.jsonl should be consumed"
+    claimed_files = list(get_state_dir().glob("spool.*.claimed"))
+    assert len(claimed_files) == 0, "No claimed spool files should remain"
+    spool_events = [e for e in MockBartenderHandler.history if e.get("session_id") == "spool-session-1"]
+    assert len(spool_events) == 2, f"Expected 2 spooled events delivered, got {len(spool_events)}"
+    print("[PASS] Atomic spool claim and replay protocol")
+
+    # 10. Reconciler singleton lock
+    lock_file = get_state_dir() / "reconciler.lock"
+    test_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(test_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    # Background reconciler should detect held lock and return cleanly
+    run_reconcile_background(bridge_url=mock_url)
+    fcntl.flock(test_fd, fcntl.LOCK_UN)
+    os.close(test_fd)
+    print("[PASS] Background reconciler singleton lock guard")
+
+    # 11. Per-pane marker lifecycle & sanitization
+    test_pane = "w1:test/dangerous:pane..id"
+    safe_pane = get_safe_pane_id(test_pane)
+    assert "/" not in safe_pane and ".." not in safe_pane, f"Unsafe characters in {safe_pane}"
+    touch_pane_marker(test_pane)
+    marker_path = get_state_dir() / "panes" / safe_pane
+    assert marker_path.exists(), f"Expected marker at {marker_path}"
+    remove_pane_marker(test_pane)
+    assert not marker_path.exists(), f"Marker should be removed from {marker_path}"
+    print("[PASS] Per-pane marker lifecycle and identity sanitization")
+
     server.shutdown()
     print("=== ALL COMPREHENSIVE UNIT TESTS PASSED ===")
 
@@ -889,6 +1102,10 @@ def main():
         cache_mgr = BoundedSessionCache(get_state_dir())
         with cache_mgr as data:
             print(json.dumps(data, indent=2))
+        return
+
+    if "--reconcile-background" in args:
+        run_reconcile_background()
         return
 
     # Normal Herdr event dispatch
