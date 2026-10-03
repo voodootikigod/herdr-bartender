@@ -7,9 +7,15 @@ into Bartender Pro's Top Shelf (NotchBar) HTTP bridge.
 import sys
 import os
 import json
+import socket
+import re
+import fcntl
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7823
@@ -32,6 +38,14 @@ STATUS_MAP = {
     "idle": "Idle",         # Idle at prompt
 }
 
+ANSI_REGEX = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
+
+def get_sanitized_hostname() -> str:
+    raw = socket.gethostname().split('.')[0].lower()
+    clean = re.sub(r'[^a-z0-9_-]', '', raw)
+    return clean or "local"
+
 
 def get_bridge_url() -> str:
     host = os.environ.get("NOTCHBAR_AGENTS_HOST") or DEFAULT_HOST
@@ -39,8 +53,39 @@ def get_bridge_url() -> str:
     return f"http://{host}:{port}"
 
 
-def post_bartender_event(payload: dict, timeout: float = 1.0) -> bool:
-    url = f"{get_bridge_url()}/event"
+def get_state_dir() -> Path:
+    state_env = os.environ.get("HERDR_PLUGIN_STATE_DIR")
+    if state_env:
+        p = Path(state_env)
+    else:
+        xdg_state = os.environ.get("XDG_STATE_HOME")
+        if xdg_state:
+            p = Path(xdg_state) / "herdr" / "plugins" / "herdr-bartender"
+        else:
+            p = Path.home() / ".local" / "state" / "herdr" / "plugins" / "herdr-bartender"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def touch_heartbeat():
+    try:
+        marker = get_state_dir() / "plugin-active"
+        marker.touch(exist_ok=True)
+    except Exception:
+        pass
+
+
+def log_debug(msg: str):
+    try:
+        log_file = get_state_dir() / "plugin.log"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def post_bartender_event(payload: dict, timeout: float = 1.0, bridge_url: str | None = None) -> bool:
+    url = f"{bridge_url or get_bridge_url()}/event"
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -51,51 +96,77 @@ def post_bartender_event(payload: dict, timeout: float = 1.0) -> bool:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status == 200
-    except Exception:
+    except Exception as e:
+        log_debug(f"Failed to post event to {url}: {e}")
         return False
 
 
-def check_bridge_health(timeout: float = 1.0) -> dict | None:
-    url = f"{get_bridge_url()}/health"
+def check_bridge_health(timeout: float = 1.0, bridge_url: str | None = None) -> dict | None:
+    url = f"{bridge_url or get_bridge_url()}/health"
     req = urllib.request.Request(url, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status == 200:
                 return json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        pass
+    except Exception as e:
+        log_debug(f"Health check failed for {url}: {e}")
     return None
 
 
-def get_state_dir() -> Path:
-    state_env = os.environ.get("HERDR_PLUGIN_STATE_DIR")
-    if state_env:
-        p = Path(state_env)
-    else:
-        p = Path.home() / ".local" / "state" / "herdr" / "plugins" / "herdr-bartender"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+class LockedSessionCache:
+    """Thread/Process-safe session cache using fcntl file locking and atomic replacement."""
+
+    def __init__(self, state_dir: Path):
+        self.state_dir = state_dir
+        self.cache_file = state_dir / "active-sessions.json"
+        self.lock_file = state_dir / "active-sessions.lock"
+        self._lock_fd = None
+
+    def __enter__(self):
+        self._lock_fd = os.open(str(self.lock_file), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
+        return self._load()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if self._lock_fd is not None:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                os.close(self._lock_fd)
+        except Exception:
+            pass
+
+    def _load(self) -> dict:
+        if not self.cache_file.exists():
+            return {"version": 1, "host": get_sanitized_hostname(), "sessions": {}}
+        try:
+            with open(self.cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if not isinstance(data, dict) or "sessions" not in data:
+                    return {"version": 1, "host": get_sanitized_hostname(), "sessions": {}}
+                return data
+        except Exception as e:
+            log_debug(f"Error reading cache (resetting): {e}")
+            return {"version": 1, "host": get_sanitized_hostname(), "sessions": {}}
+
+    def save(self, data: dict):
+        try:
+            data["last_updated"] = time.time()
+            data["host"] = get_sanitized_hostname()
+            tmp_path = self.state_dir / f"active-sessions.json.tmp.{os.getpid()}"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.cache_file)
+        except Exception as e:
+            log_debug(f"Error saving cache: {e}")
 
 
-def load_sessions(state_file: Path) -> dict:
-    if not state_file.exists():
-        return {}
-    try:
-        with open(state_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data.get("sessions", {})
-    except Exception:
-        return {}
-
-
-def save_sessions(state_file: Path, sessions: dict):
-    try:
-        tmp_file = state_file.with_suffix(".tmp")
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump({"sessions": sessions}, f, indent=2)
-        tmp_file.replace(state_file)
-    except Exception:
-        pass
+def sanitize_title(raw: str | None) -> str:
+    if not raw:
+        return ""
+    stripped = ANSI_REGEX.sub('', str(raw)).strip()
+    return stripped[:120]
 
 
 def format_agent_name(raw_agent: str | None) -> str:
@@ -107,23 +178,23 @@ def format_agent_name(raw_agent: str | None) -> str:
 
 
 def run_cleanup():
-    state_file = get_state_dir() / "active-sessions.json"
-    sessions = load_sessions(state_file)
-    for session_id, info in sessions.items():
-        payload = {
-            "state": "Ended",
-            "agent": info.get("agent", "Herdr"),
-            "session_id": session_id,
-        }
-        post_bartender_event(payload)
-    if state_file.exists():
-        try:
-            state_file.unlink()
-        except Exception:
-            pass
+    touch_heartbeat()
+    cache_mgr = LockedSessionCache(get_state_dir())
+    with cache_mgr as data:
+        sessions = data.get("sessions", {})
+        for session_id, info in list(sessions.items()):
+            payload = {
+                "state": "Ended",
+                "agent": info.get("agent", "Herdr"),
+                "session_id": session_id,
+            }
+            post_bartender_event(payload)
+        data["sessions"] = {}
+        cache_mgr.save(data)
 
 
 def handle_agent_status_changed(event_data: dict, context: dict):
+    touch_heartbeat()
     agent_status = event_data.get("agent_status")
     pane_id = event_data.get("pane_id") or context.get("focused_pane_id")
     workspace_id = event_data.get("workspace_id") or context.get("workspace_id") or "w1"
@@ -132,126 +203,270 @@ def handle_agent_status_changed(event_data: dict, context: dict):
     if not pane_id:
         return
 
-    session_id = f"herdr:{workspace_id}:{pane_id}"
-    state_file = get_state_dir() / "active-sessions.json"
-    sessions = load_sessions(state_file)
+    host = get_sanitized_hostname()
+    session_id = f"herdr:{host}:{workspace_id}:{pane_id}"
 
-    raw_agent = event_data.get("agent") or context.get("focused_pane_agent")
-    
-    # If no agent detected and not already tracked, ignore normal shell churn
-    if not raw_agent and session_id not in sessions:
-        if agent_status in ("idle", "unknown", None):
+    cache_mgr = LockedSessionCache(get_state_dir())
+    with cache_mgr as data:
+        sessions = data.get("sessions", {})
+        raw_agent = event_data.get("agent") or context.get("focused_pane_agent")
+
+        # Agent qualification filter
+        if not raw_agent and session_id not in sessions:
+            if agent_status in ("idle", "unknown", None):
+                return
+
+        # If agent crashed, exited, or released -> Ended
+        if agent_status == "unknown":
+            if session_id in sessions:
+                info = sessions.pop(session_id)
+                post_bartender_event({
+                    "state": "Ended",
+                    "agent": info.get("agent", "Herdr"),
+                    "session_id": session_id,
+                })
+                cache_mgr.save(data)
             return
 
-    mapped_state = STATUS_MAP.get(agent_status)
-    if not mapped_state:
-        if agent_status == "unknown" and session_id in sessions:
-            # Agent released / exited
-            post_bartender_event({
-                "state": "Ended",
-                "agent": sessions[session_id].get("agent", "Herdr"),
-                "session_id": session_id,
-            })
-            del sessions[session_id]
-            save_sessions(state_file, sessions)
-        return
+        mapped_state = STATUS_MAP.get(agent_status)
+        if not mapped_state:
+            return
 
-    agent_name = format_agent_name(raw_agent or (sessions.get(session_id, {}).get("raw_agent")))
-    title = event_data.get("title") or context.get("workspace_label") or f"Pane {pane_id}"
-    cwd = context.get("focused_pane_cwd") or context.get("workspace_cwd") or ""
+        agent_name = format_agent_name(raw_agent or sessions.get(session_id, {}).get("raw_agent"))
+        raw_title = event_data.get("title") or context.get("workspace_label") or f"Pane {pane_id}"
+        title = sanitize_title(raw_title)
+        cwd = context.get("focused_pane_cwd") or context.get("workspace_cwd") or ""
 
-    payload = {
-        "state": mapped_state,
-        "agent": agent_name,
-        "session_id": session_id,
-        "title": title[:120],
-        "cwd": cwd,
-        "terminal": "Herdr",
-        "event": "pane.agent_status_changed",
-    }
-
-    if post_bartender_event(payload):
-        sessions[session_id] = {
-            "pane_id": pane_id,
-            "workspace_id": workspace_id,
-            "tab_id": tab_id,
-            "agent": agent_name,
-            "raw_agent": raw_agent,
-            "title": title,
+        payload = {
             "state": mapped_state,
+            "agent": agent_name,
+            "session_id": session_id,
+            "title": title,
+            "cwd": cwd,
+            "terminal": "Herdr",
+            "event": "pane.agent_status_changed",
         }
-        save_sessions(state_file, sessions)
+
+        # Synchronous bounded POST
+        if post_bartender_event(payload):
+            sessions[session_id] = {
+                "pane_id": pane_id,
+                "workspace_id": workspace_id,
+                "tab_id": tab_id,
+                "host": host,
+                "agent": agent_name,
+                "raw_agent": raw_agent,
+                "title": title,
+                "cwd": cwd,
+                "state": mapped_state,
+                "updated_at": time.time(),
+            }
+            cache_mgr.save(data)
 
 
 def handle_pane_closed(event_data: dict, context: dict):
+    touch_heartbeat()
     pane_id = event_data.get("pane_id") or context.get("focused_pane_id")
-    workspace_id = event_data.get("workspace_id") or context.get("workspace_id") or ""
-    state_file = get_state_dir() / "active-sessions.json"
-    sessions = load_sessions(state_file)
+    if not pane_id:
+        return
 
-    target_sessions = []
-    for sid, info in list(sessions.items()):
-        if info.get("pane_id") == pane_id or sid.endswith(f":{pane_id}"):
-            target_sessions.append((sid, info))
+    cache_mgr = LockedSessionCache(get_state_dir())
+    with cache_mgr as data:
+        sessions = data.get("sessions", {})
+        target_sessions = [
+            (sid, info) for sid, info in list(sessions.items())
+            if info.get("pane_id") == pane_id or sid.endswith(f":{pane_id}")
+        ]
 
-    for sid, info in target_sessions:
-        post_bartender_event({
-            "state": "Ended",
-            "agent": info.get("agent", "Herdr"),
-            "session_id": sid,
-        })
-        sessions.pop(sid, None)
+        for sid, info in target_sessions:
+            post_bartender_event({
+                "state": "Ended",
+                "agent": info.get("agent", "Herdr"),
+                "session_id": sid,
+            })
+            sessions.pop(sid, None)
 
-    save_sessions(state_file, sessions)
+        if target_sessions:
+            cache_mgr.save(data)
 
 
 def handle_tab_closed(event_data: dict, context: dict):
+    touch_heartbeat()
     tab_id = event_data.get("tab_id") or context.get("tab_id")
     if not tab_id:
         return
-    state_file = get_state_dir() / "active-sessions.json"
-    sessions = load_sessions(state_file)
 
-    target_sessions = []
-    for sid, info in list(sessions.items()):
-        if info.get("tab_id") == tab_id:
-            target_sessions.append((sid, info))
+    cache_mgr = LockedSessionCache(get_state_dir())
+    with cache_mgr as data:
+        sessions = data.get("sessions", {})
+        target_sessions = [
+            (sid, info) for sid, info in list(sessions.items())
+            if info.get("tab_id") == tab_id
+        ]
 
-    for sid, info in target_sessions:
-        post_bartender_event({
-            "state": "Ended",
-            "agent": info.get("agent", "Herdr"),
-            "session_id": sid,
-        })
-        sessions.pop(sid, None)
+        for sid, info in target_sessions:
+            post_bartender_event({
+                "state": "Ended",
+                "agent": info.get("agent", "Herdr"),
+                "session_id": sid,
+            })
+            sessions.pop(sid, None)
 
-    save_sessions(state_file, sessions)
+        if target_sessions:
+            cache_mgr.save(data)
 
 
 def handle_workspace_closed(event_data: dict, context: dict):
+    touch_heartbeat()
     workspace_id = event_data.get("workspace_id") or context.get("workspace_id")
     if not workspace_id:
         return
-    state_file = get_state_dir() / "active-sessions.json"
-    sessions = load_sessions(state_file)
 
-    target_sessions = []
-    for sid, info in list(sessions.items()):
-        if info.get("workspace_id") == workspace_id or sid.startswith(f"herdr:{workspace_id}:"):
-            target_sessions.append((sid, info))
+    cache_mgr = LockedSessionCache(get_state_dir())
+    with cache_mgr as data:
+        sessions = data.get("sessions", {})
+        target_sessions = [
+            (sid, info) for sid, info in list(sessions.items())
+            if info.get("workspace_id") == workspace_id or f":{workspace_id}:" in sid
+        ]
 
-    for sid, info in target_sessions:
-        post_bartender_event({
-            "state": "Ended",
-            "agent": info.get("agent", "Herdr"),
-            "session_id": sid,
-        })
-        sessions.pop(sid, None)
+        for sid, info in target_sessions:
+            post_bartender_event({
+                "state": "Ended",
+                "agent": info.get("agent", "Herdr"),
+                "session_id": sid,
+            })
+            sessions.pop(sid, None)
 
-    save_sessions(state_file, sessions)
+        if target_sessions:
+            cache_mgr.save(data)
 
 
-def run_test():
+# ==============================================================================
+# Testing & Diagnostics
+# ==============================================================================
+
+class MockBartenderHandler(BaseHTTPRequestHandler):
+    sessions = {}
+    history = []
+
+    def log_message(self, format, *args):
+        pass  # Quiet mock
+
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": True, "port": self.server.server_port, "sessions": len(self.sessions)}).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/event":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode("utf-8")
+            data = json.loads(body)
+            MockBartenderHandler.history.append(data)
+            sid = data.get("session_id")
+            state = data.get("state")
+            if state == "Ended":
+                MockBartenderHandler.sessions.pop(sid, None)
+            else:
+                MockBartenderHandler.sessions[sid] = data
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+def run_unit_tests():
+    print("=== Running Hermetic Unit Test Suite ===")
+    server = HTTPServer(("127.0.0.1", 0), MockBartenderHandler)
+    mock_port = server.server_port
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    mock_url = f"http://127.0.0.1:{mock_port}"
+    os.environ["NOTCHBAR_AGENTS_HOST"] = "127.0.0.1"
+    os.environ["NOTCHBAR_AGENTS_PORT"] = str(mock_port)
+
+    # 1. Health check
+    health = check_bridge_health(bridge_url=mock_url)
+    assert health and health["ok"] is True and health["sessions"] == 0, f"Health check failed: {health}"
+    print("[PASS] Mock bridge health check")
+
+    # 2. Lifecycle transitions
+    handle_agent_status_changed(
+        {"agent_status": "working", "pane_id": "p1", "workspace_id": "w1", "agent": "claude", "title": "Unit test turn"},
+        {"tab_id": "t1"}
+    )
+    assert len(MockBartenderHandler.sessions) == 1
+    assert list(MockBartenderHandler.sessions.values())[0]["state"] == "Working"
+    print("[PASS] Working status transition")
+
+    handle_agent_status_changed(
+        {"agent_status": "blocked", "pane_id": "p1", "workspace_id": "w1", "agent": "claude"},
+        {"tab_id": "t1"}
+    )
+    assert list(MockBartenderHandler.sessions.values())[0]["state"] == "Waiting"
+    print("[PASS] Blocked -> Waiting attention transition")
+
+    handle_agent_status_changed(
+        {"agent_status": "unknown", "pane_id": "p1", "workspace_id": "w1"},
+        {"tab_id": "t1"}
+    )
+    assert len(MockBartenderHandler.sessions) == 0
+    print("[PASS] Unknown -> Ended cleanup transition")
+
+    # 3. Cascading container closures (tab & workspace)
+    handle_agent_status_changed(
+        {"agent_status": "working", "pane_id": "pA", "workspace_id": "wTest", "agent": "codex"},
+        {"tab_id": "tabAlpha", "workspace_id": "wTest"}
+    )
+    handle_agent_status_changed(
+        {"agent_status": "working", "pane_id": "pB", "workspace_id": "wTest", "agent": "claude"},
+        {"tab_id": "tabBeta", "workspace_id": "wTest"}
+    )
+    assert len(MockBartenderHandler.sessions) == 2
+
+    # Close tabAlpha
+    handle_tab_closed({"tab_id": "tabAlpha"}, {})
+    assert len(MockBartenderHandler.sessions) == 1
+    assert "pB" in list(MockBartenderHandler.sessions.keys())[0]
+    print("[PASS] tab.closed targeted cascade")
+
+    # Close wTest
+    handle_workspace_closed({"workspace_id": "wTest"}, {})
+    assert len(MockBartenderHandler.sessions) == 0
+    print("[PASS] workspace.closed multi-session cascade")
+
+    # 4. Concurrency lock stress
+    def worker(worker_id):
+        for i in range(5):
+            handle_agent_status_changed(
+                {"agent_status": "working", "pane_id": f"p_conc_{worker_id}", "workspace_id": "wConc", "agent": "claude"},
+                {"tab_id": "tConc"}
+            )
+            handle_pane_closed({"pane_id": f"p_conc_{worker_id}"}, {})
+
+    threads = [threading.Thread(target=worker, args=(tid,)) for tid in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(MockBartenderHandler.sessions) == 0
+    print("[PASS] Concurrency and flock stress test")
+
+    server.shutdown()
+    print("=== ALL UNIT TESTS PASSED ===")
+
+
+def run_live_test():
     print(f"Checking Bartender bridge at {get_bridge_url()}...")
     health = check_bridge_health()
     if not health:
@@ -259,7 +474,8 @@ def run_test():
         sys.exit(1)
     print(f"[+] Bartender bridge is healthy: {health}")
 
-    test_session = "herdr:test_workspace:test_pane_1"
+    host = get_sanitized_hostname()
+    test_session = f"herdr:{host}:test_workspace:test_pane_1"
     print("\n1. Emitting 'Working' state...")
     post_bartender_event({
         "state": "Working",
@@ -270,7 +486,6 @@ def run_test():
     })
     print("   Sent Working. Top Shelf should show active spinner.")
 
-    import time
     time.sleep(1.5)
 
     print("\n2. Emitting 'Waiting' state (Awaiting input / attention)...")
@@ -306,14 +521,18 @@ def run_test():
     print("   Sent Ended. Session removed from Top Shelf.")
 
     final_health = check_bridge_health()
-    print(f"\n[+] Test complete! Final bridge health: {final_health}")
+    print(f"\n[+] Live test complete! Final bridge health: {final_health}")
 
 
 def main():
     args = sys.argv[1:]
 
+    if "--unit-test" in args:
+        run_unit_tests()
+        return
+
     if "--test" in args:
-        run_test()
+        run_live_test()
         return
 
     if "--health" in args:
@@ -326,11 +545,13 @@ def main():
         return
 
     if "--sessions" in args:
-        state_file = get_state_dir() / "active-sessions.json"
-        print(json.dumps(load_sessions(state_file), indent=2))
+        cache_mgr = LockedSessionCache(get_state_dir())
+        with cache_mgr as data:
+            print(json.dumps(data, indent=2))
         return
 
     # Normal Herdr event dispatch
+    touch_heartbeat()
     event_name = os.environ.get("HERDR_PLUGIN_EVENT", "")
     event_json_raw = os.environ.get("HERDR_PLUGIN_EVENT_JSON", "{}")
     context_json_raw = os.environ.get("HERDR_PLUGIN_CONTEXT_JSON", "{}")
