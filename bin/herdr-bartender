@@ -676,7 +676,7 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
 
                 lease = s.get("lease_deadline") or 0
                 sending_pid = s.get("sending_pid")
-                if lease and (now_wall < lease) and is_pid_alive(sending_pid):
+                if lease and (now_wall < lease) and (sending_pid != os.getpid()) and is_pid_alive(sending_pid):
                     continue
 
                 payload = s.get("desired_payload")
@@ -689,15 +689,22 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
                         "terminal": "Herdr",
                         "seq": s.get("seq", 1),
                     }
-                targets.append((sid, s.get("desired_state"), s.get("seq", 1), pane_id, payload))
+                my_token = f"{os.getpid()}:{now_wall}:{sid}"
+                s["lease_token"] = my_token
+                s["sending_pid"] = os.getpid()
+                s["lease_deadline"] = now_wall + 1.5
+                targets.append((sid, s.get("desired_state"), s.get("seq", 1), pane_id, payload, my_token))
         cache_mgr.save(data)
 
-    for sid, target_state, target_seq, pane_id, payload in targets:
+    for sid, target_state, target_seq, pane_id, payload, my_token in targets:
         success, is_non_retryable = post_bartender_event(payload, timeout=0.2, bridge_url=bridge_url)
         with cache_mgr as data:
             s = data.get("sessions", {}).get(sid)
-            if not s:
+            if not s or s.get("lease_token") != my_token:
                 continue
+            s["sending_pid"] = None
+            s["lease_token"] = None
+            s["lease_deadline"] = None
             if success:
                 s["delivered_state"] = target_state
                 s["delivered_seq"] = target_seq
@@ -738,7 +745,7 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
             cache_mgr.save(data)
 
 
-def run_reconcile_background(bridge_url: str | None = None):
+def run_reconcile_background(bridge_url: str | None = None, loop_once: bool = False):
     if is_disabled():
         return
     state_dir = get_state_dir()
@@ -761,6 +768,7 @@ def run_reconcile_background(bridge_url: str | None = None):
         return
 
     try:
+        cache_mgr = BoundedSessionCache(state_dir)
         while not is_disabled():
             if pending_file.exists():
                 try:
@@ -771,9 +779,25 @@ def run_reconcile_background(bridge_url: str | None = None):
             replay_spool_dir(state_dir, bridge_url=bridge_url)
             reconcile_active_sessions(state_dir, bridge_url=bridge_url)
 
+            # Heartbeat: refresh mtime of active pane markers with confirmed delivery
+            active_count = 0
+            with cache_mgr as data:
+                sessions = data.get("sessions", {})
+                for sid, s in list(sessions.items()):
+                    if s.get("delivered_state") not in (None, "Ended") and s.get("delivery_status") == "delivered":
+                        touch_pane_marker(s.get("pane_id"))
+                        active_count += 1
+
+            # Automatic guard integrity check: verify and re-install if drift occurred
+            intact, missing = verify_vendor_hooks_intact()
+            if not intact and missing:
+                install_hooks()
+
             spool_dir = state_dir / "spool"
             has_spool = spool_dir.exists() and any(spool_dir.glob("*.json"))
-            if not pending_file.exists() and not has_spool:
+            if loop_once or (not pending_file.exists() and not has_spool and active_count == 0):
+                break
+            if loop_once:
                 break
     finally:
         try:
@@ -1012,7 +1036,7 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
         if active_lease and (active_lease > now_wall + 5.0):
             active_lease = 0
 
-        if active_lease and (now_wall < active_lease) and is_pid_alive(sending_pid):
+        if active_lease and (now_wall < active_lease) and (sending_pid != os.getpid()) and is_pid_alive(sending_pid):
             cache_mgr.save(data)
             return
 
@@ -1118,6 +1142,8 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
         return
     cache_mgr = BoundedSessionCache(get_state_dir())
     target_sessions = []
+    now_wall = time.time()
+    my_pid = os.getpid()
 
     with cache_mgr as data:
         sessions = data.get("sessions", {})
@@ -1126,23 +1152,38 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
                 seq = int(info.get("seq", 0)) + 1
                 info["desired_state"] = "Ended"
                 info["seq"] = seq
-                target_sessions.append((sid, info.get("agent", "Herdr"), seq))
-        if target_sessions:
+                lease_deadline = info.get("lease_deadline") or 0.0
+                sending_pid = info.get("sending_pid")
+                is_active = (now_wall < lease_deadline) and (sending_pid != my_pid) and is_pid_alive(sending_pid)
+                if not is_active:
+                    my_token = f"{my_pid}:{time.time()}"
+                    info["lease_token"] = my_token
+                    info["sending_pid"] = my_pid
+                    info["lease_deadline"] = now_wall + 1.5
+                    target_sessions.append((sid, canonical_pane, info.get("agent", "Herdr"), seq, my_token))
+        if sessions:
             cache_mgr.save(data)
 
     # Dispatch Ended outside lock
-    for sid, agent_name, target_seq in target_sessions:
+    for sid, pane_id, agent_name, target_seq, my_token in target_sessions:
         success, is_non_retryable = post_bartender_event(
             {"state": "Ended", "agent": agent_name, "session_id": sid},
             bridge_url=bridge_url
         )
-        if success or is_non_retryable:
-            with cache_mgr as data:
-                s = data.get("sessions", {}).get(sid)
-                if s and s.get("desired_state") == "Ended" and s.get("seq") == target_seq:
+        with cache_mgr as data:
+            s = data.get("sessions", {}).get(sid)
+            if s and s.get("lease_token") == my_token:
+                if (success or is_non_retryable) and s.get("desired_state") == "Ended" and s.get("seq") == target_seq:
                     data.get("sessions", {}).pop(sid, None)
-                    remove_pane_marker(canonical_pane)
-                    cache_mgr.save(data)
+                    remove_pane_marker(pane_id)
+                else:
+                    s["sending_pid"] = None
+                    s["lease_token"] = None
+                    s["lease_deadline"] = None
+                    if not success and not is_non_retryable:
+                        s["delivery_attempts"] = s.get("delivery_attempts", 0) + 1
+                        s["delivery_error"] = "retryable network error"
+            cache_mgr.save(data)
 
 
 def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = None):
@@ -1156,6 +1197,8 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
 
     cache_mgr = BoundedSessionCache(get_state_dir())
     target_sessions = []
+    now_wall = time.time()
+    my_pid = os.getpid()
 
     with cache_mgr as data:
         sessions = data.get("sessions", {})
@@ -1165,22 +1208,37 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
                 seq = int(info.get("seq", 0)) + 1
                 info["desired_state"] = "Ended"
                 info["seq"] = seq
-                target_sessions.append((sid, info.get("pane_id"), info.get("agent", "Herdr"), seq))
-        if target_sessions:
+                lease_deadline = info.get("lease_deadline") or 0.0
+                sending_pid = info.get("sending_pid")
+                is_active = (now_wall < lease_deadline) and (sending_pid != my_pid) and is_pid_alive(sending_pid)
+                if not is_active:
+                    my_token = f"{my_pid}:{time.time()}"
+                    info["lease_token"] = my_token
+                    info["sending_pid"] = my_pid
+                    info["lease_deadline"] = now_wall + 1.5
+                    target_sessions.append((sid, info.get("pane_id"), info.get("agent", "Herdr"), seq, my_token))
+        if sessions:
             cache_mgr.save(data)
 
-    for sid, pane_id, agent_name, target_seq in target_sessions:
+    for sid, pane_id, agent_name, target_seq, my_token in target_sessions:
         success, is_non_retryable = post_bartender_event(
             {"state": "Ended", "agent": agent_name, "session_id": sid},
             bridge_url=bridge_url
         )
-        if success or is_non_retryable:
-            with cache_mgr as data:
-                s = data.get("sessions", {}).get(sid)
-                if s and s.get("desired_state") == "Ended" and s.get("seq") == target_seq:
+        with cache_mgr as data:
+            s = data.get("sessions", {}).get(sid)
+            if s and s.get("lease_token") == my_token:
+                if (success or is_non_retryable) and s.get("desired_state") == "Ended" and s.get("seq") == target_seq:
                     data.get("sessions", {}).pop(sid, None)
                     remove_pane_marker(pane_id)
-                    cache_mgr.save(data)
+                else:
+                    s["sending_pid"] = None
+                    s["lease_token"] = None
+                    s["lease_deadline"] = None
+                    if not success and not is_non_retryable:
+                        s["delivery_attempts"] = s.get("delivery_attempts", 0) + 1
+                        s["delivery_error"] = "retryable network error"
+            cache_mgr.save(data)
 
 
 def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | None = None):
@@ -1194,6 +1252,8 @@ def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | N
 
     cache_mgr = BoundedSessionCache(get_state_dir())
     target_sessions = []
+    now_wall = time.time()
+    my_pid = os.getpid()
 
     with cache_mgr as data:
         sessions = data.get("sessions", {})
@@ -1203,22 +1263,37 @@ def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | N
                 seq = int(info.get("seq", 0)) + 1
                 info["desired_state"] = "Ended"
                 info["seq"] = seq
-                target_sessions.append((sid, info.get("pane_id"), info.get("agent", "Herdr"), seq))
-        if target_sessions:
+                lease_deadline = info.get("lease_deadline") or 0.0
+                sending_pid = info.get("sending_pid")
+                is_active = (now_wall < lease_deadline) and (sending_pid != my_pid) and is_pid_alive(sending_pid)
+                if not is_active:
+                    my_token = f"{my_pid}:{time.time()}"
+                    info["lease_token"] = my_token
+                    info["sending_pid"] = my_pid
+                    info["lease_deadline"] = now_wall + 1.5
+                    target_sessions.append((sid, info.get("pane_id"), info.get("agent", "Herdr"), seq, my_token))
+        if sessions:
             cache_mgr.save(data)
 
-    for sid, pane_id, agent_name, target_seq in target_sessions:
+    for sid, pane_id, agent_name, target_seq, my_token in target_sessions:
         success, is_non_retryable = post_bartender_event(
             {"state": "Ended", "agent": agent_name, "session_id": sid},
             bridge_url=bridge_url
         )
-        if success or is_non_retryable:
-            with cache_mgr as data:
-                s = data.get("sessions", {}).get(sid)
-                if s and s.get("desired_state") == "Ended" and s.get("seq") == target_seq:
+        with cache_mgr as data:
+            s = data.get("sessions", {}).get(sid)
+            if s and s.get("lease_token") == my_token:
+                if (success or is_non_retryable) and s.get("desired_state") == "Ended" and s.get("seq") == target_seq:
                     data.get("sessions", {}).pop(sid, None)
                     remove_pane_marker(pane_id)
-                    cache_mgr.save(data)
+                else:
+                    s["sending_pid"] = None
+                    s["lease_token"] = None
+                    s["lease_deadline"] = None
+                    if not success and not is_non_retryable:
+                        s["delivery_attempts"] = s.get("delivery_attempts", 0) + 1
+                        s["delivery_error"] = "retryable network error"
+            cache_mgr.save(data)
 
 
 # ==============================================================================
@@ -1453,11 +1528,11 @@ def run_unit_tests():
     pending_file = get_state_dir() / "reconciler.pending"
     test_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR, 0o600)
     fcntl.flock(test_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    run_reconcile_background(bridge_url=mock_url)
+    run_reconcile_background(bridge_url=mock_url, loop_once=True)
     assert pending_file.exists(), "Reconciler should touch reconciler.pending when lock is held"
     fcntl.flock(test_fd, fcntl.LOCK_UN)
     os.close(test_fd)
-    run_reconcile_background(bridge_url=mock_url)
+    run_reconcile_background(bridge_url=mock_url, loop_once=True)
     assert not pending_file.exists(), "Reconciler should consume and unlink reconciler.pending"
     print("[PASS] Background reconciler singleton and pending-work re-scan loop")
 
