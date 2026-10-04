@@ -149,12 +149,16 @@ def is_herdr_alive() -> bool:
 HOOK_GUARD_TEMPLATE = """# BEGIN HERDR-BARTENDER DEDUP GUARD
 if [ -n "${HERDR_PANE_ID:-}" ]; then
   STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/herdr-bartender"
-  # Guard check: suppress vendor hook only if healthy, active, and delivering
+  # Guard check: suppress vendor hook only if healthy, active, and delivering confirmed events
   if [ ! -f "$STATE_HOME/DISABLED" ] && [ ! -f "$STATE_HOME/DELIVERY_DOWN" ]; then
     HEX_PANE=$(printf '%s' "$HERDR_PANE_ID" | od -An -tx1 | tr -d ' \\n')
     PANE_MARKER="$STATE_HOME/panes/${HEX_PANE}"
-    if [ -f "$PANE_MARKER" ] && [ ! -f "${PANE_MARKER}.failed" ] && pgrep -xi "herdr" >/dev/null 2>&1; then
-      exit 0
+    if [ -f "$PANE_MARKER" ] && [ ! -f "${PANE_MARKER}.failed" ]; then
+      MARKER_MTIME=$(stat -f %m "$PANE_MARKER" 2>/dev/null || stat -c %Y "$PANE_MARKER" 2>/dev/null || echo 0)
+      NOW_TIME=$(date +%s)
+      if [ $((NOW_TIME - MARKER_MTIME)) -lt 60 ] && pgrep -xi "herdr" >/dev/null 2>&1; then
+        exit 0
+      fi
     fi
   fi
 fi
@@ -221,18 +225,19 @@ def verify_vendor_hooks_intact() -> tuple[bool, list[str]]:
     hooks_dir = get_vendor_hooks_dir()
     if not hooks_dir.exists():
         return False, []
-    hook_files = sorted(hooks_dir.glob("*.sh"))
-    if not hook_files:
-        return False, []
+    named = ["claude-event-hook.sh", "codex-notify-hook.sh"]
     missing = []
-    for hf in hook_files:
+    for name in named:
+        hf = hooks_dir / name
+        if not hf.exists():
+            continue
         try:
             with open(hf, "r", encoding="utf-8") as f:
                 content = f.read()
             if "# BEGIN HERDR-BARTENDER DEDUP GUARD" not in content or "# END HERDR-BARTENDER DEDUP GUARD" not in content:
-                missing.append(hf.name)
+                missing.append(name)
         except Exception:
-            missing.append(hf.name)
+            missing.append(name)
     return (len(missing) == 0), missing
 
 
@@ -243,9 +248,10 @@ def install_hooks() -> bool:
         print(f"[-] Vendor hooks directory not found: {hooks_dir}")
         return False
 
-    hook_files = sorted(hooks_dir.glob("*.sh"))
+    named = ["claude-event-hook.sh", "codex-notify-hook.sh"]
+    hook_files = [hooks_dir / name for name in named if (hooks_dir / name).exists()]
     if not hook_files:
-        print(f"[-] No hook scripts found in {hooks_dir}")
+        print(f"[-] No target hook scripts found in {hooks_dir}")
         return False
 
     state_dir = get_state_dir()
@@ -267,17 +273,17 @@ def install_hooks() -> bool:
             with open(hook, "r", encoding="utf-8") as f:
                 content = f.read()
 
+            bak_path = hook.with_suffix(hook.suffix + ".pristine")
+            if not bak_path.exists() and begin_marker not in content:
+                with open(bak_path, "w", encoding="utf-8") as bf:
+                    bf.write(content)
+                sha_cache[hook.name] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
             if begin_marker in content and end_marker in content:
                 pre = content.split(begin_marker)[0]
                 post = content.split(end_marker)[1]
                 new_content = f"{pre}{HOOK_GUARD_TEMPLATE}{post}"
             else:
-                bak_path = hook.with_suffix(hook.suffix + ".pre-install.bak")
-                if not bak_path.exists():
-                    with open(bak_path, "w", encoding="utf-8") as bf:
-                        bf.write(content)
-                    sha_cache[hook.name] = hashlib.sha256(content.encode("utf-8")).hexdigest()
-
                 lines = content.splitlines(keepends=True)
                 insert_idx = 0
                 for idx, line in enumerate(lines):
@@ -648,6 +654,8 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
                 is_stale = True
             elif s.get("desired_state") == "Waiting" and (now_wall - last_ts > 172800):
                 is_stale = True
+            elif s.get("desired_state") == "Working" and (now_wall - last_ts > 43200):
+                is_stale = True
 
             if is_stale:
                 s["desired_state"] = "Ended"
@@ -677,6 +685,8 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
                         "state": s.get("desired_state", "Working"),
                         "agent": s.get("agent", "Herdr"),
                         "session_id": sid,
+                        "title": s.get("title", f"Session {pane_id or 'unknown'}"),
+                        "terminal": "Herdr",
                         "seq": s.get("seq", 1),
                     }
                 targets.append((sid, s.get("desired_state"), s.get("seq", 1), pane_id, payload))
@@ -696,6 +706,7 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
                 s.pop("delivery_error", None)
                 data["last_successful_delivery"] = time.time()
                 data["consecutive_failures"] = 0
+                touch_pane_marker(pane_id)
                 clear_delivery_down()
                 clear_pane_failed(pane_id)
                 for other_s in data.get("sessions", {}).values():
@@ -715,6 +726,7 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
             else:
                 s["delivery_attempts"] = s.get("delivery_attempts", 0) + 1
                 s["delivery_error"] = "retryable network error"
+                touch_pane_failed(pane_id)
                 data["consecutive_failures"] = data.get("consecutive_failures", 0) + 1
                 if data["consecutive_failures"] >= 3:
                     touch_delivery_down()
@@ -806,6 +818,20 @@ def run_cleanup(bridge_url: str | None = None) -> bool:
                     s["delivery_attempts"] = s.get("delivery_attempts", 0) + 1
                     s["last_attempt"] = now
             cache_mgr.save(data)
+
+    if not all_cleared:
+        try:
+            orphan_path = Path.home() / ".herdr-bartender-orphans.json"
+            with cache_mgr as data:
+                old_umask = os.umask(0o077)
+                try:
+                    with open(orphan_path, "w", encoding="utf-8") as of:
+                        json.dump(data, of, indent=2)
+                finally:
+                    os.umask(old_umask)
+        except Exception:
+            pass
+
     return all_cleared
 
 
@@ -914,10 +940,25 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             if not mapped_state:
                 return
 
-        agent_name = format_agent_name(raw_agent or sessions.get(session_id, {}).get("raw_agent"))
-        raw_title = event_data.get("title") or context.get("workspace_label") or f"Pane {canonical_pane}"
+        is_focused = (context.get("focused_pane_id") == canonical_pane)
+        cached_s = sessions.get(session_id, {})
+
+        resolved_raw_agent = raw_agent
+        if not resolved_raw_agent and is_focused:
+            resolved_raw_agent = context.get("focused_pane_agent")
+        if not resolved_raw_agent:
+            resolved_raw_agent = cached_s.get("raw_agent")
+        agent_name = format_agent_name(resolved_raw_agent)
+
+        raw_title = event_data.get("title") or cached_s.get("title") or context.get("workspace_label") or f"Pane {canonical_pane}"
         title = sanitize_title(raw_title)
-        cwd = context.get("focused_pane_cwd") or context.get("workspace_cwd") or ""
+
+        cwd = event_data.get("cwd")
+        if not cwd and is_focused:
+            cwd = context.get("focused_pane_cwd")
+        if not cwd:
+            cwd = cached_s.get("cwd") or context.get("workspace_cwd") or ""
+
         tab_id = event_data.get("tab_id") or context.get("tab_id")
 
         now_wall = time.time()
@@ -933,7 +974,6 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             return
 
         new_seq = int(session_record.get("seq", 0)) + 1
-        touch_pane_marker(canonical_pane)
 
         payload = {
             "state": mapped_state,
@@ -1005,6 +1045,7 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
                 s.pop("delivery_error", None)
                 data["last_successful_delivery"] = time.time()
                 data["consecutive_failures"] = 0
+                touch_pane_marker(canonical_pane)
                 clear_delivery_down()
                 clear_pane_failed(canonical_pane)
                 for other_s in data.get("sessions", {}).values():
@@ -1028,6 +1069,7 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             else:
                 s["delivery_attempts"] = s.get("delivery_attempts", 0) + 1
                 s["delivery_error"] = "retryable network error"
+                touch_pane_failed(canonical_pane)
                 data["consecutive_failures"] = data.get("consecutive_failures", 0) + 1
                 if data["consecutive_failures"] >= 3:
                     touch_delivery_down()
@@ -1535,6 +1577,19 @@ def run_unit_tests():
     clear_pane_failed("w1:pFail")
     assert not failed_marker.exists(), "Pane failed marker must be cleared"
     print("[PASS] Delivery down & pane failure marker lifecycle")
+
+    # 18. Background pane context isolation
+    handle_agent_status_changed(
+        {"agent_status": "working", "pane_id": "w1:pBackground", "workspace_id": "w1", "agent": "claude"},
+        {"focused_pane_id": "w1:pFocused", "focused_pane_cwd": "/secret/focused/dir", "focused_pane_agent": "codex", "workspace_cwd": "/workspace/default"},
+        bridge_url=mock_url
+    )
+    with cache_mgr as data:
+        s_bg = data["sessions"].get(f"herdr:{get_sanitized_hostname()}:w1:pBackground")
+        assert s_bg is not None, "Background session must exist"
+        assert s_bg.get("cwd") == "/workspace/default", f"Background pane must not inherit focused pane cwd: {s_bg.get('cwd')}"
+        assert s_bg.get("agent") == "Claude (Herdr)", f"Background pane must not inherit focused pane agent: {s_bg.get('agent')}"
+    print("[PASS] Background pane context isolation")
 
     server.shutdown()
     print("=== ALL COMPREHENSIVE UNIT TESTS PASSED ===")
