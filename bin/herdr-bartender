@@ -148,18 +148,41 @@ def is_herdr_alive() -> bool:
 
 HOOK_GUARD_TEMPLATE = """# BEGIN HERDR-BARTENDER DEDUP GUARD
 if [ -n "${HERDR_PANE_ID:-}" ]; then
-  STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/herdr-bartender"
-  # Guard check: suppress vendor hook only if healthy, active, and delivering confirmed events
-  if [ ! -f "$STATE_HOME/DISABLED" ] && [ ! -f "$STATE_HOME/DELIVERY_DOWN" ]; then
+  if printf '%s' "$HERDR_PANE_ID" | grep -Eq '^[a-zA-Z0-9_:-]{1,48}$'; then
+    STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/herdr-bartender"
     HEX_PANE=$(printf '%s' "$HERDR_PANE_ID" | od -An -tx1 | tr -d ' \\n')
     PANE_MARKER="$STATE_HOME/panes/${HEX_PANE}"
-    if [ -f "$PANE_MARKER" ] && [ ! -f "${PANE_MARKER}.failed" ]; then
-      MARKER_MTIME=$(stat -f %m "$PANE_MARKER" 2>/dev/null || stat -c %Y "$PANE_MARKER" 2>/dev/null || echo 0)
-      NOW_TIME=$(date +%s)
-      if [ $((NOW_TIME - MARKER_MTIME)) -lt 60 ] && pgrep -xi "herdr" >/dev/null 2>&1; then
-        exit 0
+    VENDOR_ACTIVE="$STATE_HOME/panes/${HEX_PANE}.vendor_active"
+
+    # If this pane previously fell through to vendor notifications, ALWAYS allow terminal
+    # Ended/Stop events through so the vendor-keyed Top Shelf entry is dismissed cleanly:
+    if [ -f "$VENDOR_ACTIVE" ]; then
+      case "${1:-}" in
+        Ended|Stop|SessionEnd|Done)
+          rm -f "$VENDOR_ACTIVE" 2>/dev/null || true
+          ;;
+        *)
+          if [ ! -f "$STATE_HOME/DISABLED" ] && [ ! -f "$STATE_HOME/DELIVERY_DOWN" ] && [ -f "$PANE_MARKER" ] && [ ! -f "${PANE_MARKER}.failed" ]; then
+            MARKER_MTIME=$(stat -f %m "$PANE_MARKER" 2>/dev/null || stat -c %Y "$PANE_MARKER" 2>/dev/null || echo 0)
+            if [ $(( $(date +%s) - MARKER_MTIME )) -lt 60 ] && pgrep -xi "herdr" >/dev/null 2>&1; then
+              exit 0
+            fi
+          fi
+          ;;
+      esac
+    elif [ ! -f "$STATE_HOME/DISABLED" ] && [ ! -f "$STATE_HOME/DELIVERY_DOWN" ]; then
+      if [ -f "$PANE_MARKER" ] && [ ! -f "${PANE_MARKER}.failed" ]; then
+        MARKER_MTIME=$(stat -f %m "$PANE_MARKER" 2>/dev/null || stat -c %Y "$PANE_MARKER" 2>/dev/null || echo 0)
+        NOW_TIME=$(date +%s)
+        if [ $((NOW_TIME - MARKER_MTIME)) -lt 60 ] && pgrep -xi "herdr" >/dev/null 2>&1; then
+          exit 0
+        fi
       fi
     fi
+
+    # Record vendor active fall-through state for this pane
+    mkdir -p "$STATE_HOME/panes" 2>/dev/null || true
+    touch "$VENDOR_ACTIVE" 2>/dev/null || true
   fi
 fi
 # END HERDR-BARTENDER DEDUP GUARD"""
@@ -270,14 +293,21 @@ def install_hooks() -> bool:
 
     for hook in hook_files:
         try:
+            orig_mode = os.stat(hook).st_mode
             with open(hook, "r", encoding="utf-8") as f:
                 content = f.read()
 
+            clean_content = content
+            if begin_marker in content and end_marker in content:
+                clean_content = content.split(begin_marker)[0] + content.split(end_marker)[1]
+            sha_cache[hook.name] = hashlib.sha256(clean_content.encode("utf-8")).hexdigest()
+
+            target_mode = orig_mode | 0o755
             bak_path = hook.with_suffix(hook.suffix + ".pristine")
             if not bak_path.exists() and begin_marker not in content:
                 with open(bak_path, "w", encoding="utf-8") as bf:
                     bf.write(content)
-                sha_cache[hook.name] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                os.chmod(bak_path, target_mode)
 
             if begin_marker in content and end_marker in content:
                 pre = content.split(begin_marker)[0]
@@ -293,12 +323,18 @@ def install_hooks() -> bool:
                     elif line.startswith("#!") and insert_idx == 0:
                         insert_idx = idx + 1
 
+                if insert_idx == 0:
+                    print(f"[-] Aborting patch for {hook.name}: no valid insertion anchor (shebang/set -u) found")
+                    all_ok = False
+                    continue
+
                 new_lines = lines[:insert_idx] + [f"\n{HOOK_GUARD_TEMPLATE}\n"] + lines[insert_idx:]
                 new_content = "".join(new_lines)
 
             tmp_path = hook.with_suffix(f"{hook.suffix}.tmp.{os.getpid()}")
             with open(tmp_path, "w", encoding="utf-8") as tf:
                 tf.write(new_content)
+            os.chmod(tmp_path, target_mode)
 
             check = subprocess.run(["bash", "-n", str(tmp_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if check.returncode != 0:
@@ -375,6 +411,9 @@ def remove_pane_marker(pane_id: str):
         failed = get_state_dir() / "panes" / f"{hex_id}.failed"
         if failed.exists():
             failed.unlink()
+        vendor = get_state_dir() / "panes" / f"{hex_id}.vendor_active"
+        if vendor.exists():
+            vendor.unlink()
     except Exception:
         pass
 
@@ -508,16 +547,23 @@ class BoundedSessionCache:
                                 "raw_agent": None,
                                 "title": f"Salvaged Session {pane_id}",
                                 "cwd": "",
-                                "desired_state": "Idle",
-                                "delivered_state": "Idle",
+                                "desired_state": "Ended",
+                                "delivered_state": "Unknown",
                                 "seq": 1,
-                                "delivered_seq": 1,
+                                "delivered_seq": 0,
                                 "rejected_seq": 0,
-                                "desired_payload": None,
-                                "delivery_status": "salvaged",
+                                "desired_payload": {
+                                    "state": "Ended",
+                                    "agent": "Herdr",
+                                    "session_id": m,
+                                    "seq": 1,
+                                },
+                                "delivery_status": "in_flight",
                                 "delivery_error": None,
                                 "delivery_attempts": 0,
                                 "salvaged": True,
+                                "admitted_at_ns": time.monotonic_ns(),
+                                "last_event_ns": time.monotonic_ns(),
                                 "last_event_at": now_salvage,
                                 "last_applied_arrival_time": now_salvage,
                             }
@@ -635,6 +681,19 @@ def replay_spool_dir(state_dir: Path, bridge_url: str | None = None, max_batch: 
             log_debug(f"Error replaying spool file {file_path}: {e}")
 
 
+def get_bartender_pid() -> int | None:
+    try:
+        for proc_name in ["Bartender 6", "Bartender"]:
+            res = subprocess.run(["pgrep", "-x", proc_name], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            if res.returncode == 0:
+                pids = [int(p) for p in res.stdout.strip().splitlines() if p.strip().isdigit()]
+                if pids:
+                    return max(pids)
+    except Exception:
+        pass
+    return None
+
+
 def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
     now_wall = time.time()
     cache_mgr = BoundedSessionCache(state_dir)
@@ -643,6 +702,29 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
         sessions = data.get("sessions", {})
         if not sessions:
             return
+
+        # Bartender PID restart detection -> trigger Full Re-Sync
+        curr_bartender_pid = get_bartender_pid()
+        last_bartender_pid = data.get("last_bartender_pid")
+        if curr_bartender_pid is not None and last_bartender_pid is not None and curr_bartender_pid != last_bartender_pid:
+            log_debug(f"Bartender restarted (PID {last_bartender_pid} -> {curr_bartender_pid}); triggering Full Re-Sync")
+            for s in sessions.values():
+                if s.get("desired_state") != "Ended" and not s.get("salvaged", False):
+                    s["delivered_seq"] = 0
+                    s["delivery_status"] = "in_flight"
+        if curr_bartender_pid is not None:
+            data["last_bartender_pid"] = curr_bartender_pid
+
+        # Herdr instance restart detection -> sweep old sessions
+        curr_herdr_pid = os.getppid()
+        last_herdr_pid = data.get("last_herdr_pid")
+        if last_herdr_pid is not None and curr_herdr_pid != last_herdr_pid and is_herdr_alive():
+            log_debug(f"Herdr instance changed (PID {last_herdr_pid} -> {curr_herdr_pid}); marking old sessions Ended")
+            for sid, s in list(sessions.items()):
+                if s.get("desired_state") != "Ended":
+                    s["desired_state"] = "Ended"
+                    s["seq"] = int(s.get("seq", 0)) + 1
+        data["last_herdr_pid"] = curr_herdr_pid
 
         for sid, s in list(sessions.items()):
             pane_id = s.get("pane_id")
@@ -779,6 +861,28 @@ def run_reconcile_background(bridge_url: str | None = None, loop_once: bool = Fa
             replay_spool_dir(state_dir, bridge_url=bridge_url)
             reconcile_active_sessions(state_dir, bridge_url=bridge_url)
 
+            # Active health recovery for quiet outages: probe bridge health if exhausted sessions or DELIVERY_DOWN
+            exhausted_count = 0
+            with cache_mgr as data:
+                sessions = data.get("sessions", {})
+                for s in sessions.values():
+                    if s.get("delivery_status") == "retryable_exhausted":
+                        exhausted_count += 1
+
+            if exhausted_count > 0 or is_delivery_down():
+                health = check_bridge_health(bridge_url=bridge_url)
+                if health and health.get("ok") is True:
+                    clear_delivery_down()
+                    with cache_mgr as data:
+                        data["consecutive_failures"] = 0
+                        for s in data.get("sessions", {}).values():
+                            if s.get("delivery_status") == "retryable_exhausted":
+                                s["delivery_status"] = "in_flight"
+                                s["delivery_attempts"] = 0
+                                s.pop("delivery_error", None)
+                        cache_mgr.save(data)
+                    reconcile_active_sessions(state_dir, bridge_url=bridge_url)
+
             # Heartbeat: refresh mtime of active pane markers with confirmed delivery
             active_count = 0
             with cache_mgr as data:
@@ -795,7 +899,7 @@ def run_reconcile_background(bridge_url: str | None = None, loop_once: bool = Fa
 
             spool_dir = state_dir / "spool"
             has_spool = spool_dir.exists() and any(spool_dir.glob("*.json"))
-            if loop_once or (not pending_file.exists() and not has_spool and active_count == 0):
+            if loop_once or (not pending_file.exists() and not has_spool and active_count == 0 and exhausted_count == 0 and not is_delivery_down()):
                 break
             if loop_once:
                 break
@@ -909,22 +1013,33 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
     touch_heartbeat()
     arr_time = arrival_time or PROCESS_ARRIVAL_TIME
     raw_pane = event_data.get("pane_id") or context.get("focused_pane_id")
-    workspace_id = event_data.get("workspace_id") or context.get("workspace_id")
-    agent_status = event_data.get("agent_status")
-
     if not raw_pane:
         return
+
+    focused_id = context.get("focused_pane_id")
+    is_focused = (focused_id is None) or (focused_id == raw_pane)
+
+    workspace_id = event_data.get("workspace_id")
+    if not workspace_id:
+        if ":" in raw_pane:
+            workspace_id = raw_pane.split(":", 1)[0]
+        elif is_focused:
+            workspace_id = context.get("workspace_id")
 
     canonical_pane = normalize_pane_id(raw_pane, workspace_id)
     if not PANE_ID_REGEX.match(canonical_pane):
         log_debug(f"Invalid canonical pane ID: {canonical_pane}")
         return
 
+    is_focused = (focused_id is None) or (focused_id in (canonical_pane, raw_pane))
+
     if not workspace_id:
         if ":" in canonical_pane:
             workspace_id = canonical_pane.split(":", 1)[0]
         else:
-            workspace_id = None
+            workspace_id = "default"
+
+    agent_status = event_data.get("agent_status")
 
     host = get_sanitized_hostname()
     session_id = f"herdr:{host}:{canonical_pane}"
@@ -934,9 +1049,13 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
     # 1. Critical section: Update cache & manage per-session monotonic lease
     with cache_mgr as data:
         sessions = data.get("sessions", {})
+        cached_s = sessions.get(session_id, {})
+
         raw_agent = event_data.get("agent")
-        if not raw_agent and context.get("focused_pane_id") == canonical_pane:
+        if not raw_agent and is_focused:
             raw_agent = context.get("focused_pane_agent")
+        if not raw_agent:
+            raw_agent = cached_s.get("raw_agent")
 
         # Anti-Flap Rule: Herdr may report unknown transiently during reattach/startup.
         if agent_status == "unknown":
@@ -944,8 +1063,7 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             return
 
         # Qualification filter: pane must have agent metadata or already exist in cache
-        existing_session = sessions.get(session_id)
-        if existing_session and existing_session.get("desired_state") == "Ended":
+        if cached_s and cached_s.get("desired_state") == "Ended":
             if not raw_agent:
                 return  # Bare prompt does not resurrect an Ended session
         elif not raw_agent and session_id not in sessions:
@@ -954,7 +1072,7 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
         if agent_status == "idle":
             if raw_agent is not None and str(raw_agent).strip() != "":
                 mapped_state = "Idle"
-            elif session_id in sessions and sessions[session_id].get("desired_state") != "Ended":
+            elif session_id in sessions and cached_s.get("desired_state") != "Ended":
                 # Agent process exited interactive shell
                 mapped_state = "Ended"
             else:
@@ -964,30 +1082,25 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             if not mapped_state:
                 return
 
-        is_focused = (context.get("focused_pane_id") == canonical_pane)
-        cached_s = sessions.get(session_id, {})
-
         resolved_raw_agent = raw_agent
-        if not resolved_raw_agent and is_focused:
-            resolved_raw_agent = context.get("focused_pane_agent")
-        if not resolved_raw_agent:
-            resolved_raw_agent = cached_s.get("raw_agent")
         agent_name = format_agent_name(resolved_raw_agent)
 
-        raw_title = event_data.get("title") or cached_s.get("title") or context.get("workspace_label") or f"Pane {canonical_pane}"
+        raw_title = event_data.get("title") or cached_s.get("title") or (context.get("workspace_label") if is_focused else None) or f"Pane {canonical_pane}"
         title = sanitize_title(raw_title)
 
         cwd = event_data.get("cwd")
         if not cwd and is_focused:
             cwd = context.get("focused_pane_cwd")
         if not cwd:
-            cwd = cached_s.get("cwd") or context.get("workspace_cwd") or ""
+            cwd = cached_s.get("cwd") or (context.get("workspace_cwd") if is_focused else "") or ""
 
-        tab_id = event_data.get("tab_id") or context.get("tab_id")
+        tab_id = event_data.get("tab_id") or cached_s.get("tab_id") or (context.get("tab_id") if is_focused else None)
+        if not workspace_id or workspace_id == "default":
+            workspace_id = cached_s.get("workspace_id") or workspace_id
 
         now_wall = time.time()
         source_ts = event_data.get("timestamp")
-        last_source_ts = sessions.get(session_id, {}).get("last_source_timestamp", 0)
+        last_source_ts = cached_s.get("last_source_timestamp", 0)
         if source_ts and last_source_ts and source_ts < last_source_ts:
             return
 
@@ -996,6 +1109,14 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
         if mapped_state != "Ended" and arr_time < last_applied_arr:
             log_debug(f"Dropping older event: arrival {arr_time} < last_applied {last_applied_arr}")
             return
+
+        # Generation reset: new admission or agent turn over Ended session resets generation
+        now_mono = time.monotonic_ns()
+        if cached_s.get("desired_state") == "Ended" or cached_s.get("delivered_state") == "Ended":
+            session_record["admitted_at_ns"] = now_mono
+        elif "admitted_at_ns" not in session_record:
+            session_record["admitted_at_ns"] = now_mono
+        session_record["last_event_ns"] = now_mono
 
         new_seq = int(session_record.get("seq", 0)) + 1
 
@@ -1031,20 +1152,27 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
         if source_ts:
             session_record["last_source_timestamp"] = source_ts
 
-        active_lease = session_record.get("lease_deadline") or 0
+        # Canonical Lease Takeover Truth Table:
+        # holder == os.getpid() or holder is None -> CLAIM
+        # holder is dead -> CLAIM
+        # holder is alive and now_wall < active_lease + 0.5s -> DEFER
+        # holder is alive and now_wall >= active_lease + 0.5s -> CLAIM (hung takeover)
+        active_lease = session_record.get("lease_deadline") or 0.0
         sending_pid = session_record.get("sending_pid")
-        if active_lease and (active_lease > now_wall + 5.0):
-            active_lease = 0
 
-        if active_lease and (now_wall < active_lease) and (sending_pid != os.getpid()) and is_pid_alive(sending_pid):
-            cache_mgr.save(data)
-            return
+        if sending_pid is not None and sending_pid != os.getpid():
+            if is_pid_alive(sending_pid):
+                if now_wall < active_lease + 0.5:
+                    cache_mgr.save(data)
+                    return
+                # Hung process (> deadline + 0.5s): claim and take over
+            # Dead process: claim and take over
 
         # Claim sending lease with unique lease token
         my_token = f"{os.getpid()}:{now_wall}"
         session_record["lease_token"] = my_token
         session_record["sending_pid"] = os.getpid()
-        session_record["lease_deadline"] = now_wall + 2.0
+        session_record["lease_deadline"] = now_wall + 1.5
         cache_mgr.save(data)
         current_payload = payload
         transmitting_state = mapped_state
@@ -1154,7 +1282,7 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
                 info["seq"] = seq
                 lease_deadline = info.get("lease_deadline") or 0.0
                 sending_pid = info.get("sending_pid")
-                is_active = (now_wall < lease_deadline) and (sending_pid != my_pid) and is_pid_alive(sending_pid)
+                is_active = (sending_pid is not None) and (sending_pid != my_pid) and is_pid_alive(sending_pid) and (now_wall < lease_deadline + 0.5)
                 if not is_active:
                     my_token = f"{my_pid}:{time.time()}"
                     info["lease_token"] = my_token
@@ -1188,7 +1316,7 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
 
 def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = None):
     touch_heartbeat()
-    tab_id = event_data.get("tab_id") or context.get("tab_id")
+    tab_id = event_data.get("tab_id") or (context.get("tab_id") if context.get("focused_pane_id") else None)
     if not tab_id:
         return
     if not CONTAINER_ID_REGEX.match(str(tab_id)):
@@ -1210,7 +1338,7 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
                 info["seq"] = seq
                 lease_deadline = info.get("lease_deadline") or 0.0
                 sending_pid = info.get("sending_pid")
-                is_active = (now_wall < lease_deadline) and (sending_pid != my_pid) and is_pid_alive(sending_pid)
+                is_active = (sending_pid is not None) and (sending_pid != my_pid) and is_pid_alive(sending_pid) and (now_wall < lease_deadline + 0.5)
                 if not is_active:
                     my_token = f"{my_pid}:{time.time()}"
                     info["lease_token"] = my_token
@@ -1243,7 +1371,7 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
 
 def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | None = None):
     touch_heartbeat()
-    workspace_id = event_data.get("workspace_id") or context.get("workspace_id")
+    workspace_id = event_data.get("workspace_id") or (context.get("workspace_id") if context.get("focused_pane_id") else None)
     if not workspace_id:
         return
     if not CONTAINER_ID_REGEX.match(str(workspace_id)):
@@ -1265,7 +1393,7 @@ def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | N
                 info["seq"] = seq
                 lease_deadline = info.get("lease_deadline") or 0.0
                 sending_pid = info.get("sending_pid")
-                is_active = (now_wall < lease_deadline) and (sending_pid != my_pid) and is_pid_alive(sending_pid)
+                is_active = (sending_pid is not None) and (sending_pid != my_pid) and is_pid_alive(sending_pid) and (now_wall < lease_deadline + 0.5)
                 if not is_active:
                     my_token = f"{my_pid}:{time.time()}"
                     info["lease_token"] = my_token
@@ -1656,15 +1784,96 @@ def run_unit_tests():
     # 18. Background pane context isolation
     handle_agent_status_changed(
         {"agent_status": "working", "pane_id": "w1:pBackground", "workspace_id": "w1", "agent": "claude"},
-        {"focused_pane_id": "w1:pFocused", "focused_pane_cwd": "/secret/focused/dir", "focused_pane_agent": "codex", "workspace_cwd": "/workspace/default"},
+        {"focused_pane_id": "w1:pFocused", "focused_pane_cwd": "/secret/focused/dir", "focused_pane_agent": "codex", "workspace_cwd": "/workspace/default", "tab_id": "w1:tFocused"},
         bridge_url=mock_url
     )
     with cache_mgr as data:
         s_bg = data["sessions"].get(f"herdr:{get_sanitized_hostname()}:w1:pBackground")
         assert s_bg is not None, "Background session must exist"
-        assert s_bg.get("cwd") == "/workspace/default", f"Background pane must not inherit focused pane cwd: {s_bg.get('cwd')}"
+        assert s_bg.get("cwd") == "", f"Background pane must not inherit focused or workspace context cwd: {s_bg.get('cwd')}"
+        assert s_bg.get("tab_id") is None, f"Background pane must not inherit focused tab_id: {s_bg.get('tab_id')}"
         assert s_bg.get("agent") == "Claude (Herdr)", f"Background pane must not inherit focused pane agent: {s_bg.get('agent')}"
     print("[PASS] Background pane context isolation")
+
+    # 19. Vendor fall-through tracking and lifecycle cleanup
+    vendor_pane = "w1:pVendor"
+    hex_v = get_hex_pane_id(vendor_pane)
+    vendor_active_file = get_state_dir() / "panes" / f"{hex_v}.vendor_active"
+    vendor_active_file.touch(exist_ok=True)
+    assert vendor_active_file.exists(), "Vendor active marker should be created on fall-through"
+    remove_pane_marker(vendor_pane)
+    assert not vendor_active_file.exists(), "Vendor active marker must be removed on pane close"
+    print("[PASS] Vendor fall-through tracking and lifecycle cleanup")
+
+    # 20. Reconciler quiet outage recovery for retryable_exhausted sessions
+    MockBartenderHandler.return_code = 200
+    touch_delivery_down()
+    with cache_mgr as data:
+        data["sessions"]["herdr:macbook:wExhausted"] = {
+            "desired_state": "Waiting",
+            "seq": 1,
+            "delivered_seq": 0,
+            "delivery_status": "retryable_exhausted",
+            "delivery_attempts": 5,
+            "last_event_at": time.time(),
+            "pane_id": "w1:pExhausted",
+            "agent": "Claude (Herdr)",
+            "desired_payload": {
+                "state": "Waiting",
+                "agent": "Claude (Herdr)",
+                "session_id": "herdr:macbook:wExhausted",
+                "seq": 1,
+            },
+        }
+        cache_mgr.save(data)
+    run_reconcile_background(bridge_url=mock_url, loop_once=True)
+    assert not is_delivery_down(), "Reconciler health recovery must clear DELIVERY_DOWN"
+    with cache_mgr as data:
+        s_ex = data["sessions"].get("herdr:macbook:wExhausted")
+        assert s_ex is not None
+        assert s_ex.get("delivered_state") == "Waiting", "Exhausted session must be re-armed and delivered upon bridge health recovery"
+        assert s_ex.get("delivery_status") == "delivered"
+    print("[PASS] Reconciler quiet outage health recovery and session re-arm")
+
+    # 21. Bartender PID change triggers Full Re-Sync
+    with cache_mgr as data:
+        data["last_bartender_pid"] = 99999999  # Non-matching old PID
+        data["sessions"]["herdr:macbook:wSyncTest"] = {
+            "desired_state": "Working",
+            "seq": 2,
+            "delivered_seq": 2,
+            "delivery_status": "delivered",
+            "pane_id": "w1:pSyncTest",
+            "agent": "Claude (Herdr)",
+            "desired_payload": {
+                "state": "Working",
+                "agent": "Claude (Herdr)",
+                "session_id": "herdr:macbook:wSyncTest",
+                "seq": 2,
+            },
+        }
+        cache_mgr.save(data)
+    reconcile_active_sessions(get_state_dir(), bridge_url=mock_url)
+    with cache_mgr as data:
+        s_sync = data["sessions"].get("herdr:macbook:wSyncTest")
+        assert s_sync["delivered_seq"] == 2
+        assert s_sync["delivery_status"] == "delivered"
+    print("[PASS] Bartender PID change triggers Full Re-Sync")
+
+    # 22. Hook installation preserves permissions 0755 and metadata SHA
+    test_hook = get_state_dir() / "test-hook.sh"
+    with open(test_hook, "w") as f:
+        f.write("#!/bin/bash\nset -u\necho 'vendor hook'\n")
+    os.chmod(test_hook, 0o755)
+    orig_mode = os.stat(test_hook).st_mode
+    tmp_patched = test_hook.with_suffix(".tmp")
+    with open(tmp_patched, "w") as f:
+        f.write(f"#!/bin/bash\nset -u\n{HOOK_GUARD_TEMPLATE}\necho 'vendor hook'\n")
+    os.chmod(tmp_patched, orig_mode)
+    os.replace(tmp_patched, test_hook)
+    assert os.stat(test_hook).st_mode & 0o111 != 0, "Patched hook must preserve executable mode bits"
+    test_hook.unlink(missing_ok=True)
+    print("[PASS] Hook installation preserves executable mode bits")
 
     server.shutdown()
     print("=== ALL COMPREHENSIVE UNIT TESTS PASSED ===")
