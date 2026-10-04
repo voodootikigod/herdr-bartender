@@ -50,6 +50,7 @@ CONTAINER_ID_REGEX = re.compile(r'^[a-zA-Z0-9_:-]{1,48}$')
 
 START_TIME = time.monotonic()
 PROCESS_ARRIVAL_TIME = time.time()
+PROCESS_ARRIVAL_TIME_NS = time.time_ns()
 IN_CRITICAL_SECTION = False
 PENDING_WATCHDOG_EXIT = False
 
@@ -154,65 +155,111 @@ if [ -n "${HERDR_PANE_ID:-}" ]; then
     PANE_MARKER="$STATE_HOME/panes/${HEX_PANE}"
     VENDOR_ACTIVE="$STATE_HOME/panes/${HEX_PANE}.vendor_active"
 
-    # If this pane previously fell through to vendor notifications, ALWAYS allow terminal
-    # Ended/Stop events through so the vendor-keyed Top Shelf entry is dismissed cleanly:
-    if [ -f "$VENDOR_ACTIVE" ]; then
-      case "${1:-}" in
-        Ended|Stop|SessionEnd|Done)
-          rm -f "$VENDOR_ACTIVE" 2>/dev/null || true
-          ;;
-        *)
-          if [ ! -f "$STATE_HOME/DISABLED" ] && [ ! -f "$STATE_HOME/DELIVERY_DOWN" ] && [ -f "$PANE_MARKER" ] && [ ! -f "${PANE_MARKER}.failed" ]; then
-            MARKER_MTIME=$(stat -f %m "$PANE_MARKER" 2>/dev/null || stat -c %Y "$PANE_MARKER" 2>/dev/null || echo 0)
-            if [ $(( $(date +%s) - MARKER_MTIME )) -lt 60 ] && pgrep -xi "herdr" >/dev/null 2>&1; then
-              exit 0
-            fi
-          fi
-          ;;
-      esac
-    elif [ ! -f "$STATE_HOME/DISABLED" ] && [ ! -f "$STATE_HOME/DELIVERY_DOWN" ]; then
-      if [ -f "$PANE_MARKER" ] && [ ! -f "${PANE_MARKER}.failed" ]; then
-        MARKER_MTIME=$(stat -f %m "$PANE_MARKER" 2>/dev/null || stat -c %Y "$PANE_MARKER" 2>/dev/null || echo 0)
-        NOW_TIME=$(date +%s)
-        if [ $((NOW_TIME - MARKER_MTIME)) -lt 60 ] && pgrep -xi "herdr" >/dev/null 2>&1; then
-          exit 0
-        fi
+    # Also compute qualified marker if HERDR_WORKSPACE_ID is set
+    QUALIFIED_PANE_MARKER=""
+    if [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
+      HEX_QUALIFIED=$(printf '%s:%s' "$HERDR_WORKSPACE_ID" "$HERDR_PANE_ID" | od -An -tx1 | tr -d ' \\n')
+      QUALIFIED_PANE_MARKER="$STATE_HOME/panes/${HEX_QUALIFIED}"
+    fi
+
+    # Read stdin non-destructively so downstream vendor hook still receives payload
+    _GUARD_INPUT=""
+    if [ ! -t 0 ]; then
+      _GUARD_INPUT=$(cat)
+      exec <<< "$_GUARD_INPUT"
+    fi
+
+    _IS_TERMINAL=0
+    case "${1:-}" in
+      Ended|Stop|SessionEnd|Done) _IS_TERMINAL=1 ;;
+    esac
+    if [ "$_IS_TERMINAL" -eq 0 ] && [ -n "${_GUARD_INPUT:-}" ]; then
+      if printf '%s' "$_GUARD_INPUT" | grep -Eq '"(hook_event_name|event|state)"[[:space:]]*:[[:space:]]*"(Ended|Stop|SessionEnd|Done)"'; then
+        _IS_TERMINAL=1
       fi
     fi
 
-    # Record vendor active fall-through state for this pane
-    mkdir -p "$STATE_HOME/panes" 2>/dev/null || true
-    touch "$VENDOR_ACTIVE" 2>/dev/null || true
+    if [ "$_IS_TERMINAL" -eq 1 ]; then
+      # Terminal event: clear .vendor_active if present, allow event through to clean up vendor Top Shelf entry
+      rm -f "$VENDOR_ACTIVE" 2>/dev/null || true
+    elif [ -f "$VENDOR_ACTIVE" ]; then
+      # Non-terminal event, but this pane previously fell through to vendor.
+      # If Herdr has recovered (fresh marker, no DELIVERY_DOWN/DISABLED, herdr alive),
+      # suppress further vendor updates so Herdr resumes exclusive reporting.
+      if [ ! -f "$STATE_HOME/DISABLED" ] && [ ! -f "$STATE_HOME/DELIVERY_DOWN" ]; then
+        for _M in "$PANE_MARKER" "$QUALIFIED_PANE_MARKER"; do
+          if [ -n "$_M" ] && [ -f "$_M" ] && [ ! -f "${_M}.failed" ]; then
+            _MARKER_MTIME=$(stat -f %m "$_M" 2>/dev/null || stat -c %Y "$_M" 2>/dev/null || echo 0)
+            if [ $(( $(date +%s) - _MARKER_MTIME )) -lt 60 ] && pgrep -xi "herdr" >/dev/null 2>&1; then
+              exit 0
+            fi
+          fi
+        done
+      fi
+      # If Herdr is NOT healthy, allow event through and maintain .vendor_active
+      touch "$VENDOR_ACTIVE" 2>/dev/null || true
+    elif [ ! -f "$STATE_HOME/DISABLED" ] && [ ! -f "$STATE_HOME/DELIVERY_DOWN" ]; then
+      # Normal path: check if Herdr is reporting this pane
+      for _M in "$PANE_MARKER" "$QUALIFIED_PANE_MARKER"; do
+        if [ -n "$_M" ] && [ -f "$_M" ] && [ ! -f "${_M}.failed" ]; then
+          _MARKER_MTIME=$(stat -f %m "$_M" 2>/dev/null || stat -c %Y "$_M" 2>/dev/null || echo 0)
+          _NOW_TIME=$(date +%s)
+          if [ $((_NOW_TIME - _MARKER_MTIME)) -lt 60 ] && pgrep -xi "herdr" >/dev/null 2>&1; then
+            exit 0
+          fi
+        fi
+      done
+      # Fall-through: Herdr marker missing or stale; record vendor active flag
+      mkdir -p "$STATE_HOME/panes" 2>/dev/null || true
+      touch "$VENDOR_ACTIVE" 2>/dev/null || true
+    else
+      # DISABLED or DELIVERY_DOWN: record vendor active flag
+      mkdir -p "$STATE_HOME/panes" 2>/dev/null || true
+      touch "$VENDOR_ACTIVE" 2>/dev/null || true
+    fi
   fi
 fi
 # END HERDR-BARTENDER DEDUP GUARD"""
 
 
-def touch_pane_failed(pane_id: str):
+def touch_pane_failed(pane_id: str, raw_pane_id: str | None = None):
     if not pane_id or is_disabled():
         return
     try:
         panes_dir = get_state_dir() / "panes"
         panes_dir.mkdir(parents=True, exist_ok=True)
-        hex_id = get_hex_pane_id(pane_id)
-        failed_path = panes_dir / f"{hex_id}.failed"
-        with open(failed_path, "w", encoding="utf-8") as f:
-            f.write(str(int(time.time())))
-        marker_path = panes_dir / hex_id
-        if marker_path.exists():
-            marker_path.unlink()
+        now_ts = str(int(time.time()))
+        ids_to_touch = [pane_id]
+        if raw_pane_id and raw_pane_id != pane_id:
+            ids_to_touch.append(raw_pane_id)
+        elif ":" in pane_id:
+            ids_to_touch.append(pane_id.split(":", 1)[1])
+        for pid in set(ids_to_touch):
+            hex_id = get_hex_pane_id(pid)
+            failed_path = panes_dir / f"{hex_id}.failed"
+            with open(failed_path, "w", encoding="utf-8") as f:
+                f.write(now_ts)
+            marker_path = panes_dir / hex_id
+            if marker_path.exists():
+                marker_path.unlink()
     except Exception:
         pass
 
 
-def clear_pane_failed(pane_id: str):
+def clear_pane_failed(pane_id: str, raw_pane_id: str | None = None):
     if not pane_id:
         return
     try:
-        hex_id = get_hex_pane_id(pane_id)
-        failed = get_state_dir() / "panes" / f"{hex_id}.failed"
-        if failed.exists():
-            failed.unlink()
+        ids_to_clear = [pane_id]
+        if raw_pane_id and raw_pane_id != pane_id:
+            ids_to_clear.append(raw_pane_id)
+        elif ":" in pane_id:
+            ids_to_clear.append(pane_id.split(":", 1)[1])
+        for pid in set(ids_to_clear):
+            hex_id = get_hex_pane_id(pid)
+            failed = get_state_dir() / "panes" / f"{hex_id}.failed"
+            if failed.exists():
+                failed.unlink()
     except Exception:
         pass
 
@@ -383,37 +430,50 @@ def remove_heartbeat():
         pass
 
 
-def touch_pane_marker(pane_id: str):
+def touch_pane_marker(pane_id: str, raw_pane_id: str | None = None):
     if not pane_id or is_disabled():
         return
     try:
         panes_dir = get_state_dir() / "panes"
         panes_dir.mkdir(parents=True, exist_ok=True)
-        hex_id = get_hex_pane_id(pane_id)
-        marker_path = panes_dir / hex_id
-        with open(marker_path, "w", encoding="utf-8") as f:
-            f.write(str(int(time.time())))
-        failed_path = panes_dir / f"{hex_id}.failed"
-        if failed_path.exists():
-            failed_path.unlink()
+        now_ts = str(int(time.time()))
+        ids_to_touch = [pane_id]
+        if raw_pane_id and raw_pane_id != pane_id:
+            ids_to_touch.append(raw_pane_id)
+        elif ":" in pane_id:
+            ids_to_touch.append(pane_id.split(":", 1)[1])
+        for pid in set(ids_to_touch):
+            hex_id = get_hex_pane_id(pid)
+            marker_path = panes_dir / hex_id
+            with open(marker_path, "w", encoding="utf-8") as f:
+                f.write(now_ts)
+            failed_path = panes_dir / f"{hex_id}.failed"
+            if failed_path.exists():
+                failed_path.unlink()
     except Exception:
         pass
 
 
-def remove_pane_marker(pane_id: str):
+def remove_pane_marker(pane_id: str, raw_pane_id: str | None = None):
     if not pane_id:
         return
     try:
-        hex_id = get_hex_pane_id(pane_id)
-        marker = get_state_dir() / "panes" / hex_id
-        if marker.exists():
-            marker.unlink()
-        failed = get_state_dir() / "panes" / f"{hex_id}.failed"
-        if failed.exists():
-            failed.unlink()
-        vendor = get_state_dir() / "panes" / f"{hex_id}.vendor_active"
-        if vendor.exists():
-            vendor.unlink()
+        ids_to_remove = [pane_id]
+        if raw_pane_id and raw_pane_id != pane_id:
+            ids_to_remove.append(raw_pane_id)
+        elif ":" in pane_id:
+            ids_to_remove.append(pane_id.split(":", 1)[1])
+        for pid in set(ids_to_remove):
+            hex_id = get_hex_pane_id(pid)
+            marker = get_state_dir() / "panes" / hex_id
+            if marker.exists():
+                marker.unlink()
+            failed = get_state_dir() / "panes" / f"{hex_id}.failed"
+            if failed.exists():
+                failed.unlink()
+            vendor = get_state_dir() / "panes" / f"{hex_id}.vendor_active"
+            if vendor.exists():
+                vendor.unlink()
     except Exception:
         pass
 
@@ -421,6 +481,9 @@ def remove_pane_marker(pane_id: str):
 def log_debug(msg: str):
     try:
         log_file = get_state_dir() / "plugin.log"
+        if log_file.exists() and log_file.stat().st_size > 1_048_576:
+            rot_file = get_state_dir() / "plugin.log.1"
+            log_file.replace(rot_file)
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
     except Exception:
@@ -515,6 +578,7 @@ class BoundedSessionCache:
                 "version": 1,
                 "host": get_sanitized_hostname(),
                 "sessions": {},
+                "tombstones": {},
                 "last_successful_delivery": 0.0,
                 "consecutive_failures": 0,
             }
@@ -523,6 +587,8 @@ class BoundedSessionCache:
                 data = json.load(f)
                 if not isinstance(data, dict) or "sessions" not in data:
                     raise ValueError("Malformed cache structure")
+                if "tombstones" not in data:
+                    data["tombstones"] = {}
                 return data
         except Exception as e:
             log_debug(f"Quarantining corrupt cache: {e}")
@@ -532,9 +598,13 @@ class BoundedSessionCache:
                 try:
                     with open(self.cache_file, "r", encoding="utf-8", errors="ignore") as cf:
                         raw_text = cf.read()
-                        matches = re.findall(r'herdr:[a-zA-Z0-9_-]+:[a-zA-Z0-9_:-]+', raw_text)
+                        valid_id_regex = re.compile(r'^herdr:[a-zA-Z0-9_.-]{1,32}:[a-zA-Z0-9_.:-]{1,64}$')
+                        matches = re.findall(r'herdr:[a-zA-Z0-9_.-]+:[a-zA-Z0-9_.:-]+', raw_text)
                         now_salvage = time.time()
+                        now_salvage_ns = time.time_ns()
                         for m in set(matches):
+                            if not valid_id_regex.match(m):
+                                continue
                             parts = m.split(":")
                             pane_id = ":".join(parts[2:]) if len(parts) >= 3 else parts[-1]
                             ws_id = pane_id.split(":", 1)[0] if ":" in pane_id else None
@@ -547,23 +617,24 @@ class BoundedSessionCache:
                                 "raw_agent": None,
                                 "title": f"Salvaged Session {pane_id}",
                                 "cwd": "",
-                                "desired_state": "Ended",
-                                "delivered_state": "Unknown",
+                                "desired_state": "Idle",
+                                "delivered_state": "Idle",
                                 "seq": 1,
-                                "delivered_seq": 0,
+                                "delivered_seq": 1,
                                 "rejected_seq": 0,
                                 "desired_payload": {
-                                    "state": "Ended",
+                                    "state": "Idle",
                                     "agent": "Herdr",
                                     "session_id": m,
                                     "seq": 1,
                                 },
-                                "delivery_status": "in_flight",
+                                "delivery_status": "salvaged",
                                 "delivery_error": None,
                                 "delivery_attempts": 0,
                                 "salvaged": True,
-                                "admitted_at_ns": time.monotonic_ns(),
-                                "last_event_ns": time.monotonic_ns(),
+                                "admitted_at_ns": now_salvage_ns,
+                                "last_event_ns": now_salvage_ns,
+                                "last_arrival_ns": now_salvage_ns,
                                 "last_event_at": now_salvage,
                                 "last_applied_arrival_time": now_salvage,
                             }
@@ -577,6 +648,7 @@ class BoundedSessionCache:
                 "version": 1,
                 "host": get_sanitized_hostname(),
                 "sessions": salvaged,
+                "tombstones": {},
                 "last_successful_delivery": 0.0,
                 "consecutive_failures": 0,
             }
@@ -587,6 +659,17 @@ class BoundedSessionCache:
         try:
             data["last_updated"] = time.time()
             data["host"] = get_sanitized_hostname()
+            now_ns = time.time_ns()
+            tombstones = data.get("tombstones", {})
+            data["tombstones"] = {k: v for k, v in tombstones.items() if (now_ns - v) <= 60_000_000_000}
+            sessions = data.get("sessions", {})
+            if len(sessions) > 256:
+                sorted_s = sorted(sessions.items(), key=lambda kv: kv[1].get("last_event_at", 0))
+                for sid, s in sorted_s:
+                    if len(sessions) <= 256:
+                        break
+                    if s.get("desired_state") == "Ended" or s.get("salvaged", False):
+                        sessions.pop(sid, None)
             tmp_path = self.state_dir / f"active-sessions.json.tmp.{os.getpid()}"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -628,20 +711,22 @@ def normalize_pane_id(raw_pane_id: str, workspace_id: str | None) -> str:
     return f"{ws}:{raw_pane_id}"
 
 
-def enqueue_spool(event_name: str, event_data: dict, context: dict, arrival_time: float | None = None):
+def enqueue_spool(event_name: str, event_data: dict, context: dict, arrival_time: float | None = None, arrival_ns: int | None = None):
     try:
         spool_dir = get_state_dir() / "spool"
         spool_dir.mkdir(parents=True, exist_ok=True)
-        arr_time = arrival_time or PROCESS_ARRIVAL_TIME
+        arr_time = arrival_time or time.time()
+        arr_ns = arrival_ns or time.time_ns()
         envelope = {
             "event_name": event_name,
             "event_data": event_data,
             "context": context,
             "arrival_time": arr_time,
+            "arrival_ns": arr_ns,
             "enqueued_at": time.time(),
-            "enqueued_ns": time.time_ns(),
+            "enqueued_ns": arr_ns,
         }
-        filename = f"{time.time_ns():020d}_{os.getpid()}.json"
+        filename = f"{arr_ns:020d}_{os.getpid()}_{time.monotonic_ns()}.json"
         tmp_file = spool_dir / f"{filename}.tmp"
         final_file = spool_dir / filename
         with open(tmp_file, "w", encoding="utf-8") as f:
@@ -666,14 +751,15 @@ def replay_spool_dir(state_dir: Path, bridge_url: str | None = None, max_batch: 
             edata = envelope.get("event_data", {})
             econtext = envelope.get("context", {})
             arr_time = envelope.get("arrival_time", envelope.get("enqueued_at", time.time()))
+            arr_ns = envelope.get("arrival_ns", envelope.get("enqueued_ns", int(arr_time * 1e9)))
             if ename == "pane.agent_status_changed":
-                handle_agent_status_changed(edata, econtext, bridge_url=bridge_url, arrival_time=arr_time)
+                handle_agent_status_changed(edata, econtext, bridge_url=bridge_url, arrival_time=arr_time, arrival_ns=arr_ns)
             elif ename == "pane.closed":
-                handle_pane_closed(edata, econtext, bridge_url=bridge_url)
+                handle_pane_closed(edata, econtext, bridge_url=bridge_url, arrival_ns=arr_ns)
             elif ename == "tab.closed":
-                handle_tab_closed(edata, econtext, bridge_url=bridge_url)
+                handle_tab_closed(edata, econtext, bridge_url=bridge_url, arrival_ns=arr_ns)
             elif ename == "workspace.closed":
-                handle_workspace_closed(edata, econtext, bridge_url=bridge_url)
+                handle_workspace_closed(edata, econtext, bridge_url=bridge_url, arrival_ns=arr_ns)
             elif ename == "direct_post":
                 post_bartender_event(edata, bridge_url=bridge_url)
             file_path.unlink()
@@ -729,18 +815,42 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
         for sid, s in list(sessions.items()):
             pane_id = s.get("pane_id")
 
-            # Check for stale session (> 24 hours for Idle/Done, > 48 hours for Waiting)
+            # Check for stale session (> 24 hours for Idle/Done/Salvaged, > 48 hours for Waiting)
             is_stale = False
             last_ts = s.get("last_event_at", now_wall)
-            if s.get("desired_state") in ("Idle", "Done") and (now_wall - last_ts > 86400):
+            if s.get("salvaged", False) and (now_wall - last_ts > 86400):
+                is_stale = True
+            elif s.get("desired_state") in ("Idle", "Done") and (now_wall - last_ts > 86400):
                 is_stale = True
             elif s.get("desired_state") == "Waiting" and (now_wall - last_ts > 172800):
                 is_stale = True
             elif s.get("desired_state") == "Working" and (now_wall - last_ts > 43200):
                 is_stale = True
 
+            # Hard horizon: if stale, exhausted, and undelivered > 12h past TTL, export to orphans and evict
+            if is_stale and s.get("delivery_status") == "retryable_exhausted" and (now_wall - last_ts > 129600):
+                try:
+                    orphan_path = Path.home() / ".herdr-bartender-orphans.json"
+                    old_umask = os.umask(0o077)
+                    try:
+                        orphans = {}
+                        if orphan_path.exists():
+                            with open(orphan_path, "r", encoding="utf-8") as of:
+                                orphans = json.load(of).get("sessions", {})
+                        orphans[sid] = s
+                        with open(orphan_path, "w", encoding="utf-8") as of:
+                            json.dump({"version": 1, "sessions": orphans}, of, indent=2)
+                    finally:
+                        os.umask(old_umask)
+                except Exception:
+                    pass
+                sessions.pop(sid, None)
+                remove_pane_marker(pane_id)
+                continue
+
             if is_stale:
                 s["desired_state"] = "Ended"
+                s["salvaged"] = False
                 s["seq"] = int(s.get("seq", 0)) + 1
                 s["desired_payload"] = {
                     "state": "Ended",
@@ -748,6 +858,10 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
                     "session_id": sid,
                     "seq": s["seq"],
                 }
+
+            # Quiescent salvaged sessions are excluded from transmission until live event or TTL expiry
+            if s.get("salvaged", False):
+                continue
 
             if s.get("delivered_seq", 0) < s.get("seq", 0) or s.get("desired_state") == "Ended":
                 if s.get("desired_state") == "Ended" and s.get("delivery_attempts", 0) >= 5:
@@ -903,6 +1017,21 @@ def run_reconcile_background(bridge_url: str | None = None, loop_once: bool = Fa
                 break
             if loop_once:
                 break
+
+            # Bartender presence tracking and backoff
+            bartender_running = (get_bartender_pid() is not None)
+            if not bartender_running:
+                absent_cycles += 1
+            else:
+                absent_cycles = 0
+
+            # Terminal horizon: if Bartender absent for >180 cycles (~15h) and no active Herdr session
+            if absent_cycles > 180 and not is_herdr_alive():
+                log_debug("Bartender and Herdr absent past terminal horizon (15h); reconciler exiting")
+                break
+
+            sleep_time = 300.0 if absent_cycles > 50 else 20.0
+            time.sleep(sleep_time)
     finally:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -915,52 +1044,63 @@ def retry_undelivered_sessions(cache_mgr: BoundedSessionCache, bridge_url: str |
     reconcile_active_sessions(cache_mgr.state_dir, bridge_url=bridge_url)
 
 
-def run_cleanup(bridge_url: str | None = None) -> bool:
+def run_cleanup(bridge_url: str | None = None) -> int:
+    """Cleans up all active sessions on shutdown/rollback.
+    Returns:
+      0: All sessions confirmed Ended via bridge (HTTP 200).
+      2: Bridge unreachable; pending sessions exported to $HOME/.herdr-bartender-orphans.json (mode 0600).
+      1: Fatal error during cleanup.
+    """
     touch_heartbeat()
     state_dir = get_state_dir()
     cache_mgr = BoundedSessionCache(state_dir)
     now = time.time()
     all_cleared = True
     target_sessions = []
-    with cache_mgr as data:
-        sessions = data.get("sessions", {})
-        for session_id, info in list(sessions.items()):
-            seq = int(info.get("seq", 0)) + 1
-            info["seq"] = seq
-            info["desired_state"] = "Ended"
-            target_sessions.append((session_id, info.get("pane_id"), info.get("agent", "Herdr"), seq))
-        cache_mgr.save(data)
-
-    for sid, pane_id, agent_name, target_seq in target_sessions:
-        payload = {"state": "Ended", "agent": agent_name, "session_id": sid}
-        success, is_non_retryable = post_bartender_event(payload, timeout=0.2, bridge_url=bridge_url)
+    try:
         with cache_mgr as data:
-            s = data.get("sessions", {}).get(sid)
-            if s:
-                if success or is_non_retryable:
-                    if s.get("seq") == target_seq:
-                        data.get("sessions", {}).pop(sid, None)
-                        remove_pane_marker(pane_id)
-                else:
-                    all_cleared = False
-                    s["delivery_attempts"] = s.get("delivery_attempts", 0) + 1
-                    s["last_attempt"] = now
+            sessions = data.get("sessions", {})
+            for session_id, info in list(sessions.items()):
+                seq = int(info.get("seq", 0)) + 1
+                info["seq"] = seq
+                info["desired_state"] = "Ended"
+                target_sessions.append((session_id, info.get("pane_id"), info.get("agent", "Herdr"), seq))
             cache_mgr.save(data)
 
-    if not all_cleared:
-        try:
-            orphan_path = Path.home() / ".herdr-bartender-orphans.json"
+        for sid, pane_id, agent_name, target_seq in target_sessions:
+            payload = {"state": "Ended", "agent": agent_name, "session_id": sid}
+            success, is_non_retryable = post_bartender_event(payload, timeout=0.2, bridge_url=bridge_url)
             with cache_mgr as data:
-                old_umask = os.umask(0o077)
-                try:
-                    with open(orphan_path, "w", encoding="utf-8") as of:
-                        json.dump(data, of, indent=2)
-                finally:
-                    os.umask(old_umask)
-        except Exception:
-            pass
+                s = data.get("sessions", {}).get(sid)
+                if s:
+                    if success or is_non_retryable:
+                        if s.get("seq") == target_seq:
+                            data.get("sessions", {}).pop(sid, None)
+                            remove_pane_marker(pane_id)
+                    else:
+                        all_cleared = False
+                        s["delivery_attempts"] = s.get("delivery_attempts", 0) + 1
+                        s["last_attempt"] = now
+                cache_mgr.save(data)
 
-    return all_cleared
+        if not all_cleared:
+            try:
+                orphan_path = Path.home() / ".herdr-bartender-orphans.json"
+                with cache_mgr as data:
+                    old_umask = os.umask(0o077)
+                    try:
+                        with open(orphan_path, "w", encoding="utf-8") as of:
+                            json.dump(data, of, indent=2)
+                    finally:
+                        os.umask(old_umask)
+            except Exception:
+                pass
+            return 2
+
+        return 0
+    except Exception as e:
+        log_debug(f"Fatal error during cleanup: {e}")
+        return 1
 
 
 def run_replay_orphans(orphan_path_str: str, bridge_url: str | None = None) -> bool:
@@ -1009,15 +1149,16 @@ def run_replay_orphans(orphan_path_str: str, bridge_url: str | None = None) -> b
     return all_success
 
 
-def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str | None = None, arrival_time: float | None = None):
+def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str | None = None, arrival_time: float | None = None, arrival_ns: int | None = None):
     touch_heartbeat()
-    arr_time = arrival_time or PROCESS_ARRIVAL_TIME
+    arr_time = arrival_time or time.time()
+    arr_ns = arrival_ns or time.time_ns()
     raw_pane = event_data.get("pane_id") or context.get("focused_pane_id")
     if not raw_pane:
         return
 
     focused_id = context.get("focused_pane_id")
-    is_focused = (focused_id is None) or (focused_id == raw_pane)
+    is_focused = bool(focused_id and focused_id == raw_pane)
 
     workspace_id = event_data.get("workspace_id")
     if not workspace_id:
@@ -1031,7 +1172,7 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
         log_debug(f"Invalid canonical pane ID: {canonical_pane}")
         return
 
-    is_focused = (focused_id is None) or (focused_id in (canonical_pane, raw_pane))
+    is_focused = bool(focused_id and focused_id in (canonical_pane, raw_pane))
 
     if not workspace_id:
         if ":" in canonical_pane:
@@ -1048,6 +1189,13 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
 
     # 1. Critical section: Update cache & manage per-session monotonic lease
     with cache_mgr as data:
+        tombstone_ns = data.get("tombstones", {}).get(canonical_pane, 0)
+        if tombstone_ns and arr_ns <= tombstone_ns:
+            log_debug(f"Rejecting late event for closed pane {canonical_pane}: arrival {arr_ns} <= tombstone {tombstone_ns}")
+            return
+        elif tombstone_ns and arr_ns > tombstone_ns:
+            data.get("tombstones", {}).pop(canonical_pane, None)
+
         sessions = data.get("sessions", {})
         cached_s = sessions.get(session_id, {})
 
@@ -1105,18 +1253,20 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             return
 
         session_record = sessions.setdefault(session_id, {})
+        last_arr_ns = session_record.get("last_arrival_ns", 0)
         last_applied_arr = session_record.get("last_applied_arrival_time", 0.0)
-        if mapped_state != "Ended" and arr_time < last_applied_arr:
-            log_debug(f"Dropping older event: arrival {arr_time} < last_applied {last_applied_arr}")
+        if mapped_state != "Ended" and (arr_ns < last_arr_ns or arr_time < last_applied_arr):
+            log_debug(f"Dropping older event: arrival {arr_ns} < last_arrival {last_arr_ns}")
             return
 
         # Generation reset: new admission or agent turn over Ended session resets generation
-        now_mono = time.monotonic_ns()
         if cached_s.get("desired_state") == "Ended" or cached_s.get("delivered_state") == "Ended":
-            session_record["admitted_at_ns"] = now_mono
+            session_record["admitted_at_ns"] = arr_ns
         elif "admitted_at_ns" not in session_record:
-            session_record["admitted_at_ns"] = now_mono
-        session_record["last_event_ns"] = now_mono
+            session_record["admitted_at_ns"] = arr_ns
+        session_record["last_event_ns"] = arr_ns
+        session_record["last_arrival_ns"] = arr_ns
+        session_record["salvaged"] = False
 
         new_seq = int(session_record.get("seq", 0)) + 1
 
@@ -1151,6 +1301,9 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
         })
         if source_ts:
             session_record["last_source_timestamp"] = source_ts
+
+        # Pre-create/refresh pane marker immediately upon admission to prevent first-turn vendor race
+        touch_pane_marker(canonical_pane, raw_pane)
 
         # Canonical Lease Takeover Truth Table:
         # holder == os.getpid() or holder is None -> CLAIM
@@ -1197,9 +1350,9 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
                 s.pop("delivery_error", None)
                 data["last_successful_delivery"] = time.time()
                 data["consecutive_failures"] = 0
-                touch_pane_marker(canonical_pane)
+                touch_pane_marker(canonical_pane, raw_pane)
                 clear_delivery_down()
-                clear_pane_failed(canonical_pane)
+                clear_pane_failed(canonical_pane, raw_pane)
                 for other_s in data.get("sessions", {}).values():
                     if other_s.get("delivery_status") == "retryable_exhausted":
                         other_s["delivery_attempts"] = 0
@@ -1208,26 +1361,27 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
                 # Active Supersession check on Ended
                 if transmitting_state == "Ended" and s.get("seq") == transmitting_seq:
                     data.get("sessions", {}).pop(session_id, None)
-                    remove_pane_marker(canonical_pane)
+                    remove_pane_marker(canonical_pane, raw_pane)
+                    data.setdefault("tombstones", {})[canonical_pane] = arr_ns
                     cache_mgr.save(data)
                     break
             elif is_non_retryable:
                 s["delivery_status"] = "non_retryable_failed"
                 s["rejected_seq"] = transmitting_seq
                 s["delivery_error"] = "bridge_rejected"
-                touch_pane_failed(canonical_pane)
+                touch_pane_failed(canonical_pane, raw_pane)
                 if transmitting_state == "Ended":
                     s["orphaned_ended"] = True
             else:
                 s["delivery_attempts"] = s.get("delivery_attempts", 0) + 1
                 s["delivery_error"] = "retryable network error"
-                touch_pane_failed(canonical_pane)
+                touch_pane_failed(canonical_pane, raw_pane)
                 data["consecutive_failures"] = data.get("consecutive_failures", 0) + 1
                 if data["consecutive_failures"] >= 3:
                     touch_delivery_down()
                 if s.get("delivery_attempts", 0) >= 5:
                     s["delivery_status"] = "retryable_exhausted"
-                    touch_pane_failed(canonical_pane)
+                    touch_pane_failed(canonical_pane, raw_pane)
                     if s.get("desired_state") == "Ended":
                         s["orphaned_ended"] = True
 
@@ -1257,8 +1411,9 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
                 current_payload = None
 
 
-def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None = None):
+def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None = None, arrival_ns: int | None = None):
     touch_heartbeat()
+    arr_ns = arrival_ns or time.time_ns()
     raw_pane = event_data.get("pane_id") or context.get("focused_pane_id")
     workspace_id = event_data.get("workspace_id") or context.get("workspace_id")
     if not raw_pane:
@@ -1274,9 +1429,15 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
     my_pid = os.getpid()
 
     with cache_mgr as data:
+        if "tombstones" not in data:
+            data["tombstones"] = {}
+        data["tombstones"][canonical_pane] = arr_ns
         sessions = data.get("sessions", {})
         for sid, info in list(sessions.items()):
             if info.get("pane_id") == canonical_pane or sid.endswith(f":{canonical_pane}"):
+                if info.get("admitted_at_ns", 0) > arr_ns:
+                    log_debug(f"Ignoring close event predating session admission: close {arr_ns} < admitted {info.get('admitted_at_ns')}")
+                    continue
                 seq = int(info.get("seq", 0)) + 1
                 info["desired_state"] = "Ended"
                 info["seq"] = seq
@@ -1303,7 +1464,8 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
             if s and s.get("lease_token") == my_token:
                 if (success or is_non_retryable) and s.get("desired_state") == "Ended" and s.get("seq") == target_seq:
                     data.get("sessions", {}).pop(sid, None)
-                    remove_pane_marker(pane_id)
+                    remove_pane_marker(pane_id, raw_pane)
+                    data.setdefault("tombstones", {})[canonical_pane] = arr_ns
                 else:
                     s["sending_pid"] = None
                     s["lease_token"] = None
@@ -1314,8 +1476,9 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
             cache_mgr.save(data)
 
 
-def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = None):
+def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = None, arrival_ns: int | None = None):
     touch_heartbeat()
+    arr_ns = arrival_ns or time.time_ns()
     tab_id = event_data.get("tab_id") or (context.get("tab_id") if context.get("focused_pane_id") else None)
     if not tab_id:
         return
@@ -1333,6 +1496,8 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
         for sid, info in list(sessions.items()):
             s_tab = info.get("tab_id")
             if s_tab and (s_tab == tab_id or tab_id.endswith(str(s_tab))):
+                if info.get("admitted_at_ns", 0) > arr_ns:
+                    continue
                 seq = int(info.get("seq", 0)) + 1
                 info["desired_state"] = "Ended"
                 info["seq"] = seq
@@ -1359,6 +1524,8 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
                 if (success or is_non_retryable) and s.get("desired_state") == "Ended" and s.get("seq") == target_seq:
                     data.get("sessions", {}).pop(sid, None)
                     remove_pane_marker(pane_id)
+                    if pane_id:
+                        data.setdefault("tombstones", {})[pane_id] = arr_ns
                 else:
                     s["sending_pid"] = None
                     s["lease_token"] = None
@@ -1369,8 +1536,9 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
             cache_mgr.save(data)
 
 
-def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | None = None):
+def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | None = None, arrival_ns: int | None = None):
     touch_heartbeat()
+    arr_ns = arrival_ns or time.time_ns()
     workspace_id = event_data.get("workspace_id") or (context.get("workspace_id") if context.get("focused_pane_id") else None)
     if not workspace_id:
         return
@@ -1388,6 +1556,8 @@ def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | N
         for sid, info in list(sessions.items()):
             s_ws = info.get("workspace_id")
             if s_ws and (s_ws == workspace_id or f":{workspace_id}:" in sid):
+                if info.get("admitted_at_ns", 0) > arr_ns:
+                    continue
                 seq = int(info.get("seq", 0)) + 1
                 info["desired_state"] = "Ended"
                 info["seq"] = seq
@@ -1414,6 +1584,8 @@ def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | N
                 if (success or is_non_retryable) and s.get("desired_state") == "Ended" and s.get("seq") == target_seq:
                     data.get("sessions", {}).pop(sid, None)
                     remove_pane_marker(pane_id)
+                    if pane_id:
+                        data.setdefault("tombstones", {})[pane_id] = arr_ns
                 else:
                     s["sending_pid"] = None
                     s["lease_token"] = None
@@ -1529,13 +1701,13 @@ def run_unit_tests():
 
     # 3. Cascading container closures
     handle_agent_status_changed(
-        {"agent_status": "working", "pane_id": "wTest:pA", "workspace_id": "wTest", "agent": "codex"},
-        {"tab_id": "wTest:tA"},
+        {"agent_status": "working", "pane_id": "wTest:pA", "workspace_id": "wTest", "tab_id": "wTest:tA", "agent": "codex"},
+        {"focused_pane_id": "wTest:pA", "tab_id": "wTest:tA"},
         bridge_url=mock_url
     )
     handle_agent_status_changed(
-        {"agent_status": "working", "pane_id": "wTest:pB", "workspace_id": "wTest", "agent": "claude"},
-        {"tab_id": "wTest:tB"},
+        {"agent_status": "working", "pane_id": "wTest:pB", "workspace_id": "wTest", "tab_id": "wTest:tB", "agent": "claude"},
+        {"focused_pane_id": "wTest:pB", "tab_id": "wTest:tB"},
         bridge_url=mock_url
     )
     assert len(MockBartenderHandler.sessions) == 3
@@ -1578,6 +1750,7 @@ def run_unit_tests():
     print("[PASS] Failed Ended recorded in unified cache")
 
     # A new turn arrives for the same pane -> Active Supersession
+    time.sleep(0.002)
     MockBartenderHandler.return_code = 200
     handle_agent_status_changed(
         {"agent_status": "working", "pane_id": "w1:pSeq", "workspace_id": "w1", "agent": "claude", "seq": t_base + 20},
@@ -1875,6 +2048,119 @@ def run_unit_tests():
     test_hook.unlink(missing_ok=True)
     print("[PASS] Hook installation preserves executable mode bits")
 
+    # 23. Hook guard terminal unlinking without re-touch (argv $1=Ended and stdin JSON Stop)
+    test_guard_script = get_state_dir() / "test-guard-exec.sh"
+    with open(test_guard_script, "w") as f:
+        f.write(f"""#!/bin/bash
+set -u
+{HOOK_GUARD_TEMPLATE}
+echo "PASSTHROUGH"
+""")
+    os.chmod(test_guard_script, 0o755)
+
+    v_hex = get_hex_pane_id("pGuardTest")
+    v_active = get_state_dir() / "panes" / f"{v_hex}.vendor_active"
+    v_marker = get_state_dir() / "panes" / v_hex
+
+    # Step A: Fall-through creates .vendor_active
+    env_fallthrough = os.environ.copy()
+    env_fallthrough["HERDR_PANE_ID"] = "pGuardTest"
+    v_active.unlink(missing_ok=True)
+    v_marker.unlink(missing_ok=True)
+    res = subprocess.run([str(test_guard_script), "Working"], env=env_fallthrough, capture_output=True, text=True)
+    assert res.returncode == 0
+    assert "PASSTHROUGH" in res.stdout
+    assert v_active.exists(), ".vendor_active must be created on fall-through"
+
+    # Step B: Terminal event via argv ($1=Ended) must remove .vendor_active and NOT recreate it
+    res = subprocess.run([str(test_guard_script), "Ended"], env=env_fallthrough, capture_output=True, text=True)
+    assert res.returncode == 0
+    assert "PASSTHROUGH" in res.stdout
+    assert not v_active.exists(), ".vendor_active must be removed and never re-touched on terminal Ended"
+
+    # Step C: Terminal event via stdin JSON (hook_event_name: "Stop")
+    v_active.touch()
+    assert v_active.exists()
+    res = subprocess.run(
+        [str(test_guard_script)],
+        input=json.dumps({"hook_event_name": "Stop", "session_id": "test"}),
+        env=env_fallthrough,
+        capture_output=True,
+        text=True
+    )
+    assert res.returncode == 0
+    assert "PASSTHROUGH" in res.stdout
+    assert not v_active.exists(), ".vendor_active must be removed and never re-touched on stdin JSON Stop"
+    test_guard_script.unlink(missing_ok=True)
+    print("[PASS] Hook guard terminal unlinking without re-touch (argv and stdin)")
+
+    # 24. Post-close tombstone table rejects delayed status events
+    t_close = time.time_ns()
+    handle_agent_status_changed(
+        {"agent_status": "working", "pane_id": "w1:pTombstone", "workspace_id": "w1", "agent": "claude"},
+        {},
+        bridge_url=mock_url,
+        arrival_ns=t_close
+    )
+    handle_pane_closed(
+        {"pane_id": "w1:pTombstone", "workspace_id": "w1"},
+        {},
+        bridge_url=mock_url,
+        arrival_ns=t_close + 10_000
+    )
+    # Late status event arriving at or before tombstone timestamp must be rejected
+    handle_agent_status_changed(
+        {"agent_status": "working", "pane_id": "w1:pTombstone", "workspace_id": "w1", "agent": "claude"},
+        {},
+        bridge_url=mock_url,
+        arrival_ns=t_close + 5_000
+    )
+    with cache_mgr as data:
+        sid_tomb = f"herdr:{get_sanitized_hostname()}:w1:pTombstone"
+        assert sid_tomb not in data.get("sessions", {}), "Late status event must not resurrect closed pane"
+        assert "w1:pTombstone" in data.get("tombstones", {}), "Tombstone must be recorded"
+    print("[PASS] Post-close tombstone table rejects delayed status events")
+
+    # 25. --cleanup exit code contract and canonical orphan export outside state dir
+    orphan_canonical = Path.home() / ".herdr-bartender-orphans.json"
+    orphan_canonical.unlink(missing_ok=True)
+    # Setup active session with bridge failing
+    with cache_mgr as data:
+        data["sessions"]["herdr:macbook:wOrphanCleanup"] = {
+            "desired_state": "Working",
+            "seq": 1,
+            "delivered_seq": 1,
+            "pane_id": "w1:pOrphanCleanup",
+            "agent": "Claude (Herdr)",
+            "last_event_at": time.time(),
+        }
+        cache_mgr.save(data)
+    MockBartenderHandler.return_code = 500
+    cleanup_code = run_cleanup(bridge_url=mock_url)
+    assert cleanup_code == 2, f"Expected exit code 2 when bridge unreachable, got {cleanup_code}"
+    assert orphan_canonical.exists(), f"Orphans must be exported to {orphan_canonical}"
+    assert oct(orphan_canonical.stat().st_mode)[-3:] == "600", "Orphan file must have 0600 permissions"
+    orphan_canonical.unlink(missing_ok=True)
+
+    # With bridge returning 200, cleanup returns 0
+    MockBartenderHandler.return_code = 200
+    cleanup_code_ok = run_cleanup(bridge_url=mock_url)
+    assert cleanup_code_ok == 0, f"Expected exit code 0 when bridge reachable, got {cleanup_code_ok}"
+    print("[PASS] --cleanup exit code contract (0=confirmed, 2=exported) and permissions 0600")
+
+    # 26. Context isolation when focused_pane_id is None or missing
+    handle_agent_status_changed(
+        {"agent_status": "working", "pane_id": "w1:pNoneFocus", "workspace_id": "w1", "agent": "claude"},
+        {"focused_pane_id": None, "focused_pane_cwd": "/secret/none/dir", "tab_id": "w1:tNone"},
+        bridge_url=mock_url
+    )
+    with cache_mgr as data:
+        s_nf = data["sessions"].get(f"herdr:{get_sanitized_hostname()}:w1:pNoneFocus")
+        assert s_nf is not None
+        assert s_nf.get("cwd") == "", "Missing/None focused_pane_id must not leak cwd"
+        assert s_nf.get("tab_id") is None, "Missing/None focused_pane_id must not leak tab_id"
+    print("[PASS] Context isolation with None/missing focused_pane_id")
+
     server.shutdown()
     print("=== ALL COMPREHENSIVE UNIT TESTS PASSED ===")
 
@@ -1963,8 +2249,8 @@ def main():
         sys.exit(0 if ok else 1)
 
     if "--cleanup" in args:
-        ok = run_cleanup()
-        sys.exit(0 if ok else 1)
+        code = run_cleanup()
+        sys.exit(code)
 
     if "--replay-orphans" in args:
         idx = args.index("--replay-orphans")
