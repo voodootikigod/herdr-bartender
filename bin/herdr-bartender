@@ -41,8 +41,14 @@ STATUS_MAP = {
     "idle": "Idle",         # Idle at prompt
 }
 
-ANSI_REGEX = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+CSI_REGEX = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+OSC_REGEX = re.compile(r'\x1b\][^\x07\x1b]*(\x07|\x1b\\)')
+DCS_REGEX = re.compile(r'\x1bP[^\x1b]*\x1b\\')
+CONTROL_REGEX = re.compile(r'[\x00-\x1f\x7f-\x9f]')
+PANE_ID_REGEX = re.compile(r'^[a-zA-Z0-9_:-]{1,48}$')
+
 START_TIME = time.monotonic()
+PROCESS_ARRIVAL_TIME = time.time()
 IN_CRITICAL_SECTION = False
 PENDING_WATCHDOG_EXIT = False
 
@@ -134,6 +140,133 @@ def is_disabled() -> bool:
         return (get_state_dir() / "DISABLED").exists()
     except Exception:
         return False
+
+
+def is_herdr_alive() -> bool:
+    try:
+        res = subprocess.run(["pgrep", "-xi", "herdr"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+HOOK_GUARD_TEMPLATE = """# BEGIN HERDR-BARTENDER DEDUP GUARD
+if [ -n "${HERDR_PANE_ID:-}" ]; then
+  STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/herdr-bartender"
+  # Check tombstone disable flag
+  if [ ! -f "$STATE_HOME/DISABLED" ]; then
+    HEX_PANE=$(printf '%s' "$HERDR_PANE_ID" | od -An -tx1 | tr -d ' \\n')
+    PANE_MARKER="$STATE_HOME/panes/${HEX_PANE}"
+    # Guard check: suppress vendor hook if marker exists AND Herdr process is running
+    if [ -f "$PANE_MARKER" ] && pgrep -xi "herdr" >/dev/null 2>&1; then
+      exit 0
+    fi
+  fi
+fi
+# END HERDR-BARTENDER DEDUP GUARD"""
+
+
+def get_vendor_hooks_dir() -> Path:
+    return Path.home() / "Library" / "Application Support" / "Bartender" / "NotchBar" / "AgentStatus" / "hooks"
+
+
+def verify_vendor_hooks_intact() -> tuple[bool, list[str]]:
+    hooks_dir = get_vendor_hooks_dir()
+    if not hooks_dir.exists():
+        return False, []
+    hook_files = sorted(hooks_dir.glob("*.sh"))
+    if not hook_files:
+        return False, []
+    missing = []
+    for hf in hook_files:
+        try:
+            with open(hf, "r", encoding="utf-8") as f:
+                content = f.read()
+            if "# BEGIN HERDR-BARTENDER DEDUP GUARD" not in content or "# END HERDR-BARTENDER DEDUP GUARD" not in content:
+                missing.append(hf.name)
+        except Exception:
+            missing.append(hf.name)
+    return (len(missing) == 0), missing
+
+
+def install_hooks() -> bool:
+    import hashlib
+    hooks_dir = get_vendor_hooks_dir()
+    if not hooks_dir.exists():
+        print(f"[-] Vendor hooks directory not found: {hooks_dir}")
+        return False
+
+    hook_files = sorted(hooks_dir.glob("*.sh"))
+    if not hook_files:
+        print(f"[-] No hook scripts found in {hooks_dir}")
+        return False
+
+    state_dir = get_state_dir()
+    sha_file = state_dir / "vendor-hook-sha.json"
+    sha_cache = {}
+    if sha_file.exists():
+        try:
+            with open(sha_file, "r", encoding="utf-8") as f:
+                sha_cache = json.load(f)
+        except Exception:
+            sha_cache = {}
+
+    all_ok = True
+    begin_marker = "# BEGIN HERDR-BARTENDER DEDUP GUARD"
+    end_marker = "# END HERDR-BARTENDER DEDUP GUARD"
+
+    for hook in hook_files:
+        try:
+            with open(hook, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            if begin_marker in content and end_marker in content:
+                pre = content.split(begin_marker)[0]
+                post = content.split(end_marker)[1]
+                new_content = f"{pre}{HOOK_GUARD_TEMPLATE}{post}"
+            else:
+                bak_path = hook.with_suffix(hook.suffix + ".pre-install.bak")
+                if not bak_path.exists():
+                    with open(bak_path, "w", encoding="utf-8") as bf:
+                        bf.write(content)
+                    sha_cache[hook.name] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+                lines = content.splitlines(keepends=True)
+                insert_idx = 0
+                for idx, line in enumerate(lines):
+                    if line.strip() == "set -u":
+                        insert_idx = idx + 1
+                        break
+                    elif line.startswith("#!") and insert_idx == 0:
+                        insert_idx = idx + 1
+
+                new_lines = lines[:insert_idx] + [f"\n{HOOK_GUARD_TEMPLATE}\n"] + lines[insert_idx:]
+                new_content = "".join(new_lines)
+
+            tmp_path = hook.with_suffix(f"{hook.suffix}.tmp.{os.getpid()}")
+            with open(tmp_path, "w", encoding="utf-8") as tf:
+                tf.write(new_content)
+
+            check = subprocess.run(["bash", "-n", str(tmp_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if check.returncode != 0:
+                print(f"[-] Syntax validation failed for {hook.name}: {check.stderr.decode('utf-8')}")
+                tmp_path.unlink(missing_ok=True)
+                all_ok = False
+                continue
+
+            os.replace(tmp_path, hook)
+            print(f"[+] Installed dedup guard in {hook.name}")
+        except Exception as e:
+            print(f"[-] Error installing guard in {hook.name}: {e}")
+            all_ok = False
+
+    try:
+        with open(sha_file, "w", encoding="utf-8") as f:
+            json.dump(sha_cache, f, indent=2)
+    except Exception:
+        pass
+
+    return all_ok
 
 
 def get_hex_pane_id(raw_id: str | None) -> str:
@@ -303,7 +436,12 @@ class BoundedSessionCache:
                         raw_text = cf.read()
                         matches = re.findall(r'herdr:[a-zA-Z0-9_-]+:[a-zA-Z0-9_:-]+', raw_text)
                         for m in set(matches):
-                            salvaged[m] = {"desired_state": "Ended", "agent": "Herdr"}
+                            salvaged[m] = {
+                                "desired_state": "Idle",
+                                "agent": "Herdr",
+                                "salvaged": True,
+                                "delivery_status": "salvaged",
+                            }
                 except Exception:
                     pass
                 corrupt_path = self.state_dir / f"active-sessions.json.corrupt.{int(time.time())}"
@@ -342,8 +480,12 @@ class BoundedSessionCache:
 def sanitize_title(raw: str | None) -> str:
     if not raw:
         return ""
-    stripped = ANSI_REGEX.sub('', str(raw)).strip()
-    return stripped[:120]
+    text = str(raw)
+    text = OSC_REGEX.sub('', text)
+    text = DCS_REGEX.sub('', text)
+    text = CSI_REGEX.sub('', text)
+    text = CONTROL_REGEX.sub('', text)
+    return text.strip()[:120]
 
 
 def format_agent_name(raw_agent: str | None) -> str:
@@ -361,18 +503,20 @@ def normalize_pane_id(raw_pane_id: str, workspace_id: str | None) -> str:
     return f"{ws}:{raw_pane_id}"
 
 
-def enqueue_spool(event_name: str, event_data: dict, context: dict):
+def enqueue_spool(event_name: str, event_data: dict, context: dict, arrival_time: float | None = None):
     try:
         spool_dir = get_state_dir() / "spool"
         spool_dir.mkdir(parents=True, exist_ok=True)
+        arr_time = arrival_time or PROCESS_ARRIVAL_TIME
         envelope = {
             "event_name": event_name,
             "event_data": event_data,
             "context": context,
+            "arrival_time": arr_time,
             "enqueued_at": time.time(),
             "enqueued_ns": time.time_ns(),
         }
-        filename = f"{time.time_ns()}_{os.getpid()}_{int(time.monotonic() * 1000)}.json"
+        filename = f"{time.time_ns():020d}_{os.getpid()}.json"
         tmp_file = spool_dir / f"{filename}.tmp"
         final_file = spool_dir / filename
         with open(tmp_file, "w", encoding="utf-8") as f:
@@ -396,8 +540,9 @@ def replay_spool_dir(state_dir: Path, bridge_url: str | None = None, max_batch: 
             ename = envelope.get("event_name", "")
             edata = envelope.get("event_data", {})
             econtext = envelope.get("context", {})
+            arr_time = envelope.get("arrival_time", envelope.get("enqueued_at", time.time()))
             if ename == "pane.agent_status_changed":
-                handle_agent_status_changed(edata, econtext, bridge_url=bridge_url)
+                handle_agent_status_changed(edata, econtext, bridge_url=bridge_url, arrival_time=arr_time)
             elif ename == "pane.closed":
                 handle_pane_closed(edata, econtext, bridge_url=bridge_url)
             elif ename == "tab.closed":
@@ -420,29 +565,8 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
         if not sessions:
             return
 
-        panes_dir = state_dir / "panes"
-
         for sid, s in list(sessions.items()):
             pane_id = s.get("pane_id")
-            hex_id = get_hex_pane_id(pane_id)
-            marker_path = panes_dir / hex_id
-            is_marker_fresh = False
-            if marker_path.exists():
-                try:
-                    mtime = marker_path.stat().st_mtime
-                    if now_wall - mtime <= 10.0:
-                        is_marker_fresh = True
-                except Exception:
-                    pass
-
-            if not is_marker_fresh and s.get("desired_state") != "Ended":
-                s["desired_state"] = "Ended"
-                s["seq"] = int(s.get("seq", 0)) + 1
-                s["desired_payload"] = {
-                    "state": "Ended",
-                    "agent": s.get("agent", "Herdr"),
-                    "session_id": sid,
-                }
 
             # Check for stale session (> 24 hours). EXEMPT Waiting sessions!
             if s.get("desired_state") in ("Idle", "Done") and (now_wall - s.get("last_event_at", now_wall) > 86400):
@@ -458,7 +582,8 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
                 if s.get("desired_state") == "Ended" and s.get("delivery_attempts", 0) >= 5:
                     s["orphaned_ended"] = True
                     continue
-                if s.get("desired_state") != "Ended" and s.get("delivery_attempts", 0) >= 3:
+                if s.get("desired_state") != "Ended" and s.get("delivery_attempts", 0) >= 5:
+                    s["delivery_status"] = "delivery_failed"
                     continue
 
                 lease = s.get("lease_deadline") or 0
@@ -486,6 +611,7 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
                 s["delivered_state"] = target_state
                 s["delivered_seq"] = target_seq
                 s["delivery_attempts"] = 0
+                s["delivery_status"] = "delivered" if success else "delivery_failed"
                 s.pop("delivery_error", None)
                 if success:
                     data["last_successful_delivery"] = time.time()
@@ -497,8 +623,10 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
                 s["delivery_attempts"] = s.get("delivery_attempts", 0) + 1
                 s["delivery_error"] = "retryable network error"
                 data["consecutive_failures"] = data.get("consecutive_failures", 0) + 1
-                if s.get("desired_state") == "Ended" and s.get("delivery_attempts", 0) >= 5:
-                    s["orphaned_ended"] = True
+                if s.get("delivery_attempts", 0) >= 5:
+                    s["delivery_status"] = "delivery_failed"
+                    if s.get("desired_state") == "Ended":
+                        s["orphaned_ended"] = True
             cache_mgr.save(data)
 
 
@@ -585,8 +713,9 @@ def run_cleanup(bridge_url: str | None = None) -> bool:
     return all_cleared
 
 
-def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str | None = None):
+def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str | None = None, arrival_time: float | None = None):
     touch_heartbeat()
+    arr_time = arrival_time or PROCESS_ARRIVAL_TIME
     raw_pane = event_data.get("pane_id") or context.get("focused_pane_id")
     workspace_id = event_data.get("workspace_id") or context.get("workspace_id")
     agent_status = event_data.get("agent_status")
@@ -595,6 +724,10 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
         return
 
     canonical_pane = normalize_pane_id(raw_pane, workspace_id)
+    if not PANE_ID_REGEX.match(canonical_pane):
+        log_debug(f"Invalid canonical pane ID: {canonical_pane}")
+        return
+
     if not workspace_id:
         if ":" in canonical_pane:
             workspace_id = canonical_pane.split(":", 1)[0]
@@ -642,7 +775,13 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
         if source_ts and last_source_ts and source_ts < last_source_ts:
             return
 
-        new_seq = int(sessions.get(session_id, {}).get("seq", 0)) + 1
+        session_record = sessions.setdefault(session_id, {})
+        last_applied_arr = session_record.get("last_applied_arrival_time", 0.0)
+        if arr_time < last_applied_arr:
+            log_debug(f"Dropping older event: arrival {arr_time} < last_applied {last_applied_arr}")
+            return
+
+        new_seq = int(session_record.get("seq", 0)) + 1
         touch_pane_marker(canonical_pane)
 
         payload = {
@@ -655,7 +794,6 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             "event": "pane.agent_status_changed",
         }
 
-        session_record = sessions.setdefault(session_id, {})
         session_record.update({
             "pane_id": canonical_pane,
             "workspace_id": workspace_id,
@@ -668,6 +806,7 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             "desired_state": mapped_state,
             "desired_payload": payload,
             "seq": new_seq,
+            "last_applied_arrival_time": arr_time,
             "last_event_at": now_wall,
         })
         if source_ts:
@@ -758,6 +897,9 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
         return
 
     canonical_pane = normalize_pane_id(raw_pane, workspace_id)
+    if not PANE_ID_REGEX.match(canonical_pane):
+        log_debug(f"Invalid canonical pane ID: {canonical_pane}")
+        return
     cache_mgr = BoundedSessionCache(get_state_dir())
     target_sessions = []
 
@@ -1049,7 +1191,7 @@ def run_unit_tests():
 
     MockBartenderHandler.delay = 0.0
 
-    # 9. Atomic spool directory enqueue and ingestion
+    # 9. Atomic spool directory enqueue, arrival ordering and ingestion
     spool_dir = get_state_dir() / "spool"
     if spool_dir.exists():
         for f in spool_dir.glob("*.json*"):
@@ -1062,7 +1204,27 @@ def run_unit_tests():
     assert len(list(spool_dir.glob("*.json"))) == 0, "All spool files should be ingested and unlinked"
     spool_events = [e for e in MockBartenderHandler.history if e.get("session_id") == "spool-session-1"]
     assert len(spool_events) == 2, f"Expected 2 spooled events delivered, got {len(spool_events)}"
-    print("[PASS] Atomic spool directory enqueue and ingestion protocol")
+
+    # Test arrival ordering: older spooled event should be dropped
+    t_arr = time.time()
+    handle_agent_status_changed(
+        {"agent_status": "working", "pane_id": "w1:pArrival", "workspace_id": "w1", "agent": "claude"},
+        {},
+        bridge_url=mock_url,
+        arrival_time=t_arr
+    )
+    # Enqueue spooled event with older arrival time
+    enqueue_spool(
+        "pane.agent_status_changed",
+        {"agent_status": "idle", "pane_id": "w1:pArrival", "workspace_id": "w1", "agent": "claude"},
+        {},
+        arrival_time=t_arr - 5.0
+    )
+    replay_spool_dir(get_state_dir(), bridge_url=mock_url)
+    with cache_mgr as data:
+        s_arr = data["sessions"].get(f"herdr:{get_sanitized_hostname()}:w1:pArrival")
+        assert s_arr and s_arr["desired_state"] == "Working", "Older spooled event must not overwrite newer state"
+    print("[PASS] Atomic spool directory enqueue, ingestion, and arrival ordering")
 
     # 10. Reconciler singleton with pending work re-scan
     lock_file = get_state_dir() / "reconciler.lock"
@@ -1201,8 +1363,17 @@ def main():
 
     if "--health" in args:
         h = check_bridge_health()
-        print(json.dumps(h or {"error": "unreachable"}))
+        result = h or {"error": "unreachable"}
+        hooks_ok, missing = verify_vendor_hooks_intact()
+        result["hooks_guard_intact"] = hooks_ok
+        if missing:
+            result["hooks_guard_missing"] = missing
+        print(json.dumps(result, indent=2))
         return
+
+    if "--install-hooks" in args:
+        ok = install_hooks()
+        sys.exit(0 if ok else 1)
 
     if "--cleanup" in args:
         ok = run_cleanup()
