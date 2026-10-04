@@ -1,0 +1,1822 @@
+[
+ {
+  "id": "main-stdin-envelope",
+  "title": "main() reads env vars instead of the stdin JSON envelope + argv event name",
+  "status": "divergent",
+  "severity": "critical",
+  "plan_refs": "plan L243 (\u00a73.4 Plugin Executable Invocation), L1284-1360 (\u00a711.1 envelope shape with top-level event/data/context)",
+  "code_refs": "bin/herdr-bartender main() L5213-5236: reads HERDR_PLUGIN_EVENT, HERDR_PLUGIN_EVENT_JSON, HERDR_PLUGIN_CONTEXT_JSON; never reads sys.stdin or argv[1]",
+  "required_change": "Parse the event from stdin: read sys.stdin (bounded, non-blocking, within time_remaining()), json.loads it, take event_name = envelope.get('event') or argv[1] (argv[1] is the event name per the plan), data = envelope['data'], context = envelope['context']. If stdin is empty or malformed, fall back to argv ${1:-}: no-op for a known event name with no payload, or start background recovery (ensure_reconciler_running). Keep the env-var path only as a secondary fallback. Type-check envelope/data/context as dicts; treat non-dicts as {}. Add tests that run the binary as a subprocess with the \u00a73.4 captured envelope on stdin, and with empty and malformed stdin.",
+  "area": "events-context"
+ },
+ {
+  "id": "idle-case-c-omitted-key",
+  "title": "Case C (omitted agent key) maps to Ended instead of Idle; Case B vs C is not distinguished",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "plan L164-173 (\u00a72.2 Cases A/B/C), L249 (Agent Exit Signal), L1311-1323 fixtures",
+  "code_refs": "handle_agent_status_changed L2232-2255: `if not raw_agent and agent_status != \"idle\": raw_agent = cached_s.get(\"raw_agent\")` and then the idle branch maps to Ended whenever raw_agent is falsy and a session exists",
+  "required_change": "Classify idle events by key presence: has_agent_key = 'agent' in event_data; ev_agent = str(event_data.get('agent') or '').strip(). Case A: ev_agent non-empty -> Idle. Case B: has_agent_key and ev_agent == '' (null or empty) -> Ended, even when the pane is focused and context.focused_pane_agent is set (Case B must win over the \u00a72.3 hierarchy). Case C: key absent -> if a cached session exists with raw_agent and desired_state != 'Ended', keep raw_agent and map to Idle; otherwise discard. Add unit tests for Case C (key omitted -> Idle with retained agent) and for Case B on a focused pane that has a stale focused_pane_agent.",
+  "area": "events-context"
+ },
+ {
+  "id": "ended-resurrection-cached-agent",
+  "title": "A non-idle event with no agent revives an Ended (not yet evicted) session through the cached raw_agent",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "plan L157-163 (admission requires event agent, or focused agent, or an existing session with desired_state != Ended)",
+  "code_refs": "handle_agent_status_changed L2236-2244: raw_agent is filled from cached_s['raw_agent'] before the check `if cached_s.get('desired_state') == 'Ended': if not raw_agent: return`, so the Ended guard is bypassed",
+  "required_change": "Run the admission check before the cached fallback: positive_signal = event agent non-empty after strip OR (is_focused and focused_pane_agent non-empty after strip). Admit only if positive_signal OR (session exists AND desired_state != 'Ended'). Apply the cached raw_agent fallback only for display-name resolution after admission. Add a test: Ended session still in cache plus 'working' with no agent -> no resurrection.",
+  "area": "events-context"
+ },
+ {
+  "id": "admission-whitespace-agent",
+  "title": "Admission does not strip whitespace from event.data.agent",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "plan L160 (non-empty after stripping whitespace), L99",
+  "code_refs": "handle_agent_status_changed L2236-2246 (`not raw_agent` truthiness); tombstone path L2205 does strip",
+  "required_change": "Normalize ev_agent = str(event_data.get('agent') or '').strip() (same for focused_pane_agent) and use these stripped values for every admission and Case A/B decision.",
+  "area": "events-context"
+ },
+ {
+  "id": "agent-sanitization",
+  "title": "Agent name is not stripped of ANSI/OSC/control characters or truncated to 64",
+  "status": "missing",
+  "severity": "medium",
+  "plan_refs": "plan L186 (\u00a72.3 agent row)",
+  "code_refs": "format_agent_name L1178-1183",
+  "required_change": "In format_agent_name, run the raw agent through the same OSC/DCS/CSI/control stripping as sanitize_title (factor out a shared strip_terminal_controls()), then strip, lowercase, map through AGENT_NAME_OVERRIDES, and truncate the final string to 64 characters. Also handle non-str input with str(). Add tests with an OSC-injected agent name and a 200-character agent name.",
+  "area": "events-context"
+ },
+ {
+  "id": "cwd-order-and-sanitization",
+  "title": "cwd hierarchy order is wrong, and cwd is never sanitized or truncated",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "plan L188 (event.cwd -> cached cwd -> focused_pane_cwd if focused -> workspace_cwd if focused -> ''; control-strip; 256 chars)",
+  "code_refs": "handle_agent_status_changed L2262-2266 (focused_pane_cwd is consulted before cached cwd; no sanitization)",
+  "required_change": "Reorder to: event_data.cwd or cached_s.cwd or (focused_pane_cwd if is_focused) or (workspace_cwd if is_focused) or ''. Apply CONTROL_REGEX stripping (plus CSI/OSC stripping) and truncate to 256 characters; coerce non-str to str. Add tests for focused-pane precedence (cached beats focused) and for control-character and length sanitization.",
+  "area": "events-context"
+ },
+ {
+  "id": "tab-workspace-validation",
+  "title": "tab_id and workspace_id resolved in status events are not validated against the container regex",
+  "status": "missing",
+  "severity": "medium",
+  "plan_refs": "plan L189-190 (validated against ^[a-zA-Z0-9_:-]{1,48}$; null/'' if invalid)",
+  "code_refs": "handle_agent_status_changed L2244-2270 (event_data workspace_id and tab_id stored as given)",
+  "required_change": "After resolution, set tab_id = tab_id if isinstance(tab_id, str) and CONTAINER_ID_REGEX.match(tab_id) else None, and do the same for workspace_id with '' as the fallback. Invalid values must fall through to the next hierarchy level, not be stored. Add tests with an invalid tab_id or workspace_id.",
+  "area": "events-context"
+ },
+ {
+  "id": "workspace-id-precedence",
+  "title": "An event workspace_id that disagrees with the colon-qualified pane prefix is stored, which makes workspace.closed cleanup wrong",
+  "status": "plan-contradiction",
+  "severity": "medium",
+  "plan_refs": "plan L190 (hierarchy lists event.data.workspace_id first, yet also says a colon-qualified pane is used directly 'without workspace prefixing or override'); L11",
+  "code_refs": "handle_agent_status_changed L2156-2172, L2268-2269 (also special-cases workspace_id == 'default')",
+  "required_change": "Recommended reading: when canonical_pane contains ':', the workspace_id stored in cache must equal its prefix. The canonical pane identity is authoritative, and a mismatched event workspace_id should be logged and ignored. Otherwise workspace.closed for the prefix workspace misses the session, and a close of the wrong workspace evicts it. Also remove the `workspace_id == \"default\"` special case (the plan says never fall back to 'default'). Amend plan \u00a72.3 so the prefix takes precedence over event.data.workspace_id when the pane is colon-qualified.",
+  "area": "events-context"
+ },
+ {
+  "id": "hostname-truncation",
+  "title": "Sanitized hostname is not truncated to 32 characters, and session_id is never checked against the 96-character bound",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "plan L15, L185 (re.sub(...)[:32], fallback 'local', total ^[a-zA-Z0-9_:-]{1,96}$), L116 (salvage regex host {1,32})",
+  "code_refs": "get_sanitized_hostname L94-97; session_id built at L2177-2179 with no validation; SESSION_ID_REGEX L50 used in salvage",
+  "required_change": "Return (clean[:32] or 'local'). Validate the pinned data['host'] read from cache against ^[a-z0-9_-]{1,32}$ and fall back to get_sanitized_hostname() if it fails. After building session_id, assert it matches ^[a-zA-Z0-9_:-]{1,96}$ and SESSION_ID_REGEX, and log and reject if not. Without the truncation, hosts longer than 32 characters produce session IDs that corrupt-cache salvage can never recover (SESSION_ID_REGEX caps the host at 32). The code also splits on '.' before sanitizing, which the plan formula does not (the plan formula gives 'macbook-prolocal', the code gives 'macbook-pro'). Recommend keeping the split and updating the plan formula to `raw_host.split('.')[0]`, because the \u00a711.2 fixture 'herdr:macbook:...' implies the split. Add a unit test that monkeypatches socket.gethostname to a 60-character name.",
+  "area": "events-context"
+ },
+ {
+  "id": "normalize-env-fallback",
+  "title": "normalize_pane_id ignores HERDR_WORKSPACE_ID; the plan contradicts itself on env fallback",
+  "status": "plan-contradiction",
+  "severity": "medium",
+  "plan_refs": "plan L13 (ws = workspace_id or os.environ.get('HERDR_WORKSPACE_ID')), L190, L249 vs L10 ('colon-less pane IDs without workspace_id in event data are invalid and rejected')",
+  "code_refs": "normalize_pane_id L1186-1191; handle_agent_status_changed L2160-2162 and handle_pane_closed L2580-2582 reject before normalize can consult env",
+  "required_change": "Pick one rule. Recommended: follow L13/L190/L249, stated three times, and make normalize_pane_id use `ws = workspace_id or os.environ.get('HERDR_WORKSPACE_ID')`, returning '' if empty. Have the handlers call normalize_pane_id and reject only when it returns '' instead of pre-rejecting. Edit L10 to read 'without workspace_id in event data or HERDR_WORKSPACE_ID'. Update parity tests 31/37 to clear or set HERDR_WORKSPACE_ID explicitly, because the ('pane123', None, '') case depends on the env being unset.",
+  "area": "events-context"
+ },
+ {
+  "id": "marker-dual-link-default",
+  "title": "touch_pane_marker writes a second alias marker using a 'default' workspace fallback",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "plan L14 ('no alias, no symlink, and no dual-linking'), L190 ('never falling back to \"default\"'), L249",
+  "code_refs": "touch_pane_marker L734-739 (alt_id = f\"{HERDR_WORKSPACE_ID or 'default'}:{raw_pane_id}\")",
+  "required_change": "Remove the alt_id/hex_ids alias logic and write only panes/<hex(canonical_pane)>. Drop the unused raw_pane_id parameters from the touch_pane_marker, touch_pane_failed, clear_pane_failed, remove_pane_marker and cleanup_vendor_active signatures, or ignore them explicitly. Add a test asserting exactly one marker file after a confirmed delivery for a colon-less raw pane.",
+  "area": "events-context"
+ },
+ {
+  "id": "pane-closed-context-leak",
+  "title": "pane.closed falls back to the focused pane id and an unfocused context.workspace_id, and crashes when pane_id is missing",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "plan L181 (background events NEVER inherit focused workspace attributes), L190, L151",
+  "code_refs": "handle_pane_closed L2576-2582: raw_pane = event_data.pane_id or context.focused_pane_id; workspace_id = event_data.workspace_id or context.workspace_id (no focus gate); `\":\" in raw_pane` raises TypeError when both are None; same raw_pane fallback in handle_agent_status_changed L2149",
+  "required_change": "Require event_data['pane_id'] (a non-empty str) and return with a log line if it is absent. Never substitute focused_pane_id: a close or status event without pane_id must not act on the focused pane. Resolve workspace only from event_data.workspace_id (or HERDR_WORKSPACE_ID, per the normalize-env-fallback decision), never from an unfocused context.workspace_id, otherwise a colon-less background pane resolves into the focused workspace. Add tests: pane.closed without pane_id is a no-op; a background colon-less pane.closed does not use context.workspace_id.",
+  "area": "events-context"
+ },
+ {
+  "id": "tab-closed-suffix-match",
+  "title": "tab.closed and workspace.closed use loose matching that can evict sessions in other containers",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "plan L152 ('every session where cached tab_id matches closed tab'), L153 ('cached workspace_id matches')",
+  "code_refs": "handle_tab_closed L2738: `s_tab == tab_id or tab_id.endswith(str(s_tab))` (closing 'w11:t1' matches cached 'w1:t1'); handle_workspace_closed L2887: `f\":{workspace_id}:\" in sid` (a workspace named the same as the host, e.g. 'macbook', matches every session); both fall back to context ids when focused_pane_id is set",
+  "required_change": "Use exact equality only: info.get('tab_id') == tab_id, and info.get('workspace_id') == workspace_id or info['pane_id'].split(':',1)[0] == workspace_id. Remove the context fallback for container ids, since a close event without its id should be a no-op. Add regression tests: 'w11:t1' does not close 'w1:t1', and workspace.closed with a workspace id equal to the host does not close other workspaces.",
+  "area": "events-context"
+ },
+ {
+  "id": "close-payload-fields",
+  "title": "Ended payloads from close handlers omit terminal, event and seq",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "plan L191-193 (terminal 'Herdr', event = source event name sanitized to [A-Za-z0-9.] max 64, seq = transmitting_seq), L119 (the minimal 3-field payload is only the retry fallback)",
+  "code_refs": "handle_pane_closed L2644, handle_tab_closed L2793, handle_workspace_closed L2941: {'state','agent','session_id'} only",
+  "required_change": "Build close payloads as {'state':'Ended','agent':...,'session_id':sid,'title','cwd' (from cache),'terminal':'Herdr','event':<'pane.closed'|'tab.closed'|'workspace.closed'>,'seq':seq}. Keep the 3-field minimal payload only for the single fallback retry. Add a sanitize_event_name() helper (re.sub(r'[^A-Za-z0-9.]','',name)[:64]) and use it for every payload's 'event' field.",
+  "area": "events-context"
+ },
+ {
+  "id": "unrecognized-status-log",
+  "title": "Unrecognized agent_status is silently ignored without the required warning",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "plan L150 (log warning to plugin.log; do not mutate cache)",
+  "code_refs": "handle_agent_status_changed L2251-2253 (`if not mapped_state: return` with no log)",
+  "required_change": "Validate agent_status up front, before the cache lock and before tombstone or agent_exits handling: if it is not in STATUS_MAP and not 'unknown', call log_debug(f'Warning: unrecognized agent_status {agent_status!r} for pane {canonical_pane}') and return. Add a test that checks the log line and that the cache is unchanged.",
+  "area": "events-context"
+ },
+ {
+  "id": "title-csi-coverage",
+  "title": "Title/ANSI stripping misses CSI sequences with private or intermediate bytes",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "plan L187 (stripped of all ANSI CSI, OSC, DCS and control characters)",
+  "code_refs": "CSI_REGEX L44 `\\x1b\\[[0-9;]*[a-zA-Z]`; verified that '\\x1b[?25hHi\\x1b[>4;2m!' sanitizes to '[?25hHi[>4;2m!'",
+  "required_change": "Use the ECMA-48 form: CSI_REGEX = r'(\\x1b\\[|\\x9b)[0-?]*[ -/]*[@-~]'. Make OSC and DCS also accept the 8-bit introducers (\\x9d, \\x90) and an unterminated tail up to the end of the string. Use the shared helper for title, agent and cwd. Add tests with private-mode CSI and OSC-8 hyperlinks.",
+  "area": "events-context"
+ },
+ {
+  "id": "salvage-host-pin",
+  "title": "Corrupt-cache salvage re-pins host to the current hostname instead of the host recovered from salvaged session ids",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "plan L273 (host pinned once at cache creation; stable session IDs across hostname changes)",
+  "code_refs": "BoundedSessionCache._load salvage return L1084-1094 ('host': get_sanitized_hostname()) while the salvaged sessions use parts[1]",
+  "required_change": "When salvaged sessions exist, set the root host to the most common parts[1] among salvaged ids (when it is valid), so that later events map to the same session_id as the salvaged records.",
+  "area": "events-context"
+ },
+ {
+  "id": "tests-isolation-weak",
+  "title": "Context-isolation and parity tests do not exercise the risky paths",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "plan \u00a710.1 tests 4, 18, 26, 31, 37, 44",
+  "code_refs": "run_unit_tests test 18 L3406-3418 (the event supplies agent 'claude', so focused-agent leakage is never tested); tests 31/37 L3837-3866, L4160-4185 re-implement the bash derivation inline instead of executing HOOK_GUARD_TEMPLATE's own lines; no test for Case C, Ended resurrection, hostname truncation, agent/cwd sanitization, tab_id validation, or a missing pane_id",
+  "required_change": "Test 18: a background event with no agent and focused_pane_agent 'codex' must not be admitted (and must not take Codex as its agent if a session exists). Parity tests: extract the canonical/hex block from HOOK_GUARD_TEMPLATE (between markers) and run that exact text, or have the guard echo _HB_HEX_PANE in a debug mode. Add the missing cases listed in the other gaps. All tests must use a temp HOME, XDG_STATE_HOME and HERDR_PLUGIN_STATE_DIR so --unit-test never writes into the real $HOME.",
+  "area": "events-context"
+ },
+ {
+  "id": "focus-match-contradiction",
+  "title": "The focused-agent admission clause uses a different focus test than \u00a72.3",
+  "status": "plan-contradiction",
+  "severity": "low",
+  "plan_refs": "plan L161 (focused_pane_id == canonical_pane_id) vs L181 (is_focused = focused_id in (canonical_pane, raw_pane))",
+  "code_refs": "handle_agent_status_changed L2169 (uses the \u00a72.3 form for both purposes)",
+  "required_change": "Recommend the \u00a72.3 form as normative, since Herdr context may report the raw form, and amending L161 to reference is_focused. The code needs no change; only the plan text.",
+  "area": "events-context"
+ },
+ {
+  "id": "lock-best-effort",
+  "title": "Cache lock 'acquisition' proceeds WITHOUT the lock on contention (no mutual exclusion)",
+  "status": "divergent",
+  "severity": "critical",
+  "plan_refs": "plan L390-391 (Step A LOCK_NB with deadline, contention => spool and exit), L482-483 (Step C lock failure => results envelope and exit)",
+  "code_refs": "bin/herdr-bartender BoundedSessionCache.__enter__ L911-927: on timeout it logs 'proceeding with best effort', sets IN_CRITICAL_SECTION=True and returns self._load() anyway; every handler then does read-modify-write + save() unlocked",
+  "required_change": "__enter__ must report failure (raise a LockTimeout or return a sentinel) when flock is not obtained within deadline min(0.2, max(0.02, time_remaining()-0.3)). Callers in Step A must then enqueue_spool(...) + ensure_reconciler_running() and exit 0; callers in Step C must write_result_envelope(...) and exit; background/reconciler callers should block (or retry with their own longer budget). __exit__ must only LOCK_UN if acquired. Add a multi-process test that holds the flock in a child and asserts (a) the handler spools instead of writing the cache, (b) a Step C failure produces a results/ file.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "post-lock-dispatch-skipped-by-break",
+  "title": "break/continue inside the locked Step C block skips ALL post-lock dispatch (compensation send, orphan I/O, reconciler spawn, vendor cleanup)",
+  "status": "divergent",
+  "severity": "critical",
+  "plan_refs": "plan L294-298, L489-496 (stale-send compensation sent outside lock), L498-503 (lease mismatch => ensure_reconciler_running), L505-510, L519-528 (Ended eviction => orphan removal + vendor cleanup), L561-567 (post-lock external dispatch)",
+  "code_refs": "handle_agent_status_changed: break at L2421 (stale-send compensation staged then loop exits before the `if compensation_needed:` block at ~L2523), L2430 (lease superseded; should_spawn_reconciler set but ensure_reconciler_running never called), L2440 (resync superseded, same), L2481 (Ended confirmed: orphans_to_remove and vendor_to_clean never executed). handle_pane_closed: continue at L2654 and L2663 skip ensure_reconciler_running (L2709+)",
+  "required_change": "Restructure so the with-block only sets flags/staged lists and the post-lock dispatch section always runs after the lock is released (e.g. set `done=True` instead of break, exit the with, run dispatch, then `if done: break`). Compensating Ended must be sent synchronously when budget allows; ensure_reconciler_running must be called whenever should_spawn_reconciler is set; orphan removal and vendor cleanup must run after Ended eviction. Replace hollow tests #43/#48 (which re-implement the logic inline) with tests that drive the real handler through a delayed mock POST concurrent with handle_pane_closed and assert the bridge received the compensating Ended and that pending_compensations is cleared.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "pending-compensation-cleared-before-send",
+  "title": "Persisted compensation is removed from pending_compensations BEFORE the compensating send (and even when deferred for budget)",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "plan L486 (record under lock; after successful dispatch re-acquire lock to clear entry; reconciler drains on SIGALRM/exit), L562-564",
+  "code_refs": "handle_agent_status_changed ~L2518-2549: re-verification lock clears data['pending_compensations'] then sends; when time_remaining()<=0.3 it only touches reconciler.pending after having already deleted the entry. reconcile_active_sessions L1486-1507 has the same clear-then-send order",
+  "required_change": "Keep the entry until the compensating POST has returned; clear it in the post-send re-lock (the same lock that performs post-compensation re-sync detection). When budget-deferred, leave the entry in place. On abort due to re-admitted live session, clear it under that lock. Same fix in reconcile_active_sessions.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "no-contention-spool-path",
+  "title": "Step A contention spooling never happens; enqueue_spool is dead code in production",
+  "status": "missing",
+  "severity": "critical",
+  "plan_refs": "plan L391 (write envelope to spool/<enqueued_ns:020d>_<pid>_<monotonic_ns>.json, cap 100 protecting closes, spawn --reconcile-background, exit)",
+  "code_refs": "enqueue_spool L1301 is only called from unit tests (L3246-3388); no handler calls it; enqueue_spool itself does not spawn the helper",
+  "required_change": "Wire enqueue_spool into the Step A lock-failure path of every handler (status, pane/tab/workspace closed) and have it (or the caller) call ensure_reconciler_running(). Set enqueued_ns = time.time_ns() as specified (keep arrival_ns separately; see plan-contradiction note) and name the file by it, or amend the plan to name by arrival_ns.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "step-a-spool-replay-missing",
+  "title": "Live Step A does not replay the spool under lock; replay only happens in the reconciler via full handlers with network I/O",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "plan L393-403 (Step A: drain up to 16 envelopes FIFO under the lock, close admission ordering, tombstone recording, status staleness, unlink only after save)",
+  "code_refs": "replay_spool_dir L1412-1452 is called only from run_reconcile_background L1822; it invokes handle_* per envelope (each doing its own lock cycles and HTTP POSTs), so it is neither a pure under-lock mutation nor bounded by the <10ms CPU lock budget",
+  "required_change": "Factor a pure `apply_envelope_locked(data, envelope)` that performs the cache mutation only (close: admission check arrival_ns>=admitted_at_ns and generation if present, tombstone dict, desired_state=Ended, seq++; status: source-ts or arrival vs last_event_ns supersession) and call it from Step A of the live handler for up to 16 files before evaluating the live event, unlinking each file after the save. Delivery of replayed sessions is then done by the universal sender/reconciler. Add schema validation (event_name in known set, event_data dict, arrival_ns int) that quarantines to spool/bad. Remove or gate the non-spec 'direct_post' event type (test-only).",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "is-disabled-under-lock",
+  "title": "is_disabled() is not re-checked under the lock in Step A or Step C",
+  "status": "missing",
+  "severity": "medium",
+  "plan_refs": "plan L392, L484",
+  "code_refs": "handle_agent_status_changed L2180+ and Step C ~L2405; handle_pane_closed L2593 and L2650; only main() L5207 checks before dispatch",
+  "required_change": "Immediately after acquiring the lock in Step A and Step C of every handler, `if is_disabled(): return` without saving or sending.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "results-dir-schema-and-drain",
+  "title": "Results directory: never written by handlers; drain uses a schema different from the plan and applies wrong state transitions",
+  "status": "partial",
+  "severity": "high",
+  "plan_refs": "plan L483 (envelope fields version:1, session_id, transmitting_seq, transmitting_state, status success|non_retryable|retryable, error, timestamp_ns, pid; drain applies confirmations with staleness check transmitting_seq >= delivered_seq)",
+  "code_refs": "write_result_envelope L1348 (no caller outside tests); drain_results_dir L1369-1409 reads 'success'/'is_non_retryable'/'pane_id' instead of 'status'; requires s.seq == r_seq (discards valid older confirmations); maps non-retryable to 'retryable_exhausted' and retryable to 'in_flight' without rejected_seq/delivery_attempts; Ended success evicts without recording tombstone/agent_exits, orphan removal or vendor cleanup; compensation staged with generation 1/admitted_at_ns 0/agent 'Herdr'",
+  "required_change": "Have Step C lock-failure write the plan's envelope (also include pane_id and agent for compensation). In drain: parse 'status'; on success apply if transmitting_seq >= delivered_seq (evict only if Ended and seq == transmitting_seq, recording tombstone/agent_exits from persisted session origins, staging orphan removal and pending_vendor_cleanups); on non_retryable set non_retryable_failed + rejected_seq + .failed marker + orphan export for Ended; on retryable increment delivery_attempts and apply the 5-attempt exhaustion rule; stage compensation with the real agent and pane_generations[pane]. Add tests for each status.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "capacity-prune-before-reject",
+  "title": "256 cap rejects session 257 without first pruning Ended/salvaged sessions",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "plan L290-293, L426-429",
+  "code_refs": "handle_agent_status_changed L2233-2235 rejects when len(sessions)>=256; save() L1117-1129 prunes only when len>256 (never reached) and only 'safe' Ended (delivered/orphaned) or salvaged",
+  "required_change": "At admission, when the pane is new and len(sessions)>=256, prune Ended sessions and salvaged records (oldest last_event_at first; for undelivered Ended export as orphan first to preserve zero-data-loss) and reject only if still >=256 live sessions. Extend test #51 to fill with e.g. 255 live + 1 Ended and assert 257th admission succeeds.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "closed-source-ts-not-persisted",
+  "title": "pane.closed does not persist closed_source_ts on the session; Step C overwrites the tombstone with closed_source_ts=0.0",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "plan L264 (closed_at_ns recorded once, stable origin), L278, L451 (persist closed_at_ns and closed_source_ts on session), L528 (tombstone re-affirmed from persisted session origins)",
+  "code_refs": "handle_pane_closed L2602-2606 writes a correct tombstone, L2619 sets info['closed_at_ns']=arr_ns (overwriting any earlier close) but never info['closed_source_ts']; on success L2684-2688 rewrites the tombstone with s.get('closed_source_ts', 0.0)=0.0, weakening the positive-admission source check (src_ts > 0 trivially true)",
+  "required_change": "In Step A of pane close set info['closed_source_ts'] = the computed closed_source_ts and only set closed_at_ns/closed_source_ts if not already present for the current generation (setdefault) so duplicate/delayed closes keep the original origin; likewise do not overwrite an existing tombstone's closed_at_ns. Add a test asserting tombstone closed_source_ts survives Step C confirmation.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "tombstone-on-stale-close",
+  "title": "pane.closed records a tombstone even when the close predates the current session admission",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "plan L398 (discard close events predating admission), L575 (cascade ignores closes predating admission)",
+  "code_refs": "handle_pane_closed L2602 records tombstone unconditionally before the per-session admitted_at_ns check at L2614",
+  "required_change": "Record/refresh the tombstone only when at least one matching session accepted the close (or no session exists and the close is not older than the pane's last admission); a stale replayed close must not tombstone a freshly admitted pane. Also save the tombstone even when sessions is empty (currently gated by `if sessions:` L2635) to keep behavior consistent.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "source-staleness-tolerance",
+  "title": "Source staleness filter lacks the 0.1s tolerance and uses truthiness",
+  "status": "divergent",
+  "severity": "low",
+  "plan_refs": "plan L299-302, L425",
+  "code_refs": "handle_agent_status_changed L2288: `if source_ts and last_source_ts and source_ts < last_source_ts: return`",
+  "required_change": "Use `if source_ts is not None and float(source_ts) < float(session.get('last_source_timestamp', 0)) - 0.1: drop`, evaluated before seq increment (already is). Add a test with a 50ms-older timestamp being accepted.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "agent-exits-prune-and-pop",
+  "title": "agent_exits entries are not pruned after 60s globally and are popped on 'working' without requiring event.data.agent",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "plan L303, L421-424",
+  "code_refs": "BoundedSessionCache.save L1096-1166 prunes tombstones only; agent_exits pruned lazily at L2224 only when the same pane receives an event; L2229 pops on working without checking agent",
+  "required_change": "Prune agent_exits entries with now_ns - exit_at_ns > 60s in save() alongside tombstones; require a non-empty event_data['agent'] before popping on a working event.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "last-event-ns-clamp",
+  "title": "last_event_ns not clamped monotonic (plan self-contradictory)",
+  "status": "plan-contradiction",
+  "severity": "low",
+  "plan_refs": "plan L263 (last_event_ns = max(now_ns, prev+1)) vs L435 (session['last_event_ns'] = arr_ns)",
+  "code_refs": "handle_agent_status_changed L2310 and L2339 set last_event_ns = arr_ns",
+  "required_change": "Recommend `last_event_ns = max(arr_ns, session.get('last_event_ns', 0) + 1)`: keeps the arrival basis used by \u00a74.3 replay comparisons while guaranteeing strict monotonicity on equal/backward clocks. Keep last_arrival_ns as the raw arrival for ordering drops. Update \u00a74.3 L435 to match.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "generation-bump-on-delivered-ended",
+  "title": "Generation/admitted_at_ns re-bumped on every event while delivered_state=='Ended' but desired_state is live",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "plan L270, L441-446 (bump only on new admission or transitioning from Ended)",
+  "code_refs": "handle_agent_status_changed L2301 is_new_turn includes cached_s.get('delivered_state') == 'Ended'",
+  "required_change": "Bump only when the record is new (no generation) or cached desired_state == 'Ended'. Otherwise repeated bumps move admitted_at_ns forward and cause legitimate spooled closes (arrival between admissions) to be discarded.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "step-b-sync-cap",
+  "title": "Synchronous Step B is not capped at 1 iteration / 2 POSTs (plan self-contradictory)",
+  "status": "plan-contradiction",
+  "severity": "medium",
+  "plan_refs": "plan L471-472 (at most 1 session, at most 2 POST attempts, at most 1 iteration) vs L531 and L553-556 ('loop continues and transmits latest desired_state', 'continue loop to Step B')",
+  "code_refs": "handle_agent_status_changed while loop L2395-2571 iterates while time_remaining()>0.3; plus compensation POST and cleanup_vendor_active POST",
+  "required_change": "Recommend the cap reading (L471): it is the only one that guarantees the 1.4s watchdog with 0.2s POSTs + lock waits. In the 'newer state arrived' branch, clear the lease, touch reconciler.pending and ensure_reconciler_running() instead of looping. Clarify in the plan that compensating Ended and vendor-dismiss POSTs are outside the 2-POST cap but subject to the time_remaining()>0.3 gate. Also gate the first POST on time_remaining()>0.3 (L472).",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "ended-retry-budget-and-timeout",
+  "title": "Minimal Ended retry is not budget-gated and socket timeout formula differs",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "plan L478-479 (timeout min(0.2, max(0.05, time_remaining()-0.3)); retry only if time_remaining()>0.3)",
+  "code_refs": "post_bartender_event L864-876 retries unconditionally; _raw_post_event L831 uses max(0.05, min(timeout, tr-0.3 if tr>0.4 else tr)) which yields 0.2s when tr<=0.4; time_remaining() L105 floors at 0.1 so budget is never exhausted",
+  "required_change": "Use timeout = min(0.2, max(0.05, time_remaining()-0.3)); guard the retry with time_remaining()>0.3; let time_remaining() return the true (possibly <=0) remainder so gates work.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "background-budget-starvation",
+  "title": "Reconciler-driven replays inherit the 1.4s per-process budget: lock deadline collapses to 20ms and every budget gate fails",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "plan L390, L561-566 (budget gates are for the synchronous handler; deferred work goes to the reconciler)",
+  "code_refs": "time_remaining() L105-108 uses module START_TIME and PROCESS_DEADLINE_SECONDS=1.4; run_reconcile_background L1789 never resets them; replay_spool_dir/drain_results_dir/reconcile call handlers whose lock deadline becomes min(0.2,max(0.02,0.1-0.3))=0.02s (then proceeds unlocked per lock-best-effort), and compensation/vendor cleanup are perpetually 'deferred' by re-spawning a reconciler that immediately exits on reconciler.lock",
+  "required_change": "Give background mode its own budget (e.g. reset START_TIME per sweep and use a larger deadline, or pass an explicit budget object), and have background lock acquisition block/retry rather than fall through.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "pane-closed-retryable",
+  "title": "pane.closed retryable failure does not bump consecutive_failures/DELIVERY_DOWN nor spawn the reconciler; vendor cleanup unbudgeted and unpersisted",
+  "status": "partial",
+  "severity": "high",
+  "plan_refs": "plan L541-552 (retryable: consecutive_failures, DELIVERY_DOWN at >=3, schedule background helper), L486 and L566 (pending_vendor_cleanups, budget gate)",
+  "code_refs": "handle_pane_closed L2697-2704 and L2709-2716",
+  "required_change": "Mirror the status handler's retryable branch (consecutive_failures, touch_delivery_down, should_spawn_reconciler=True when delivered_seq<seq), record pending_vendor_cleanups under lock and dispatch cleanup_vendor_active only if time_remaining()>0.3 then clear the entry. Ideally route both handlers through one shared universal-sender function to remove the duplication.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "unconditional-watchdog-check",
+  "title": "Unconditional watchdog check (ensure reconciler when any non-Ended session remains) missing",
+  "status": "missing",
+  "severity": "medium",
+  "plan_refs": "plan L568",
+  "code_refs": "handle_agent_status_changed / handle_pane_closed end of function (~L2571, ~L2716); no such check anywhere",
+  "required_change": "At the end of each handler (after post-lock dispatch), if any cached session has desired_state != 'Ended' (read during the last locked section), call ensure_reconciler_running().",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "pending-comp-target-generation",
+  "title": "Persisted compensations carry placeholder generation/admitted_at_ns and the reconciler ignores them",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "plan L486 (recorded with target generation and admitted_at_ns; reconciler re-verifies identically)",
+  "code_refs": "handle_agent_status_changed L2410-2418 uses generation 1 / admitted_at_ns 0 when session is None; reconcile_active_sessions L1486-1507 only checks desired_state",
+  "required_change": "When the session is gone use data['pane_generations'].get(canonical_pane) and the transmitted payload's agent; in the reconciler abort if a session for that id exists with generation > target generation or desired_state != 'Ended'.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "success-staleness-check",
+  "title": "Step C success branch does not apply the transmitting_seq >= delivered_seq guard",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "plan L511",
+  "code_refs": "handle_agent_status_changed L2442-2445",
+  "required_change": "Wrap delivered_state/delivered_seq/status updates in `if transmitting_seq >= s.get('delivered_seq', 0):`.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "spool-close-protection-agent-exit",
+  "title": "Spool cap protection cannot recognise agent-exit envelopes (classifies by event_data.state which status events lack)",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "plan L391 (protect close events), L397 (close includes agent exit to Ended)",
+  "code_refs": "enqueue_spool L1316-1318, corrupt-cache salvage L983-985",
+  "required_change": "Treat pane.agent_status_changed envelopes with agent_status=='idle' and empty agent (potential agent exit) as protected, or persist a 'close_hint' flag in the envelope at enqueue time. Also bad/ cap enforced once per pass (L1418-1423) can exceed 20 within a pass; prune after each quarantine.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "cache-schema-version-fields",
+  "title": "Cache schema version and fields diverge from \u00a74.2; schema omits fields \u00a74.3 requires",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "plan L309 (version 4), L313 (herdr_instance_id), L305-383 vs \u00a74.3 fields close_kind, closed_source_ts, exit_at_ns, exit_source_ts, resync_generation, pending_compensations, pending_vendor_cleanups",
+  "code_refs": "BoundedSessionCache._load L942 and L1085 write version 1; herdr_instance_id never persisted (get_herdr_instance_id L219 unused for cache); salvage return L1084-1094 omits agent_exits/dismissed_vendor_uuids and resets host to current hostname (breaks host pinning for salvaged IDs)",
+  "required_change": "Write version 4 (with migration of v1 caches), persist herdr_instance_id, preserve the old host in salvage (regex-extract from raw text or from salvaged IDs). Update \u00a74.2 example to include the \u00a74.3 fields (plan gap).",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "in-critical-section-flag",
+  "title": "save() clears IN_CRITICAL_SECTION while the lock is still held; deferred watchdog exit not honored on early return",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "plan L561 (<10ms CPU lock guarantee; no network under lock), L587 (assert not IN_CRITICAL_SECTION)",
+  "code_refs": "BoundedSessionCache.save finally L1160-1164; __exit__ L929-937 does not check PENDING_WATCHDOG_EXIT",
+  "required_change": "Only __exit__ should clear IN_CRITICAL_SECTION; __exit__ should honor PENDING_WATCHDOG_EXIT after unlocking.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "pid-reuse-start-time-portability",
+  "title": "PID-reuse defense depends on `ps -o lstart` and silently falls back to module-load time",
+  "status": "portability",
+  "severity": "low",
+  "plan_refs": "plan L265, L459-468 (token with PROCESS_START_TIME)",
+  "code_refs": "get_process_start_time L60-74 (fallback str(int(MODULE_LOAD_TIME)) is this process's time even when asked about another pid); is_process_instance_alive L157-164; spawns ps under the cache lock",
+  "required_change": "When ps fails for a foreign pid return None and treat start time as unknown (fall back to plain is_pid_alive) instead of comparing against our own load time. On Linux prefer /proc/<pid>/stat starttime; ps -o lstart works on both macOS and Linux procps so tests run, but locale must be forced (LC_ALL=C) for strptime.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "tests-hollow-area",
+  "title": "Tests for compensation, contention, results dir and capacity pruning are missing or hollow",
+  "status": "test-weak",
+  "severity": "high",
+  "plan_refs": "plan \u00a710.1 coverage of \u00a74.1/\u00a74.3 behaviours",
+  "code_refs": "run_unit_tests #43 (L4340-4379) and #48 (L4463-4495) re-implement compensation logic inline rather than exercising Step C; no test for lock-contention spooling, results/ envelopes, Step A replay, is_disabled under lock, capacity pruning of Ended sessions, agent_exits pruning, closed_source_ts preservation; is_herdr_alive() returns True under HERDR_BARTENDER_UNIT_TESTING so condition 4 of positive admission is untestable; tests write into real $HOME state dir",
+  "required_change": "Add multi-process tests (child holding flock; delayed mock POST with concurrent close) asserting real handler behaviour; make is_herdr_alive injectable rather than env-bypassed; point HERDR_PLUGIN_STATE_DIR and HOME at a tempdir in run_unit_tests.",
+  "area": "dispatch-protocol"
+ },
+ {
+  "id": "lock-timeout-proceeds-unlocked",
+  "title": "Lock acquisition timeout proceeds without the lock instead of spooling",
+  "status": "divergent",
+  "severity": "critical",
+  "plan_refs": "plan L390-391 (contention rule), \u00a76.1 L700-705, budget table L713",
+  "code_refs": "bin/herdr-bartender BoundedSessionCache.__enter__ L911-927; enqueue_spool L1301 (never called by any handler)",
+  "required_change": "The deadline formula min(0.2, max(0.02, time_remaining()-0.3)) is correct. But when it runs out, __enter__ only logs 'proceeding with best effort', sets IN_CRITICAL_SECTION=True and returns _load(), so handle_tab_closed/handle_workspace_closed change and os.replace the cache without holding the flock, and concurrent writers can lose each other's updates. Fix: __enter__ must report the failure (raise LockContention or set self.acquired=False). Each handler, including both cascade handlers, must then call enqueue_spool(event_name, event_data, context, arrival_ns=arr_ns), call ensure_reconciler_running() and return. Blocking callers (--cleanup, the reconciler) may keep a longer or blocking wait. Add a test that holds the flock from a child process and checks that a spool envelope is written and the cache is not changed.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "orphan-lock-blocking",
+  "title": "Orphan file lock is blocking LOCK_EX, not LOCK_NB with a 50ms deadline",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "\u00a76.1 L703 (LOCK_NB, 50ms, delegate on contention); budget table L720 (10ms); \u00a74.3 item 5 Post-Lock L608",
+  "code_refs": "export_orphan_record L1215-1253 and remove_orphan_record L1256-1298 (fcntl.flock(lock_fd, fcntl.LOCK_EX)); called after Step C in handle_tab_closed/handle_workspace_closed",
+  "required_change": "In the plugin event path, add a non_blocking/deadline parameter that loops on LOCK_EX|LOCK_NB for up to 50ms. On contention, return False and leave the record in cache: orphaned_ended stays True, plus a pending_orphan_export/pending_orphan_remove flag. Then touch_reconciler_pending() and ensure_reconciler_running(), and have the reconciler drain those flags. The blocking mode should remain only for --cleanup, --replay-orphans and the reconciler. Plan conflict: \u00a74.3 (L565, L608) says only 'under dedicated lock' while \u00a76.1 requires LOCK_NB with a 50ms limit. Recommend \u00a76.1, because a blocking flock in a watchdog-bounded process can be held until SIGALRM, which loses the export.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "cascade-no-budget-gate",
+  "title": "Cascade network I/O ignores the time_remaining() > 0.3s skip rule, and the socket timeout formula differs",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "\u00a75.2 L683-685; \u00a76.1 L701, L704 (skip network when <=0.3s); budget table L715-718 (minimal retry only on rejection and only if >0.3s); \u00a74.3 L566",
+  "code_refs": "_raw_post_event L821-861 (eff_timeout = max(0.05, min(timeout, tr-0.3 if tr>0.4 else tr))); post_bartender_event L864-876; cleanup_vendor_active L751-791; handle_tab_closed Step B L2792, post-lock L2860-2865; handle_workspace_closed same",
+  "required_change": "1) Compute the timeout as exactly min(0.2, max(0.05, time_remaining()-0.3)). The current code returns up to 0.2s when remaining is in (0.3, 0.4], where the spec allows 0.05-0.1s. 2) Before each Step B POST, minimal-payload retry, compensating POST and cleanup_vendor_active in the cascade handlers, check time_remaining() > 0.3. If it fails, leave the session in_flight, touch_reconciler_pending() and ensure_reconciler_running(). 3) post_bartender_event should retry the minimal payload only after a rejection (is_non_retryable=True or ok:false), not after a timeout or connection error, and only when time_remaining() > 0.3. 4) cleanup_vendor_active should use the same formula and gate, and defer to the reconciler when the budget is spent. Note: time_remaining() never returns less than 0.1 (L108), so gates must compare against 0.3 and not test for <= 0.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "watchdog-deadline-1p4",
+  "title": "ITIMER_REAL is armed at 1.4s, not the specified 1.5s",
+  "status": "divergent",
+  "severity": "low",
+  "plan_refs": "\u00a76.1 L698; \u00a75.2 L682; budget table L725",
+  "code_refs": "PROCESS_DEADLINE_SECONDS = 1.4 (L24); arm_watchdog L137-144; time_remaining L105-108",
+  "required_change": "Set PROCESS_DEADLINE_SECONDS = 1.5 to match the spec, or update the spec if the 100ms extra margin is intended. Also, START_TIME is taken at module load and not at interpreter start, so startup cost (including the ps fork for PROCESS_START_TIME at L76) is not counted against the budget. Consider moving the PROCESS_START_TIME fork to lazy evaluation.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "deferred-exit-only-in-save",
+  "title": "Deferred watchdog exit is checked only in save(), not in __exit__, and skips the reconciler handoff",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "\u00a76.1 L727-729 (exit deferred until __exit__ completes swap and releases lock, then exit 0; outside critical sections launch reconciler if unconfirmed sessions remain)",
+  "code_refs": "_timeout_watchdog L111-134; BoundedSessionCache.__exit__ L929-937; save() finally L1160-1164",
+  "required_change": "Move the PENDING_WATCHDOG_EXIT check into __exit__, after LOCK_UN and close. Before sys.exit(0), call ensure_reconciler_running() when unconfirmed sessions remain. With-blocks that never call save() (Step C 'if not s: continue', --status/--sessions, a cascade where 'sessions' is empty, and _load raising) currently ignore the pending exit. Because the timer is one-shot, the process then runs network I/O with no deadline. save() also clears IN_CRITICAL_SECTION while the lock is still held, so later mutations in the same block are unprotected. Add tests that call _timeout_watchdog with IN_CRITICAL_SECTION=True and check that SystemExit(0) is raised only after the lock is released (a child process can then flock LOCK_NB).",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "load-nameerror-salvage",
+  "title": "Corrupt-load path can raise UnboundLocalError and leave the lock and IN_CRITICAL_SECTION stuck",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "\u00a76.3 L737-783 (quarantine and salvage must always yield a fresh cache)",
+  "code_refs": "_load L1020-1093: salvage_epoch_gen is defined inside the inner try at L1026, but L1090 uses it unconditionally",
+  "required_change": "If the raw re-read fails (file removed between exists() and open, EACCES, and so on), the inner try swallows the error and the return statement then raises UnboundLocalError. That exception leaves __enter__ with IN_CRITICAL_SECTION=True and the flock fd still open, because __exit__ is never called. Initialise salvage_epoch_gen = max(int(time.time()), 1_700_000_000) before any try. Wrap __enter__ so a _load failure releases the lock and resets IN_CRITICAL_SECTION.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "salvage-not-persisted",
+  "title": "Salvaged cache is not written atomically under the held lock",
+  "status": "missing",
+  "severity": "medium",
+  "plan_refs": "\u00a76.3 step 6 L783",
+  "code_refs": "_load L1078-1093 returns the salvaged dict after moving the corrupt file but never saves; callers --status L5174, --sessions L5208 and early-return paths do not save",
+  "required_change": "After building the salvaged dict in _load, call self.save(salvaged_data) or an internal _write_atomic while the lock is still held, so the salvage survives read-only callers. Today 'herdr-bartender --status' on a corrupt cache quarantines the file and drops every salvaged session. Add a test that runs a read-only with-block on a corrupt cache and then checks that the next load still contains the salvaged sessions.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "quarantine-prune-7d",
+  "title": "No 7-day prune of active-sessions.json.corrupt.* files",
+  "status": "missing",
+  "severity": "low",
+  "plan_refs": "\u00a76.3 step 1 L737",
+  "code_refs": "_load L1080-1081 (rename only); no other code matches 'corrupt.'",
+  "required_change": "After the rename, glob state_dir/'active-sessions.json.corrupt.*' and unlink files whose mtime, or whose integer suffix, is older than 7*86400 seconds. Add a unit test using an injected clock or os.utime.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "stale-tmp-sweep",
+  "title": "Stale active-sessions.json.tmp.* files are never swept on startup",
+  "status": "missing",
+  "severity": "low",
+  "plan_refs": "\u00a76.2 step 4 L733",
+  "code_refs": "BoundedSessionCache.__init__ L897-909 (sweeps only .guard_stdin.*); save L1152-1157 (a tmp file left after a write error is never removed)",
+  "required_change": "In __init__ or at startup, also unlink state_dir/'active-sessions.json.tmp.*' (and spool/*.json.tmp, plus orphan .tmp.*) when mtime is more than 60s old. In save(), unlink tmp_path in the except branch. Add a test.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "liveness-cache-0p5s",
+  "title": "No 0.5s cache for get_bartender_pid / is_herdr_alive / start-time lookups",
+  "status": "missing",
+  "severity": "medium",
+  "plan_refs": "\u00a76.1 L706; budget table L712",
+  "code_refs": "get_bartender_pid L1455-1477 (pgrep plus ps per PID, on every _raw_post_event L827); get_herdr_pid L174-210; is_process_instance_alive L157-164 (ps fork per lease check inside the Step A critical section of both cascade handlers)",
+  "required_change": "Add a module-level memo {key: (monotonic_ts, value)} with a 0.5s TTL for get_bartender_pid(), get_herdr_pid()/is_herdr_alive() and get_process_start_time(pid). Separately, get_bartender_pid passes the already-epoch string from get_process_start_time to strptime again, which always fails, so it silently falls back to the lowest PID. Compare float(st) instead. Add a test that counts subprocess.run calls.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "cascade-tombstone-only-when-leased",
+  "title": "Cascade writes the tombstone only when this process claims the lease",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "\u00a74.3 item 5 L577 (record tombstone for each matching session before the lease check); L91",
+  "code_refs": "handle_tab_closed L2753-2767 (tombstone inside 'if not is_active'); handle_workspace_closed equivalent (W31-37)",
+  "required_change": "Write data['tombstones'][pane_id] (and in tab.closed, info['closed_source_ts']) for every matching session before the lease check. Without this, a session whose lease is held by another live sender gets no tombstone, and a delayed pre-close status event can bring it back. Add a test where the lease is held by a live foreign PID and a later stale status event must be rejected.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "cascade-overflow-two-locks",
+  "title": "Overflow lease clearing uses a second lock/save cycle instead of one Step A transaction",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "\u00a74.3 item 5 L571 ('Step A acquires lock once'), L581-586; \u00a76.1 L705 (left in_flight under cache lock)",
+  "code_refs": "handle_tab_closed L2770-2785; handle_workspace_closed same",
+  "required_change": "Do the [:1]/[1:] split inside the first with-block: for overflow sessions set sending_pid, lease_token and lease_deadline to None and delivery_status='in_flight' before the single save. Then call touch_reconciler_pending() and ensure_reconciler_running() once, after the lock is released. Today a crash or deadline between the two saves leaves overflow sessions leased to a dead PID for about 2s, and overflow sessions are never marked in_flight.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "cascade-reconciler-spawn-in-lock",
+  "title": "ensure_reconciler_running() is called per session inside the Step A critical section and is not a singleton",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "\u00a76.1 L728 (critical sections CPU-bounded, under 10ms); budget table L721 (one Popen at 20ms); \u00a75.1 helper singleton",
+  "code_refs": "handle_tab_closed L2768-2770 and handle_workspace_closed W38-40 (touch_reconciler_pending plus ensure_reconciler_running inside the with-block loop); ensure_reconciler_running L1194-1205 (unconditional Popen; no-op under HERDR_BARTENDER_UNIT_TESTING)",
+  "required_change": "In Step A, collect a needs_reconciler flag and spawn once after the lock is released. Make ensure_reconciler_running check a reconciler singleton lock or PID file before Popen. Expose a test hook, such as a counter, so tests can assert that delegation happened instead of no-op'ing in tests.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "cascade-retryable-no-handoff",
+  "title": "Retryable failure of the inline cascade session does not hand off to the reconciler",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "\u00a74.3 item 4 L568 (unconditional watchdog check); \u00a75.2 L685; \u00a76.1 L704",
+  "code_refs": "handle_tab_closed L2836-2844 retryable branch; handle_workspace_closed same",
+  "required_change": "After Step C, if any session in cache is not confirmed (retryable failure, attempts < 5, or a skipped send), call touch_reconciler_pending() and ensure_reconciler_running(). Today an Ended that fails with a network error is only retried on the next unrelated event.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "cascade-container-matching",
+  "title": "Container matching is loose (suffix or substring) and falls back to the focused context",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "\u00a72.1 L152-153 (cached tab_id/workspace_id matches the closed container); \u00a711.1 L1344-1361 fixtures (tab_id 'w1:t1')",
+  "code_refs": "handle_tab_closed L2722, L2738 (tab_id.endswith(str(s_tab))); handle_workspace_closed (f':{workspace_id}:' in sid; context fallback)",
+  "required_change": "Match only on equality of canonical ids. If cached tab_ids may be unqualified, qualify both sides as f'{workspace_id}:{tab}' before comparing. Example: a cached tab 't1' in w1 matches a closed 'w2:t1'. Drop the f':{ws}:' in sid fallback, because it can match the host component of the sid. Also drop the context.tab_id/workspace_id fallback when event data lacks the id: the focused tab is not necessarily the closed one. Log and return instead.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "cascade-disabled-recheck",
+  "title": "Cascade Step A does not re-check is_disabled() under lock",
+  "status": "missing",
+  "severity": "low",
+  "plan_refs": "\u00a74.3 L392",
+  "code_refs": "handle_tab_closed L2734; handle_workspace_closed equivalent",
+  "required_change": "At the start of the with-block, if is_disabled(): return before any change or save.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "salvage-agent-exit-detection",
+  "title": "Salvage close-envelope detection misses agent exits",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "\u00a76.3 step 2 L738 (agent exit to Ended preserved); \u00a73.4 L249 (agent exit = agent_status 'idle' and agent null or empty)",
+  "code_refs": "_load L986-994; enqueue_spool L1316-1318 (same predicate)",
+  "required_change": "Herdr envelopes carry agent_status/agent and never state=='Ended', so agent-exit envelopes are quarantined as status envelopes. Add a shared is_close_envelope(env) helper that returns True for pane/tab/workspace.closed, or for pane.agent_status_changed with agent_status=='idle' and not agent (Case B). Use it in _load, enqueue_spool and spool pruning. If the envelope cannot be parsed, keep it in spool/ rather than quarantining it, since a close cannot be ruled out.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "salvage-marker-removal-scope",
+  "title": "Salvage deletes all markers wholesale instead of remove_pane_marker per candidate",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "\u00a76.3 step 4 L743",
+  "code_refs": "_load L1009-1018 (glob panes/*, skips *.failed and *.vendor_active)",
+  "required_change": "For each salvaged candidate, call remove_pane_marker(pane_id). That removes the hex marker and its .failed flag, matching the spec, while avoiding deletion of .va.tmp files and other unrelated entries. If the wholesale sweep is kept as defence-in-depth, also clear the .failed flags of salvaged panes.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "salvage-pane-gen-parse",
+  "title": "Raw pane_generations regex parse is broken for colon-bearing pane ids",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "\u00a76.3 step 4 L741",
+  "code_refs": "_load L1028-1037 (pair.split(':',1) on '\"w1:p1\": 5' yields key '\"w1' and value 'p1\": 5')",
+  "required_change": "Parse with re.findall(r'\"([^\"]+)\"\\s*:\\s*(\\d+)', group), or drop the parse entirely because salvage_epoch_gen dominates. Today it works only by accident: colon-containing ids fail isdigit and are skipped.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "test-cascade-overflow",
+  "title": "No test covers the cascade overflow clamp (more than one matching session)",
+  "status": "test-missing",
+  "severity": "high",
+  "plan_refs": "\u00a710.1 item 3 L1206; \u00a74.3 item 5 L581-586; \u00a75.2 L685",
+  "code_refs": "run_unit_tests L3147-3169 (each tab/workspace close matches exactly one session)",
+  "required_change": "Add tests with 3 sessions in one tab and 3 in one workspace. Assert: exactly 1 POST to the mock; the other 2 stay in cache with desired_state Ended, seq incremented, leases null and delivery_status in_flight; tombstones exist for all 3; the reconciler was requested (via a test hook); and the workspace cascade does not touch sessions in other workspaces with the same raw tab id. Also cover the lease held by a live foreign PID, admission predating, and generation skip.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "test-salvage-hollow",
+  "title": "Salvage test assertions are hollow: host mismatch skips them",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a76.3 L737-783; \u00a710.1",
+  "code_refs": "run_unit_tests L4536-4547 (corrupt text uses 'herdr:macbook:...', but lookup uses host_test = get_sanitized_hostname(), and the asserts sit under 'if salvaged_sess:'); L3219-3229 does not check fields",
+  "required_change": "Build the corrupt text from host_test and assert unconditionally: salvaged=True; desired/delivered_state 'Idle'; seq=delivered_seq=1; delivery_status 'salvaged'; generation >= 1_700_000_000, equal to pane_generations[pane] and <= next_generation; markers and .failed removed; agent-exit close envelope preserved; corrupt file renamed; the salvage persists after a read-only load; and corrupt files older than 7 days are pruned.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "test-watchdog-tmp-orphanlock",
+  "title": "No tests for watchdog, deferred exit, socket timeout formula, tmp sweep, orphan LOCK_NB or liveness caching",
+  "status": "test-missing",
+  "severity": "medium",
+  "plan_refs": "\u00a76.1, \u00a76.2, \u00a710.1-10.2 (clock injection)",
+  "code_refs": "run_unit_tests sets PROCESS_DEADLINE_SECONDS=60 for the whole suite (L3082-3084); 'Bounded request timeout' test L3231-3237 only checks <1.0s with timeout=0.5",
+  "required_change": "Add tests that patch START_TIME/PROCESS_DEADLINE_SECONDS to check the timeout formula at remaining 1.0/0.45/0.35/0.25s, including no POST when <=0.3. Call _timeout_watchdog directly with IN_CRITICAL_SECTION True and False. Create stale tmp files (os.utime -120s) and assert they are swept. Hold the orphan lock in a child process and assert the export returns within about 60ms and is deferred. Assert that pgrep runs at most once per 0.5s.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "test-isolation-real-home",
+  "title": "Unit suite runs against the real state dir and the real ~/.herdr-bartender-orphans.json",
+  "status": "isolation",
+  "severity": "high",
+  "plan_refs": "\u00a710.2 L1273-1280 (test harness)",
+  "code_refs": "run_unit_tests L3100-3113 (get_state_dir() without HERDR_PLUGIN_STATE_DIR override deletes the live active-sessions.json, panes and spool); export_orphan_record/remove_orphan_record default to Path.home()",
+  "required_change": "At the start of run_unit_tests, create tempfile.mkdtemp(), set HERDR_PLUGIN_STATE_DIR and HOME to it (and XDG_STATE_HOME), and restore and remove them at the end. Make the orphan path resolve through a function that reads HOME at call time. Otherwise every test listed above destroys live user state.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "plan-contradictions",
+  "title": "Plan internal inconsistencies affecting this area",
+  "status": "plan-contradiction",
+  "severity": "low",
+  "plan_refs": "L390 vs L398; L577 vs L398 vs L91; L575 vs L397; L713 vs L390; L565/608 vs L703",
+  "code_refs": "enqueue_spool L1326-1334; handle_tab_closed L2763-2767; handle_workspace_closed",
+  "required_change": "1) The envelope payload key is 'data' at L390 but 'event_data' at L398 and L738. Recommend 'event_data', which the code and tests use. 2) Tombstone last_source_timestamp is the session value at L577, the event timestamp at L398, and 'ts' at L91; the code uses max(both). Recommend max(session.last_source_timestamp, event timestamp) as the most conservative choice against stale resurrection. 3) The generation check is 'ignore older than current generation' at L575 but strict equality at L397. Recommend skipping only when session.generation > envelope generation, so a close for a newer or equal turn still applies; the code already does this. 4) The budget table gives 150ms for lock acquisition while the formula allows 200ms; update the table to 200ms (the total becomes 1235ms, still under 1.5s). 5) Orphan lock: blocking per \u00a74.3 vs LOCK_NB 50ms per \u00a76.1. Recommend \u00a76.1 for the plugin path.",
+  "area": "cascade-deadline-cache"
+ },
+ {
+  "id": "bg-deadline-clamp",
+  "title": "Background reconciler inherits the 1.4s event-process deadline, so it takes cache locks with a 20ms budget, carries on without the lock, and uses 0.1s HTTP timeouts",
+  "status": "divergent",
+  "severity": "critical",
+  "plan_refs": "L618 (exempt from 1.5s watchdog), L629-634 (long-lived loop), L683-686 (timeouts), L711-717",
+  "code_refs": "time_remaining() L105-108; BoundedSessionCache.__enter__ L911-927 ('proceeding with best effort'); _raw_post_event L831; check_bridge_health L882; run_reconcile_background L1789 (never resets START_TIME/PROCESS_DEADLINE_SECONDS); main L5207",
+  "required_change": "Add a background mode, set in main() before run_reconcile_background, --cleanup and --replay-orphans, that sets PROCESS_DEADLINE_SECONDS to infinity (or an explicit large budget) so time_remaining() no longer floors at 0.1. In background mode, BoundedSessionCache.__enter__ must wait with a bounded blocking timeout (for example 2s) and raise or skip the pass if it cannot get the lock. It must never return data unlocked. Event processes must also stop proceeding unlocked: on lock timeout they should go to the results/spool path (\u00a74.3 L483). Bridge timeouts in background should use the 0.2s per-request value. Add a test that runs the reconciler more than 1.4s after START_TIME and asserts locked saves and 0.2s timeouts.",
+  "area": "reconciler"
+ },
+ {
+  "id": "no-spawn-after-delivery",
+  "title": "Reconciler is not started when an event leaves an active non-Ended session that was delivered, so the 20s marker heartbeat never runs",
+  "status": "missing",
+  "severity": "high",
+  "plan_refs": "L617, L58, L640-641, L834, L1077",
+  "code_refs": "handle_agent_status_changed L2394-2572 (should_spawn_reconciler is set only for undelivered, superseded or compensation cases); main L5216-5236 has no post-dispatch spawn",
+  "required_change": "After Step C, if the cache still holds any non-Ended session (Working, Waiting, Idle or Done), call touch_reconciler_pending() and ensure_reconciler_running(). The singleton lock makes extra spawns harmless. Do the same at the end of the close handlers when sessions remain. Add a test that a delivered Working event starts a reconciler (mock Popen) and that the marker stays fresher than 60s across a simulated 90s pause.",
+  "area": "reconciler"
+ },
+ {
+  "id": "premature-idle-exit",
+  "title": "Reconciler exits immediately when no delivered sessions exist, not after 60 idle seconds with zero sessions and a healthy bridge, and it ignores pending work",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "L669-670, L651-655, L661",
+  "code_refs": "run_reconcile_background L1924-1930; active_count L1851-1857 counts only delivered non-salvaged sessions",
+  "required_change": "Track idle_since. Exit only when sessions, results/, spool/, pending_compensations, pending_vendor_cleanups and dismissed_vendor_uuids are all empty, DELIVERY_DOWN is absent and the last health probe succeeded, continuously for at least 60s. Undelivered in_flight sessions, non_retryable_failed sessions and salvaged sessions awaiting their 300s TTL must keep the loop alive. Make the sleep deadline min(20 or 300, next retry due, next dismissal due, next salvage expiry). Remove the redundant loop_once check at L1929.",
+  "area": "reconciler"
+ },
+ {
+  "id": "herdr-dead-5m-missing",
+  "title": "Expiry of all sessions when Herdr has been dead for more than 5 minutes is not implemented",
+  "status": "missing",
+  "severity": "high",
+  "plan_refs": "L666, L110, L235",
+  "code_refs": "reconcile_active_sessions L1618-1647 (no Herdr-dead timer); no herdr_dead_since field anywhere",
+  "required_change": "Persist herdr_dead_since in the cache, set when get_herdr_pid() is None and cleared otherwise. When now - herdr_dead_since > 300, move every non-Ended session (salvaged ones included, with salvaged=False) to desired_state='Ended', seq+1, desired_payload Ended, delivery_status='in_flight', delivery_attempts=0. Run pgrep outside the cache lock. Make is_herdr_alive injectable so this can be tested; today unit-test mode forces it to True.",
+  "area": "reconciler"
+ },
+ {
+  "id": "herdr-restart-stale-payload",
+  "title": "Herdr restart mass expiry sets desired_state='Ended' but leaves desired_payload unchanged, so the old Working, Waiting or Idle state is sent and the session is then evicted as if Ended",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "L668, L235",
+  "code_refs": "reconcile_active_sessions L1608-1616; L1663 payload = s.get('desired_payload'); L1720-1725 eviction on success",
+  "required_change": "In the Herdr-restart branch, set desired_payload={'state':'Ended','agent':..,'session_id':sid,'seq':new_seq}, delivery_status='in_flight', delivery_attempts=0, salvaged=False. Better still, build the transmit payload from desired_state. Add a test asserting that the mock bridge received state=='Ended' after a simulated Herdr PID change.",
+  "area": "reconciler"
+ },
+ {
+  "id": "start-time-fallback-false-restart",
+  "title": "get_process_start_time falls back to this process's own load time when ps fails, so one transient ps failure looks like a Bartender or Herdr restart and can mass-expire every session",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "L667-668",
+  "code_refs": "get_process_start_time L60-77; is_process_instance_alive L157-164; reconcile_active_sessions L1580-1616",
+  "required_change": "Return None when ps fails. Treat an unknown start time as no information: no restart and no lease-holder rejection. Compare only when both values are known. Run ps with LC_ALL=C and store epoch integers.",
+  "area": "reconciler"
+ },
+ {
+  "id": "bartender-earliest-start-broken",
+  "title": "get_bartender_pid picks the lowest PID, not the earliest start time, because it re-parses an already-converted epoch string",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "L667",
+  "code_refs": "get_bartender_pid L1455-1477 (strptime on an epoch string always raises, so epoch_ts = float(pid))",
+  "required_change": "Use float(get_process_start_time(p)) directly, and factor a shared earliest-start helper out of get_herdr_pid and get_bartender_pid. Add a unit test with monkeypatched subprocess.run where a higher PID has the earlier start time.",
+  "area": "reconciler"
+ },
+ {
+  "id": "retry-schedule-missing",
+  "title": "Fast retry schedule (0s, 1s, 2s, 4s, 8s, lease released during sleeps) is not implemented: the reconciler retries once per 20s pass and the event path re-POSTs immediately in its drain loop",
+  "status": "missing",
+  "severity": "high",
+  "plan_refs": "L673-677, L67, L233-234, L471",
+  "code_refs": "reconcile_active_sessions L1758-1769; run_reconcile_background L1952; handle_agent_status_changed L2499-2504",
+  "required_change": "On retryable failure, persist next_retry_at = now + [0,1,2,4,8][attempts] and release the lease. The sweep should skip sessions not yet due, and the sleep deadline must be min(interval, earliest next_retry_at). After 5 failures: set retryable_exhausted, remove the marker, touch .failed, and for Ended export the orphan. Cap event-path Step B at 1 POST plus 1 minimal Ended retry. Add injected-clock tests that check the retry timestamps.",
+  "area": "reconciler"
+ },
+ {
+  "id": "lock-discipline-subprocess",
+  "title": "Subprocesses and orphan-file I/O run while the cache lock is held, which breaks the <10ms lock guarantee",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "L679, L712, L717",
+  "code_refs": "reconcile_active_sessions L1535-1542, L1575-1616, L1626, L1638-1640; run_reconcile_background L1851-1857",
+  "required_change": "Before taking the cache lock, compute one process snapshot per pass: bartender and herdr PIDs and start times, herdr_alive, and liveness of the previous PIDs. Use the snapshot inside the lock. Stage orphan exports and marker touches until after the lock is released.",
+  "area": "reconciler"
+ },
+ {
+  "id": "delivery-down-resync-missing",
+  "title": "Bridge reconnection after DELIVERY_DOWN does not trigger a Full Top Shelf Re-Sync",
+  "status": "missing",
+  "severity": "medium",
+  "plan_refs": "L679-681 (\u00a75.1 item 4)",
+  "code_refs": "run_reconcile_background L1838-1849 (re-arms only retryable_exhausted sessions)",
+  "required_change": "When the health probe succeeds while DELIVERY_DOWN was set, set delivered_seq=0 and delivery_status='in_flight' for all non-Ended, non-salvaged sessions, then reconcile. Add a test covering this.",
+  "area": "reconciler"
+ },
+ {
+  "id": "dismissal-cadence",
+  "title": "dismissed_vendor_uuids 2s retries cannot happen because the loop sleeps 20s and nothing wakes it; a confirmed 200 is ignored and the 64 cap is applied only on load",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "L651-655, L43, L56, L1268",
+  "code_refs": "cleanup_vendor_active L766-778; reconcile_active_sessions L1526-1569; _load L960-965; run_reconcile_background L1952-1959",
+  "required_change": "In cleanup_vendor_active, write attempts=1 and last_attempt=now, enforce the 64 cap at insert time or in save(), and touch reconciler.pending. In the reconciler, set the sleep deadline to the earliest last_attempt+2.0 and purge on success=True. Extend test 65 to use the real loop timing, and add a cancellation test for Herdr dead.",
+  "area": "reconciler"
+ },
+ {
+  "id": "compensation-drain-loses-side-effects",
+  "title": "Compensation drain deletes each record before sending and ignores the result; the vendor-cleanup drain has no re-verification and deletes regardless of outcome",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "L650 (5a)",
+  "code_refs": "reconcile_active_sessions L1484-1525; cleanup_vendor_active L751-791",
+  "required_change": "Remove each record only after a confirmed success or a non-retryable result. Otherwise keep it with an attempts counter and give up after a bounded count by exporting to orphans. Make cleanup_vendor_active return its success. Add tests with a mock bridge returning 500.",
+  "area": "reconciler"
+ },
+ {
+  "id": "hard-horizon-unreachable",
+  "title": "Eviction for 'undelivered for >12h past TTL' uses a fixed 36h, requires retryable_exhausted, is never reached once the stale session becomes Ended, and the skip path sets orphaned_ended without exporting",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "L680, L110, L230-235",
+  "code_refs": "reconcile_active_sessions L1621-1650, L1656-1658",
+  "required_change": "Persist ttl_expired_at when the TTL fires. Evict and export, outside the lock, when now - ttl_expired_at > 43200 and the session is still undelivered, whatever its status. Export orphaned_ended records in the attempts>=5 skip path.",
+  "area": "reconciler"
+ },
+ {
+  "id": "vendor-active-12h-horizon-missing",
+  "title": "No cleanup of UUID-bearing .vendor_active files older than 12 hours",
+  "status": "missing",
+  "severity": "medium",
+  "plan_refs": "L657",
+  "code_refs": "run_reconcile_background L1859-1866 (only .guard_stdin.* is swept)",
+  "required_change": "Each pass, dismiss or unlink UUID-bearing panes/*.vendor_active files with mtime older than 43200s. Never sweep bare markers on mtime and never sweep while Herdr is dead. Add a test using os.utime.",
+  "area": "reconciler"
+ },
+ {
+  "id": "hook-integrity-allowlist-bypass",
+  "title": "Hook integrity check re-patches automatically when the hook has no SHA entry or no allowlist file exists",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "L669 (item 10)",
+  "code_refs": "run_reconcile_background L1869-1915 (can_autopatch stays True when known_shas is empty or lacks the hook)",
+  "required_change": "Re-patch only when known_shas.get(name) == clean_sha. Anything else goes to HOOK_NEEDS_REVIEW: touch the flag and .hook_review_alerted, run osascript once, and log_debug a warning. Add tests for the reconciler path with osascript mocked.",
+  "area": "reconciler"
+ },
+ {
+  "id": "results-drain-divergent",
+  "title": "Results drain uses an equality seq check, skips orphan removal, vendor cleanup and the tombstone on Ended, maps non-retryable to retryable_exhausted, and write_result_envelope is never called",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "L622 (1a), L483",
+  "code_refs": "drain_results_dir L1369-1409; write_result_envelope L1348 (no call sites); BoundedSessionCache.__enter__ L924",
+  "required_change": "Write result envelopes in the plan's schema when Step C cannot get the lock. Apply them when transmitting_seq >= delivered_seq. Mirror the Step C success and failure branches: orphan removal, vendor cleanup, tombstone, non_retryable_failed, attempts++. Add drain tests.",
+  "area": "reconciler"
+ },
+ {
+  "id": "cleanup-not-universal-sender",
+  "title": "--cleanup and the opportunistic sweep do not use Step A/B/C: run_cleanup has no lease or token verification, and retry_undelivered_sessions has no callers",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "L615-616",
+  "code_refs": "run_cleanup L1972-2025; retry_undelivered_sessions L1968",
+  "required_change": "Route run_cleanup through a shared lease-claim, send and verify helper, and set desired_payload to Ended. Export orphans outside the lock. Either wire the opportunistic sweep into the event path or drop it from the plan.",
+  "area": "reconciler"
+ },
+ {
+  "id": "orphan-replay-lock-and-skip",
+  "title": "Orphan replay holds the blocking orphan lock across network POSTs, so event-path exports block past the watchdog, and records skipped by the guard are deleted from the file",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "L645-647, L679",
+  "code_refs": "run_replay_orphans L2028-2142; export_orphan_record L1215-1223",
+  "required_change": "Snapshot, release the lock, send, re-lock, and remove only delivered SIDs, merging concurrent additions. Use a non-blocking bounded lock in event-path exports. Keep skipped records, and evict Ended cache sessions whose orphan was delivered.",
+  "area": "reconciler"
+ },
+ {
+  "id": "terminal-horizon-no-evict",
+  "title": "Terminal absence horizon exports sessions but does not evict them from active-sessions.json",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "L667-668, L680",
+  "code_refs": "run_reconcile_background L1939-1950",
+  "required_change": "After export, re-lock, pop the exported SIDs and their markers, save, then log and exit.",
+  "area": "reconciler"
+ },
+ {
+  "id": "reconciler-lease-batch-claim",
+  "title": "Reconciler claims all leases at once with a 1.5s deadline and lacks the +0.5s hung-holder grace",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "L616, L67, \u00a74.3",
+  "code_refs": "reconcile_active_sessions L1660-1679 vs handle_agent_status_changed L2361-2377",
+  "required_change": "Claim, send and verify one session at a time through a claim_lease() helper shared with the event path.",
+  "area": "reconciler"
+ },
+ {
+  "id": "plan-contradictions",
+  "title": "Plan contradictions in \u00a75.1",
+  "status": "plan-contradiction",
+  "severity": "low",
+  "plan_refs": "L652 vs L653 (3 vs 5 attempts); L43/L56 (t=0..10 means 6 sends but 'up to 5'); items jump from 5b to 7; L230-234 vs L235/L680 (eviction criteria); L58/L834 vs L667 (heartbeat vs 300s backoff); L667-668 vs the code's debounce",
+  "code_refs": "n/a (plan document)",
+  "required_change": "Recommended readings: 5 attempts at t=0,2,4,6,8, purging at \u226510s or on 200, with the 3-attempt bullet deleted; renumber the items; evict on >12h past TTL or the terminal horizon or the 256 cap; keep the 20s heartbeat during the Bartender-absent backoff; write the confirm-old-dead restart debounce into the plan.",
+  "area": "reconciler"
+ },
+ {
+  "id": "tests-weak-reconciler",
+  "title": "Reconciler tests are hollow or missing for the restart, horizon, rotation, idle-exit, latency, Herdr-dead and hook re-patch paths; the suite writes to the real $HOME",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1, \u00a710.2 L1273-1280",
+  "code_refs": "Test 21 (about L3482-3504) passes vacuously; no tests reference last_herdr_pid, 43200, bartender_absent, plugin.log.1, drain_results_dir or osascript; is_herdr_alive L213-216 is forced True; run_unit_tests L3080+ never sets HOME or HERDR_PLUGIN_STATE_DIR",
+  "required_change": "Isolate HOME and HERDR_PLUGIN_STATE_DIR in temporary directories, and add injectable process-probe seams. Add tests for: Bartender re-sync seen as a re-POST in mock history; Herdr restart sending Ended; Herdr dead >5m; backoff and terminal horizon with an injected clock; log rotation; idle exit; wake latency under 1s; the hook re-patch and review path; the results drain; and dismissal cancellation when Herdr is dead.",
+  "area": "reconciler"
+ },
+ {
+  "id": "stat-order-aborts-guard",
+  "title": "stat -f %m tried first: on GNU stat it prints filesystem info, so the arithmetic fails and the vendor hook aborts with exit 1",
+  "status": "portability",
+  "severity": "high",
+  "plan_refs": "plan L943 (block: stat -f %m || stat -c %Y || echo 0); \u00a77.1 L799 condition 5; fail-open intent L807",
+  "code_refs": "bin/herdr-bartender L353-354 HOOK_GUARD_TEMPLATE",
+  "required_change": "With GNU coreutils stat (Linux, or macOS with Homebrew gnubin on PATH), `stat -f %m FILE` prints filesystem info to stdout and exits 1. The `||` chain then appends the output of `stat -c %Y`, so _HB_MARKER_MTIME becomes multi-line text that starts with 'File: ...'. The expression `$((_HB_NOW_TIME - _HB_MARKER_MTIME))` then fails under set -u. Reproduced in a sandbox: 'line 130: File: unbound variable', rc=1, and the vendor script never ran. So every hook call with a pane marker present kills the native vendor hook, which breaks fail-open. Fix (and update the plan block to match): run `stat -c %Y` first, because BSD stat fails cleanly with no stdout; fall back to `stat -f %m`; then check the value is numeric, e.g. `case $_HB_MARKER_MTIME in ''|*[!0-9]*) _HB_MARKER_MTIME=0;; esac`. Add a test that runs the guard against a fresh marker and asserts rc==0 on both platforms.",
+  "area": "hook-guard-installer"
+ },
+ {
+  "id": "reconciler-allowlist-fails-open",
+  "title": "Reconciler SHA allowlist fails open, and auto-repair calls the approving install_hooks()",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "\u00a77.3 L1064; \u00a75.1 item 10 L657; \u00a71 L131",
+  "code_refs": "bin/herdr-bartender L1876-1921 (reconciler hook integrity block), L520-642 install_hooks",
+  "required_change": "can_autopatch only becomes False when `known_shas and m_name in known_shas and mismatch`. A missing or corrupt vendor-hook-sha.json, or a hook with no recorded SHA, is therefore auto-patched blindly. The plan says an unknown modification must block patching. Fail closed instead: no entry means HOOK_NEEDS_REVIEW. Also, the reconciler calls install_hooks(), which is the explicit-approval path. It rewrites the SHAs of all hooks (silently approving upstream changes to hooks whose guard is still present) and unlinks HOOK_NEEDS_REVIEW and .hook_review_alerted. Split this into a non-approving `repair_hooks(names)` that only re-inserts the guard into hooks whose clean SHA matches, never updates vendor-hook-sha.json, and never clears review flags. install_hooks(approve=True) stays the CLI path. Add a log_warning on mismatch (the plan asks for a warning to be logged; the code only calls log_debug).",
+  "area": "hook-guard-installer"
+ },
+ {
+  "id": "no-hooks-sticky-missing",
+  "title": "--uninstall-hooks never creates NO_HOOKS; install_hooks creates it and can leave it behind",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "\u00a77.3 L1076 (Sticky Uninstall Intent), L1064",
+  "code_refs": "bin/herdr-bartender L527-532 (install_hooks touches NO_HOOKS), L534-537 early return, L645-699 uninstall_hooks (no NO_HOOKS)",
+  "required_change": "Move the NO_HOOKS touch from install_hooks into uninstall_hooks. Create the file unconditionally, before the hooks-dir and hook-file existence checks, so the intent is recorded even when the vendor dir is absent. In install_hooks, remove the touch. As written, when no hook files exist, install returns False at L536 after touching NO_HOOKS and before the unlink at L551, which permanently disables auto-repair. Unlink NO_HOOKS whenever an explicit install proceeds.",
+  "area": "hook-guard-installer"
+ },
+ {
+  "id": "install-flag-unlink-order",
+  "title": "install_hooks clears HOOK_NEEDS_REVIEW and .hook_review_alerted only after the dir and file checks pass",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "\u00a77.3 L1064; test 68 L1271",
+  "code_refs": "bin/herdr-bartender L522-525, L534-537, L550-556; test 68 L5063-5078",
+  "required_change": "When the vendor hooks dir is missing (any Linux host, or macOS without Bartender), install_hooks returns before unlinking the flags, so unit test 68 fails there. Decide the semantics and implement one: (a) unlink NO_HOOKS at the start of an explicit install, and unlink HOOK_NEEDS_REVIEW and .hook_review_alerted only after every present hook is verified or patched (all_ok); or (b) unlink all three up front. Recommend (a), so a failed install does not hide the review warning. Make test 68 run against an isolated, temporary vendor hooks dir (see vendor-hooks-dir-not-overridable).",
+  "area": "hook-guard-installer"
+ },
+ {
+  "id": "strip-not-inverse-of-insert",
+  "title": "Insert adds '\\n' around the guard but strip removes only the markers, so the round trip is not byte-exact",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "\u00a77.3 L1062 (clean SHA), L1065 (.pristine), L1072 (strip cleanly); \u00a79.1 L1146-1147 (different strip algorithm)",
+  "code_refs": "bin/herdr-bartender L564-566, L588-591, L607 (f\"\\n{HOOK_GUARD_TEMPLATE}\\n\"), L665 uninstall strip, L1897-1898 reconciler strip",
+  "required_change": "Verified: patching '#!/bin/bash\\nset -u\\necho hi\\n' and then stripping gives '...set -u\\n\\n\\necho hi\\n', with 2 extra newlines. Consequences: (1) uninstall does not restore the original bytes; (2) a second --install-hooks stores the SHA of the stripped content, not the pristine one, so a later vendor revert to the original script triggers a false HOOK_NEEDS_REVIEW; (3) .pristine is overwritten with the drifted content on every reinstall (L582-584). Write a single pair of helpers, insert_guard() and strip_guard(), shared by install, uninstall and the reconciler, with strip_guard(insert_guard(x)) == x. For example, insert the exact text TEMPLATE+'\\n' and strip with the regex `(?s)\\n?# BEGIN ...?# END HERDR-BARTENDER DEDUP GUARD\\n` that matches what was inserted. Read and write in binary mode (or newline='') so CRLF and non-UTF-8 bytes are preserved, and hash the bytes. Align the \u00a79.1 inline python strip with the same algorithm. Add a round-trip test.",
+  "area": "hook-guard-installer"
+ },
+ {
+  "id": "marker-count-validation",
+  "title": "No check for exactly one BEGIN and one END marker; split()[1] can drop content or duplicate the guard",
+  "status": "missing",
+  "severity": "medium",
+  "plan_refs": "\u00a79.1 L1139-1162 (BEGIN_COUNT==1 && END_COUNT==1, otherwise mismatched-marker warning); \u00a77.3 L1062, L1071",
+  "code_refs": "bin/herdr-bartender L512-513 verify_vendor_hooks_intact, L564-566, L588-591, L663-665, L1897-1898",
+  "required_change": "If a hook contains two guard blocks, content.split(END)[1] keeps only the text between the first and second END and silently drops the rest of the vendor script. If it contains BEGIN without END, verify_vendor_hooks_intact reports it missing, and the install else-branch inserts a second guard, so the file then has 2 BEGINs. Require count(BEGIN)==1, count(END)==1 and BEGIN before END. Otherwise, in install, uninstall and the reconciler, abort without touching the file, log the problem and (in the reconciler) touch HOOK_NEEDS_REVIEW. Add tests for both cases.",
+  "area": "hook-guard-installer"
+ },
+ {
+  "id": "vendor-hooks-dir-not-overridable",
+  "title": "get_vendor_hooks_dir is hard-coded to the real $HOME, so unit tests patch the user's real vendor hooks",
+  "status": "isolation",
+  "severity": "high",
+  "plan_refs": "\u00a79.1 L1136-1137 (path); \u00a710.2 test harness isolation",
+  "code_refs": "bin/herdr-bartender L496-497; test 68 L5075 calls install_hooks()",
+  "required_change": "The path matches \u00a79.1 ($HOME/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks), but there is no override. Test 68 calls the real install_hooks(), which on a macOS dev machine with Bartender rewrites the real claude-event-hook.sh and codex-notify-hook.sh. Add an env override, e.g. HERDR_BARTENDER_VENDOR_HOOKS_DIR, with the \u00a79.1 path as default. Have run_unit_tests() point it, together with HERDR_PLUGIN_STATE_DIR and HOME, at a tempfile.mkdtemp() sandbox, and seed fake vendor hooks there.",
+  "area": "hook-guard-installer"
+ },
+ {
+  "id": "herdr-liveness-pgrep-f",
+  "title": "The guard's Herdr liveness check uses pgrep -f \"Herdr.app\", which differs from the plan prose and from the Python check",
+  "status": "plan-contradiction",
+  "severity": "medium",
+  "plan_refs": "\u00a77.1 L800 (condition 7: pgrep -xi \"herdr\") vs block L945 (pgrep -f \"Herdr.app\" || pgrep -xi \"herdr\")",
+  "code_refs": "bin/herdr-bartender L354 (guard), L176 (Python is_herdr_alive uses only pgrep -xi herdr)",
+  "required_change": "`pgrep -f Herdr.app` matches any process whose command line contains 'Herdr.app' (an editor, `tail` of a log under the bundle, `open -a Herdr.app`). That can report Herdr healthy when it is not, and suppress vendor notifications. The plan contradicts itself here. Recommendation: use the prose reading (`pgrep -xi herdr`), optionally adding a tighter `pgrep -f '/Herdr.app/Contents/MacOS/'` match, and make the Python is_herdr_alive check the same thing so the reconciler heartbeat and the guard agree. Update the plan block to match.",
+  "area": "hook-guard-installer"
+ },
+ {
+  "id": "guard-tests-host-dependent",
+  "title": "Guard suppression tests depend on a real herdr process and on BSD stat",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 tests 23, 33, 52, 55, 61, 67 (L1226-1271); \u00a710.2 L1273-1280",
+  "code_refs": "bin/herdr-bartender test 23 Step D L3590-3626, and the similar healthy-path tests at ~L3885-3918, L4596-4668, L5036-5061",
+  "required_change": "The healthy-path assertions (returncode==0 and PASSTHROUGH absent) need `pgrep -xi herdr` to find a live process, and on Linux they hit the stat abort described in stat-order-aborts-guard. They fail on Linux and on any Mac where Herdr is not running. In the harness, spawn a stub process named `herdr` (e.g. copy /bin/sleep to tmp/herdr and run it), or prepend PATH with a stub `pgrep` script, so Herdr liveness is deterministic. Kill the stub in teardown.",
+  "area": "hook-guard-installer"
+ },
+ {
+  "id": "hollow-install-tests",
+  "title": "Tests 22 and 41 are vacuous, and no installer, uninstaller or allowlist behavior is tested",
+  "status": "test-missing",
+  "severity": "high",
+  "plan_refs": "\u00a710.1 test 22 L1225, test 41 L1244, test 68 L1271; \u00a77.3 L1059-1079",
+  "code_refs": "bin/herdr-bartender L3505-3518 (test 22), L4285-4302 (test 41)",
+  "required_change": "Test 22 never calls install_hooks(). It hand-writes a file with mode 0755, which is already executable, so `orig_mode|0o100` is never exercised. Test 41 replaces 'mktemp \"$STATE_HOME/.guard_stdin.XXXXXX\"', but the template uses $_HB_STATE_HOME, so the replace does nothing. It also sets HERDR_PANE_ID=pFailOpen with no workspace, so the guard is skipped entirely; fix both. Add tests in a sandboxed vendor dir for: install on a 0o644 hook gives 0o744; .pristine is created with target_mode; vendor-hook-sha.json equals sha256 of the clean content; a file with no anchor is aborted and left unchanged; a bash -n failure leaves the file unchanged and no tmp file remains; a concurrent modification (monkeypatch between prepare and replace) aborts; uninstall restores the exact bytes and orig_mode and creates NO_HOOKS; the reconciler skips repair while NO_HOOKS exists; the reconciler with a SHA mismatch or unknown hook creates HOOK_NEEDS_REVIEW and .hook_review_alerted and runs osascript once (stub it via PATH), and does not patch; the reconciler with a matching SHA re-patches without clearing flags or rewriting the SHA; --status prints the exact warning string.",
+  "area": "hook-guard-installer"
+ },
+ {
+  "id": "pristine-backup-gaps",
+  "title": ".pristine is not created when the guard is already present, and an updated .pristine does not get target_mode",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "\u00a77.3 L1065",
+  "code_refs": "bin/herdr-bartender L573-586",
+  "required_change": "Write .pristine from clean_content (not content) whenever it is absent, whether or not the guard is present. When it is rewritten because upstream content changed, also apply os.chmod(bak_path, target_mode). Write it atomically (tmp + os.replace) under umask 077 or with an explicit mode.",
+  "area": "hook-guard-installer"
+ },
+ {
+  "id": "install-tmp-and-sha-file-hygiene",
+  "title": "tmp.<pid> can leak on exception; vendor-hook-sha.json is written non-atomically with umask permissions",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "\u00a77.3 L1067; \u00a78 L1091 (state files 0600)",
+  "code_refs": "bin/herdr-bartender L612-638, L639-643, L667-685",
+  "required_change": "Wrap the tmp lifecycle in try/finally so that tmp_path is unlinked on any exception (chmod or subprocess errors). Write vendor-hook-sha.json through tmp + os.replace with mode 0600. Only update the SHA entry for a hook that was patched or verified successfully; right now a hook whose patch was aborted (no anchor, bash -n failure, concurrent modification) still has its SHA recorded as approved.",
+  "area": "hook-guard-installer"
+ },
+ {
+  "id": "anchor-detection-narrow",
+  "title": "The anchor search only recognizes an exact 'set -u' line, and accepts '#!' anywhere",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "\u00a77.2 L840; \u00a77.3 L1066",
+  "code_refs": "bin/herdr-bartender L594-605",
+  "required_change": "Hooks that use `set -eu` or `set -euo pipefail` fall back to the shebang anchor. That is acceptable, but the matcher should recognize `set` lines that enable -u, or document the fallback. Accept a shebang only on line 0. Consider checking that the shebang interpreter is bash or sh, because validation runs `bash -n` regardless of the hook's interpreter.",
+  "area": "hook-guard-installer"
+ },
+ {
+  "id": "uninstall-skip-not-logged",
+  "title": "Uninstall skips hooks without the guard silently, and returns early without recording intent",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "\u00a77.3 L1071 ('if absent, logs and skips safely')",
+  "code_refs": "bin/herdr-bartender L647-653, L662-663",
+  "required_change": "Print or log '[=] No dedup guard in <hook>; skipping' when the guard is absent. On the early returns (missing dir, no hook files), still create NO_HOOKS (see no-hooks-sticky-missing). Also reconsider deleting vendor-hook-sha.json and .pristine on uninstall: the plan does not ask for it, and keeping them lets a later --install-hooks detect upstream drift.",
+  "area": "hook-guard-installer"
+ },
+ {
+  "id": "vendor-active-perms",
+  "title": "The guard creates .vendor_active and the splice FIFO under the user's umask, not 077",
+  "status": "plan-contradiction",
+  "severity": "low",
+  "plan_refs": "\u00a78 L1091 (files 0600 under umask 077) vs block L1002, L1029-1040 (touch/printf after the umask is restored at L879)",
+  "code_refs": "bin/herdr-bartender L276-277 (umask restored), L363-373, L408-420 (touch / printf > .vendor_active)",
+  "required_change": "Files made by mktemp (.va.tmp) are 0600, but the bare `touch \"$_HB_VENDOR_ACTIVE\"` and the fallback `printf > $_HB_VENDOR_ACTIVE` create 0644 files under umask 022. Recommend following \u00a78: keep umask 077 for the guard's writes (restore it just before the block ends), and fix the plan block the same way.",
+  "area": "hook-guard-installer"
+ },
+ {
+  "id": "plan-prose-vs-block-minor",
+  "title": "Minor contradictions between \u00a77.1 prose and the \u00a77.2 block",
+  "status": "plan-contradiction",
+  "severity": "low",
+  "plan_refs": "\u00a77.1 L806 (/usr/bin/perl absolute) vs L881 (command -v perl); \u00a77.1 L823-825, L795 item 3 (non-terminal bare touch is unlinked under healthy Herdr) vs block L956-966 (bare touch is upgraded to a UUID record first when a session_id is present, then suppressed without unlinking); \u00a71 L131 (uninstall uses orig_mode|0o100) vs \u00a77.3 L1070, L1074 (uninstall preserves orig_mode exactly)",
+  "code_refs": "bin/herdr-bartender L280, L361-373, L676",
+  "required_change": "The code follows the block in each case, which is acceptable. Recommend updating the prose: keep `command -v perl` (more portable); document the bare-to-UUID upgrade, since keeping the UUID is needed later for the Ended dismissal; and make L131 say uninstall preserves orig_mode exactly, as the code does.",
+  "area": "hook-guard-installer"
+ },
+ {
+  "id": "event-input-contract",
+  "title": "Plugin event dispatch reads env vars instead of stdin JSON envelope + argv event name",
+  "status": "divergent",
+  "severity": "critical",
+  "plan_refs": "plan L243 (\u00a73.4 Plugin Executable Invocation: './bin/herdr-bartender <event_name>' with full JSON envelope on stdin; stdin primary, argv ${1:-} fallback); fixture \u00a711.1 L1284+",
+  "code_refs": "bin/herdr-bartender main() L5196-5236 reads HERDR_PLUGIN_EVENT / HERDR_PLUGIN_EVENT_JSON / HERDR_PLUGIN_CONTEXT_JSON; no sys.stdin read anywhere outside the bash guard template",
+  "required_change": "In main(), after the flag checks: read sys.stdin (bounded, non-blocking when it is a TTY) and parse the envelope {event,data,context}. Get event_name from envelope['event'], then argv[1] if it is not a flag, then the env var as a last legacy fallback. Take context from envelope['context']. If stdin is empty or malformed and argv[1] names an event, do a safe no-op or ensure_reconciler_running(). Add unit tests that run the script as a subprocess with the \u00a711.1 fixtures on stdin.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "redirect-followed",
+  "title": "3xx responses are followed by urllib (POST->GET), so they read as success and may leave loopback",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "plan L231 (3xx => non_retryable_failed, delivery_error='unexpected_redirect'); L1087 literal loopback, no hostname resolution",
+  "code_refs": "_raw_post_event L821-861 and check_bridge_health L879-891 use bare urllib.request.urlopen; the default HTTPRedirectHandler follows 301/302/303 (verified: POST 302 -> GET /other -> 200 {ok:true} => (True, False)). Only 307/308 reach the HTTPError branch.",
+  "required_change": "Build a module-level opener with a no-redirect handler (subclass HTTPRedirectHandler with redirect_request returning None, or raise) plus ProxyHandler({}). Route all bridge I/O through it, so any 3xx comes back as HTTPError/resp.status 3xx and is classified non-retryable 'unexpected_redirect'. Add a mock-server test that returns 302 and asserts non_retryable_failed and no follow-up GET.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "proxy-leak",
+  "title": "Bridge requests honor HTTP_PROXY, so loopback payloads can be sent to a proxy",
+  "status": "missing",
+  "severity": "high",
+  "plan_refs": "plan L1087 (all connections strictly target literal 127.0.0.1), L1085 (prevent transmission of agent metadata to unrelated listeners)",
+  "code_refs": "_raw_post_event L846, check_bridge_health L884 use urllib.request.urlopen; verified getproxies() picks up HTTP_PROXY and proxy_bypass('127.0.0.1') is False when NO_PROXY is unset",
+  "required_change": "Use urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect()) or http.client.HTTPConnection('127.0.0.1', port) directly for every bridge request. Add a test with HTTP_PROXY set to a dead address that asserts delivery still reaches the mock.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "error-classification",
+  "title": "Classification collapses to (success, non_retryable); the plan's delivery_error codes are not produced",
+  "status": "partial",
+  "severity": "high",
+  "plan_refs": "plan L229-234: delivery_error = bridge_rejected | unexpected_redirect | 4xx_client_error | 5xx_server_error | network_timeout",
+  "code_refs": "_raw_post_event returns tuple[bool,bool]; every caller writes 'bridge_rejected' for all non-retryable failures (L1755, 2485, 2693, 2842, 2987) and 'retryable network error' for all retryable ones (L1762, 2492, 2700, 2849, 2994)",
+  "required_change": "Return a classification (for example a small enum or string: ok, bridge_rejected, unexpected_redirect, 4xx_client_error, 5xx_server_error, network_timeout) from _raw_post_event/post_bartender_event. Write it to s['delivery_error'] in all 5 result-handling sites, ideally through one shared apply_delivery_result(data, s, ...) helper to remove the five duplicated blocks. Also decide on 200 with non-JSON body (now success at L852-853): recommend treating it as a retryable protocol anomaly rather than success. Add tests per row.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "retry-schedule",
+  "title": "Retry schedule 0,1,2,4,8 with lease release/re-claim is not implemented; reconciler can exit with retries pending",
+  "status": "missing",
+  "severity": "high",
+  "plan_refs": "plan L233-234 (background helper retries up to 5 attempts at 0s,1s,2s,4s,8s; releases lease before each sleep, re-claims under lock)",
+  "code_refs": "run_reconcile_background L1789-1966: no backoff, fixed 20s/300s sleep. Exit condition L1925 counts only delivered sessions (active_count) and exhausted ones, so a session that is in_flight with delivery_attempts 1-4 and consecutive_failures<3 breaks the loop after one pass and is not retried until the next Herdr event.",
+  "required_change": "Store next_retry_at per session (attempt n -> delay [0,1,2,4,8][n]) and have reconcile_active_sessions skip sessions not yet due. Count undelivered in_flight sessions as pending work in the loop exit condition and sleep until the earliest next_retry_at (capped). Release the lease (sending_pid/lease_token/lease_deadline=None) before sleeping and re-claim under lock. Add a test that injects a clock and asserts 5 attempts at the scheduled offsets, then retryable_exhausted.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "close-handlers-consecutive",
+  "title": "pane/tab/workspace close paths never increment consecutive_failures or touch DELIVERY_DOWN",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "plan L233-234 (consecutive_failures += 1; if >= 3 touch DELIVERY_DOWN) for every 5xx/network result",
+  "code_refs": "handle_pane_closed L2698-2706, handle_tab_closed L2847-2855, handle_workspace_closed L2992-3000 (only reconcile L1764-1766 and handle_agent_status_changed L2494-2496 do it)",
+  "required_change": "Apply the same retryable-failure block in all close handlers, preferably via the shared helper from error-classification. Add a test: 3 consecutive 500s across close events create DELIVERY_DOWN, and a 200 clears it.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "minimal-retry-noop",
+  "title": "The minimal-payload Ended retry never fires for cleanup, replay or compensation, and uses the wrong agent",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "plan L118, L230-232 (retry once with {\"state\":\"Ended\",\"agent\":\"Herdr\",\"session_id\":sid}); L1194 \u00a79.2 step 5 (replay retries with minimal payload)",
+  "code_refs": "post_bartender_event L864-876 builds min_payload with agent=payload.get('agent') and retries only when min_payload != payload. run_cleanup L2001, run_replay_orphans L2089, and compensations already send {state,agent,session_id}, so the retry is skipped. The agent should be the literal 'Herdr'.",
+  "required_change": "Set min_payload['agent'] = 'Herdr' literally and retry whenever the first attempt failed and min_payload differs, which now covers the 3-key payloads with a vendor-formatted agent. Recommended reading of the plan contradiction: \u00a73.3 lists the minimal retry only for non-retryable rows, while L118 and \u00a79.2 say any failure. Retry on all Ended failures, but only when time_remaining() can fit a second timeout. Add a test where the mock rejects agent!='Herdr'.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "port-validation",
+  "title": "NOTCHBAR_AGENTS_PORT is not validated (1024-65535 integer, fallback 7823 with warning)",
+  "status": "missing",
+  "severity": "medium",
+  "plan_refs": "plan L250, L1088",
+  "code_refs": "get_bridge_url L100-102 interpolates the raw env string",
+  "required_change": "Parse with int() after a strict ^[0-9]{1,5}$ check and require 1024<=p<=65535. Otherwise log_debug a warning and use DEFAULT_PORT. Add unit tests for '80', '70000', 'abc', '7823/x', '' and a valid value.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "liveness-gate-bypass",
+  "title": "Bartender liveness gate is skipped whenever bridge_url is passed; the gate is untested",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "plan L135, L1085 (ALL outbound dispatches and health checks verify get_bartender_pid())",
+  "code_refs": "_raw_post_event L827 and check_bridge_health L880 check `bridge_url is None and get_bartender_pid() is None`. Every unit test passes bridge_url=mock_url, so the gate is never exercised and any future caller passing a URL silently bypasses it.",
+  "required_change": "Gate unconditionally. Make get_bartender_pid injectable for tests (for example a module-level hook, or env HERDR_BARTENDER_TEST_BARTENDER_PID honored only when HERDR_BARTENDER_UNIT_TESTING is set). Add tests: no Bartender gives (False,False) and no HTTP hit on the mock, for both /event and /health.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "bartender-pid-earliest",
+  "title": "get_bartender_pid picks the lowest PID, not the earliest start time",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "plan L208 (\u00a73.1 Restart Detection: earliest start time via ps lstart), L134",
+  "code_refs": "get_bartender_pid L1455-1477 runs time.strptime on the output of get_process_start_time(), which already returns an epoch string (L67). The parse always fails and falls back to float(pid).",
+  "required_change": "Use float(get_process_start_time(p)) directly, as get_herdr_pid does at L200-203. Add a test that stubs ps/pgrep output.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "ttl-herdr-dead",
+  "title": "'Herdr dead >5m' TTL applies only to salvaged sessions",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "plan L235 (Stale TTL row: ... or Herdr dead >5m), L110",
+  "code_refs": "reconcile_active_sessions L1622-1634: Herdr-dead check is only in the salvaged branch L1626",
+  "required_change": "Persist herdr_dead_since in the cache, set when get_herdr_pid() is None and cleared when it is alive. Mark every non-Ended session stale when now - herdr_dead_since > 300. Add a clock-injected test.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "orphan-horizon",
+  "title": "12h-past-TTL / 12h absence eviction horizon is wrong, and missing for non-retryable orphaned_ended",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "plan L230-235 (orphaned_ended retained, evicted only after 12h horizon or 256 cap; undelivered >12h past TTL exported and evicted), L110",
+  "code_refs": "L1637 uses a fixed 129600s (36h) from last_event_at and only for retryable_exhausted: Waiting (48h TTL) is evicted the moment it goes stale, and Working (12h TTL) waits 36h. Ended sessions with non_retryable_failed/orphaned_ended are never stale (desired_state 'Ended' is not in the TTL branches), so only the 256-cap prune at L1116-1127 removes them.",
+  "required_change": "Compute ttl_for(state) and evict exported when now - last_ts > ttl + 43200 for undelivered sessions in either failure status. For orphaned_ended sessions, evict when now - orphaned_at > 43200 (record orphaned_at when setting the flag). Add tests for each state.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "perms-umask",
+  "title": "State dir is not 0700 and process does not set umask 077; cache/markers/log/spool files are created 0644",
+  "status": "missing",
+  "severity": "medium",
+  "plan_refs": "plan L1089 (dirs 0700, state/orphan files 0600 under umask 077)",
+  "code_refs": "get_state_dir L80-91 mkdir() with default mode. No os.umask at process start. Only the orphan writers (L1236, 1281, 2124) and lock opens use 0o077/0o600. Cache tmp L1150, touch_pane_failed L451, touch_pane_marker L742, log_debug L815 and spool use default modes.",
+  "required_change": "Call os.umask(0o077) as the first statement of main(). In get_state_dir, mkdir(mode=0o700) and os.chmod(p, 0o700) if it already exists with looser bits, and do the same for panes/ and spool/. Add a test asserting 0700 dirs and 0600 cache/marker/log files.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "cleanup-budget",
+  "title": "--cleanup has no max(10, n*0.15) budget; per-request timeout and lock window shrink after 1.4s",
+  "status": "missing",
+  "severity": "medium",
+  "plan_refs": "plan L126, L686 (0.15s per-session timeout, budget max(10.0, len(sessions)*0.15), exempt from watchdog)",
+  "code_refs": "run_cleanup L1972-2025 is unbounded and uses timeout=0.2. time_remaining() (L105-108) is measured against PROCESS_DEADLINE_SECONDS=1.4 and floors at 0.1, so after ~1.1s every post timeout clamps to 0.1s and the BoundedSessionCache lock window (L915) drops to 20ms.",
+  "required_change": "At the start of run_cleanup, set PROCESS_DEADLINE_SECONDS = max(10.0, n*0.15) and reset START_TIME, or pass an explicit deadline. Use timeout=0.15. When the budget is exhausted, stop sending, export the remaining sessions and return 2. Do the same for --replay-orphans and --reconcile-background, which suffer the same floor. Add a test with many sessions and a slow mock asserting the budget and exit 2.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "lock-best-effort",
+  "title": "Cache lock gives up after a short budget and proceeds unlocked, so 'under lock' guarantees in cleanup/replay fail",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "plan L1191 (\u00a79.2 step 3: checks under lock), L1192 (4a re-acquires cache lock), L616 (cleanup uses identical Step A/B/C lease protocol)",
+  "code_refs": "BoundedSessionCache.__enter__ L911-926 logs 'proceeding with best effort' and returns data without holding flock. In long-running CLI modes time_remaining() floors at 0.1, giving a 20ms window. run_replay_orphans also evaluates the skip predicate against a single snapshot taken before the loop (L2052-2054), not per record under lock. Lock order differs: cleanup takes cache then orphan lock (L1997-2018), replay takes orphan then cache.",
+  "required_change": "On failure to acquire, raise or return a sentinel so callers retry or abort. Give CLI/background modes a longer blocking acquire. In replay, re-read the cache under lock per record immediately before sending. In run_cleanup, call export/remove_orphan_record only after leaving the cache lock to keep a single lock order (orphan lock is never taken while holding the cache lock). Implement the Step A/B/C lease claim in run_cleanup as L616 requires.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "replay-256-bound",
+  "title": "--replay-orphans does not bound ingestion to 256 records",
+  "status": "missing",
+  "severity": "low",
+  "plan_refs": "plan L1189 (\u00a79.2 step 1: bounded to 256 records)",
+  "code_refs": "run_replay_orphans L2045-2050 iterates all records (export_orphan_record truncates on write, but hand-edited or legacy list files are unbounded)",
+  "required_change": "After parsing, keep at most 256 records (newest by admitted_at_ns or last_event_at) to process this pass. Leave the remainder in the file, not dropped. Add a test with 300 records.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "replay-marker-resync",
+  "title": "Replay removes the pane marker and flips salvaged records to in_flight even when a live/salvaged session exists",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "plan L1192-1193 (4a re-sync only for fresh active session; step 5 clears marker)",
+  "code_refs": "run_replay_orphans L2093-2110: remove_pane_marker(pane_id) runs before the re-sync check, and the re-sync sets delivery_status='in_flight' on salvaged sessions too (overwriting 'salvaged'). It also resets consecutive_failures, which the plan does not require.",
+  "required_change": "Only remove the marker when no non-Ended active session exists for the pane. Skip the re-sync status flip for salvaged records, or keep 'salvaged' and only set delivered_seq=0. Leave consecutive_failures alone.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "cleanup-failure-state",
+  "title": "--cleanup failure path does not mark orphaned_ended/delivery_status and misses sessions whose seq changed",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "plan L118-121, L127-130 (unconfirmed Ended retained, orphaned_ended, mirrored to orphan file)",
+  "code_refs": "run_cleanup L2008-2010 only bumps delivery_attempts. A delivered session whose seq advanced mid-cleanup (L2003 check) is neither evicted nor counted as uncleared, so the exit code is 0 while the session remains.",
+  "required_change": "On failure, set orphaned_ended=True, delivery_status and delivery_error. When success but seq mismatches, set all_cleared=False so exit 2 and export happen.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "rollback-script-missing",
+  "title": "\u00a79.1 deterministic rollback script is not shipped in the repo",
+  "status": "missing",
+  "severity": "high",
+  "plan_refs": "plan L1095-1182",
+  "code_refs": "repo contains only README.md, herdr-plugin.toml, bin/herdr-bartender (no scripts/ directory)",
+  "required_change": "Add scripts/rollback.sh (mode 0755) with the \u00a79.1 body. Resolve the binary relative to the script (\"$(cd \"$(dirname \"$0\")/..\" && pwd)/bin/herdr-bartender\") instead of hardcoding ~/Projects/herdr-bartender (the repo actually lives at ~/Projects/voodootikigod/herdr-bartender). Remove both plugin symlink locations (~/.config/herdr/plugins/herdr-bartender and ~/.config/herdr/plugins/local/herdr-bartender, the README install path). Add a bash -n check and an integration test running it against a temp HOME/state dir with a mock bridge (exit 0 path and exit-2 path).",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "cli-live-test",
+  "title": "--live-test flag missing (code only has --test)",
+  "status": "missing",
+  "severity": "low",
+  "plan_refs": "plan L1276 (\u00a710.2: ./bin/herdr-bartender --live-test)",
+  "code_refs": "main() L5149 handles '--test' -> run_live_test(); no '--live-test'",
+  "required_change": "Accept '--live-test' (keep '--test' as an alias). Optionally make --health exit non-zero when unreachable so scripts can rely on it.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "manifest-version",
+  "title": "herdr-plugin.toml min_herdr_version 0.9.0 contradicts the plan's Herdr 0.8.x target",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "plan L237 (\u00a73.4 Herdr 0.8.x), L1284 (\u00a711.1 Herdr 0.8.x fixtures), L1277",
+  "code_refs": "herdr-plugin.toml line 5: min_herdr_version = \"0.9.0\"",
+  "required_change": "Set min_herdr_version = \"0.8.0\" (or whichever 0.8.x was verified), since a 0.9.0 floor would block installation on the platform the plan validated. platforms=[\"macos\"] is correct.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "manifest-startup-cleanup",
+  "title": "Manifest runs --cleanup at every Herdr startup, which the plan does not specify and which conflicts with the 2s supervisor and restart semantics",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "plan L686 (--cleanup is a rollback tool, budget up to max(10,n*0.15), exempt from watchdog); L134 (Herdr restart mass-expiry only when previous PID confirmed dead, done by the reconciler); L245 (2.0s SIGKILL on synchronous plugin executions)",
+  "code_refs": "herdr-plugin.toml [[startup]] command = [\"./bin/herdr-bartender\", \"--cleanup\"]",
+  "required_change": "Replace it with [\"./bin/herdr-bartender\", \"--reconcile-background\"] (detached, which handles restart detection per the plan), or drop the startup hook. If startup cleanup is intentional, add it to the plan with a sub-2s budget and DISABLED respect. As written, it bypasses DISABLED, can be SIGKILLed mid-sweep, and exports every session to orphans when Bartender is not yet running at login.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "readme-remote",
+  "title": "README advertises remote-host support and NOTCHBAR_AGENTS_HOST, which the plan marks out of scope",
+  "status": "plan-contradiction",
+  "severity": "medium",
+  "plan_refs": "plan L1083, L1086 (remote SSH forwarding OUT OF SCOPE), L1087 (literal 127.0.0.1)",
+  "code_refs": "README.md 'Remote Host Support' feature bullet and 'Remote Sessions' section (SSH RemoteForward, NOTCHBAR_AGENTS_HOST); code ignores NOTCHBAR_AGENTS_HOST (get_bridge_url L100). run_unit_tests L3096 sets it (dead). DEFAULT_HOST L22 is unused.",
+  "required_change": "Remove the remote-host bullet and section and NOTCHBAR_AGENTS_HOST from the README. State the single-host loopback scope, NOTCHBAR_AGENTS_PORT (1024-65535), and the liveness gate. Remove the dead env set in tests and the unused DEFAULT_HOST, or use it as the literal.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "readme-cli-install",
+  "title": "README CLI list and install path are incomplete or inconsistent with plan",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "plan L131 (--status, --install-hooks, --uninstall-hooks), L1184 (--replay-orphans), L1095 (rollback), L1277 (symlink at ~/.config/herdr/plugins/herdr-bartender), L1202 (--unit-test)",
+  "code_refs": "README.md 'CLI Commands' lists only --health/--test/--sessions/--cleanup and describes --test as an 'interactive simulation' (it posts to the live bridge). The install step links to ~/.config/herdr/plugins/local/herdr-bartender.",
+  "required_change": "Document every CLI flag (--health, --live-test/--test, --sessions, --status, --cleanup with exit codes 0/2/1, --install-hooks, --uninstall-hooks, --replay-orphans <file>, --unit-test). Document scripts/rollback.sh and the orphan file location. Align the symlink path with the plan and the rollback script.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "tests-home-isolation",
+  "title": "Unit tests mutate the real $HOME state dir and delete the real ~/.herdr-bartender-orphans.json",
+  "status": "isolation",
+  "severity": "high",
+  "plan_refs": "plan L1273-1280 (\u00a710.2 test harness), L1228 (test #25)",
+  "code_refs": "run_unit_tests L3100-3110 wipes active-sessions.json, DISABLED, DELIVERY_DOWN and panes/* in the real get_state_dir(). Test 25 (~L3658-3677) and ~L3794 unlink Path.home()/'.herdr-bartender-orphans.json'. Test 15 and others write into the real state dir.",
+  "required_change": "At the start of run_unit_tests, create tempfile.mkdtemp(), set HOME, HERDR_PLUGIN_STATE_DIR and XDG_STATE_HOME to it, and restore or remove them at the end, so rollback DISABLED tombstones and user orphan files are never destroyed. Make the orphan path a function (get_orphan_path()) instead of repeating Path.home() literals.",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "tests-missing-matrix",
+  "title": "No tests for several \u00a73.3/\u00a78/\u00a79.2 behaviors",
+  "status": "test-missing",
+  "severity": "medium",
+  "plan_refs": "plan L229-235, L1085-1089, L1188-1198, L1217 (#14 DISABLED: plugin exits 0 AND --cleanup still runs)",
+  "code_refs": "run_unit_tests: test 12 (~L3302) only checks is_disabled() and never runs main() or run_cleanup under DISABLED. The DELIVERY_DOWN test (~L3395) only touches and clears the flag. No 200 ok:false, 3xx, 3-consecutive-failure, .failed-on-first-failure, port-validation, liveness-gate, permissions (beyond the orphan file), replay retain/atomic-rewrite, replay invalid-regex skip, replay 256 bound, or replay-never-unlinks-DISABLED test.",
+  "required_change": "Extend MockBartenderHandler with configurable body (ok:false), 302 redirect and per-request code sequences. Add one assertion-focused test per item listed, including the DISABLED test running main() as a subprocess (exit 0, no HTTP) and run_cleanup under DISABLED (sends Ended).",
+  "area": "bridge-cli-security-rollback"
+ },
+ {
+  "id": "linux-guard-stat-crash",
+  "title": "Root cause of the Linux --unit-test failure at L3601: the hook guard's stat fallback breaks on GNU coreutils and kills the vendor hook (rc=1)",
+  "status": "portability",
+  "severity": "critical",
+  "plan_refs": "\u00a710.1 #23, #52, #55, #61, #62, #67; \u00a77.2 guard health predicate",
+  "code_refs": "bin/herdr-bartender L352 `_HB_MARKER_MTIME=$(stat -f %m \"$_HB_PANE_MARKER\" 2>/dev/null || stat -c %Y ... || echo 0)`; L353-354 arithmetic; failing assert L3601 (test #23 Step D, `assert res.returncode == 0`)",
+  "required_change": "I confirmed this in a sandbox: I copied the template to scratch and set HERDR_PLUGIN_STATE_DIR to a tempdir. On GNU, `stat -f` means filesystem mode, so `stat -f %m FILE` prints multi-line filesystem info to stdout for FILE. It then exits 1 because '%m' is not a file. The `||` fallback appends the `stat -c %Y` output to the same capture. Under `set -u`, `$((_HB_NOW_TIME - _HB_MARKER_MTIME))` then aborts with 'File: unbound variable', so the hook exits 1 and the vendor script never runs (it fails closed). This happens whenever a pane marker exists and the flags are clear, which breaks tests #23D, #52, #55, #61 (third case), #62 and #67 on Linux. It is also a production bug on macOS for anyone with Homebrew coreutils gnubin on PATH. Fix: try GNU first and validate the result: `_HB_MARKER_MTIME=$(stat -c %Y \"$f\" 2>/dev/null) || _HB_MARKER_MTIME=$(stat -f %m \"$f\" 2>/dev/null) || _HB_MARKER_MTIME=0; case $_HB_MARKER_MTIME in ''|*[!0-9]*) _HB_MARKER_MTIME=0;; esac`. Once the stat fix is in, PASSTHROUGH vs suppress still depends on a real `herdr` process existing (`pgrep -f Herdr.app || pgrep -xi herdr`, L354). This host passed only because herdr happens to be running, so a pgrep PATH shim is needed (see harness gap). Add a regression test that runs the guard with a fresh marker and asserts rc==0 under both a GNU-style and a BSD-style stat shim.",
+  "area": "tests"
+ },
+ {
+  "id": "isolation-real-home",
+  "title": "Suite reads and writes the real $HOME, the real state dir, /tmp and (on macOS) the real Bartender vendor hooks",
+  "status": "isolation",
+  "severity": "critical",
+  "plan_refs": "\u00a710.1 preamble (ephemeral mock), #22, #25, #29, #47, #66, #68",
+  "code_refs": "get_state_dir L80-91 (HERDR_PLUGIN_STATE_DIR > XDG_STATE_HOME > Path.home(), and it mkdirs as a side effect); run_unit_tests L3100-3114 uses get_state_dir() without setting an env override first and deletes the real active-sessions.json/DISABLED/DELIVERY_DOWN/panes/spool; guard L239 resolves the same path via $HOME; get_vendor_hooks_dir L497 Path.home()/Library/Application Support/Bartender/...; orphan path Path.home()/.herdr-bartender-orphans.json at L1134, L1217, L1258, L1826; --replay-orphans expanduser L2029; tests L3658/L3659 (#25), L3796-3811 (#29), L4452 (#47) write and unlink the real ~/.herdr-bartender-orphans.json; #66 L5006-5024 creates /tmp/test_herdr_plugin_state, /tmp/test_xdg_home and the real ~/.local/state/... (via get_state_dir mkdir), then sets HERDR_PLUGIN_STATE_DIR only at L5028; #68 L5074 calls install_hooks() and run_reconcile_background (L1874-1919) can auto-call install_hooks() and `osascript` on the real ~/Library hooks dir; guard subprocesses inherit os.environ.copy() (L3548, L3876, L4296, L4431), so HERDR_WORKSPACE_ID or HERDR_PANE_ID from a real Herdr pane leak in; session IDs hard-code 'macbook' while lookups use get_sanitized_hostname()",
+  "required_change": "Add a shared fixture that runs before importing or calling anything. It creates a tempdir and sets HOME=<tmp>/home, XDG_STATE_HOME=<tmp>/xdg, HERDR_PLUGIN_STATE_DIR=<tmp>/state and PATH=<tmp>/shims:<orig PATH>. It clears all inherited HERDR_* variables and gives every guard subprocess an explicit minimal env (env -i style). Add an env override for the vendor hooks dir (e.g. HERDR_BARTENDER_VENDOR_HOOKS_DIR) or rely on the sandboxed HOME, which Path.home() honors through $HOME on POSIX. #66 must use tempdir paths, not /tmp literals. Tear down with shutil.rmtree. As a safety guard, refuse to run --unit-test unless HOME resolves under tempfile.gettempdir().",
+  "area": "tests"
+ },
+ {
+  "id": "t68-hook-review",
+  "title": "#68 HOOK_NEEDS_REVIEW alerting is not tested, and the clearing test fails on Linux and is dangerous on macOS",
+  "status": "test-weak",
+  "severity": "high",
+  "plan_refs": "\u00a710.1 #68",
+  "code_refs": "test L5063-5079; install_hooks L520-523 returns False before the unlinks at L551-554 when the hooks dir is missing; reconciler alert path L1908-1919",
+  "required_change": "Seed a sandboxed vendor hooks dir with claude-event-hook.sh and codex-notify-hook.sh, plus a vendor-hook-sha.json whose SHA does not match. Run run_reconcile_background(loop_once=True) and assert that HOOK_NEEDS_REVIEW and .hook_review_alerted are created and that the osascript shim was called exactly once, with no second call on the next pass. Then call install_hooks() and assert both flags are gone. Also move the flag unlinks in install_hooks so they no longer sit behind the hooks-dir early return, or document that behavior. Today the test only touches the files by hand and calls install_hooks(), which returns early on Linux, so the assertion fails.",
+  "area": "tests"
+ },
+ {
+  "id": "t53-herdr-pid",
+  "title": "#53 earliest-start-time Herdr PID selection is a tautology",
+  "status": "test-missing",
+  "severity": "high",
+  "plan_refs": "\u00a710.1 #53",
+  "code_refs": "test L4609-4612 `assert get_herdr_pid() is not None or get_herdr_pid() is None`; get_herdr_pid L174-208",
+  "required_change": "Use PATH shims. A `pgrep` shim prints PIDs 300, 200 and 100. A `ps` shim answers `-o comm=` with non-.app names and `-o lstart=` with distinct dates where PID 200 is earliest. Assert get_herdr_pid()==200. Add a case where one PID has a `/Applications/Herdr.app/...` comm and assert it is preferred, and a case where the pgrep shim exits 1 and assert None. Note that get_herdr_pid compares float(st), and get_process_start_time returns epoch-string seconds only when strptime succeeds, so the test must also cover the fallback when lstart cannot be parsed.",
+  "area": "tests"
+ },
+ {
+  "id": "t42-43-48-63-hollow",
+  "title": "#42, #43, #48 and #63 re-implement the production logic inside the test and never exercise the real Step C code",
+  "status": "test-weak",
+  "severity": "high",
+  "plan_refs": "\u00a710.1 #42, #43, #48, #63; \u00a74.3 Step C",
+  "code_refs": "#42 L4304-4338 (the test itself sets delivered_seq=0/in_flight); #43 L4340-4379 (the test calls _raw_post_event for the compensation); #48 L4463-4495 (`compensation_needed` is a local test variable); #63 L4880-4936 (both senders are simulated inline)",
+  "required_change": "Drive the real dispatch path, using either an injected hook point or a mock bridge that blocks on a threading.Event mid-request. Thread or process A starts a send. While its POST is blocked, a second sender takes over the lease (#42/#63), a pane.closed evicts or tombstones the session (#43), or a re-admission happens (#48). Then release the mock. Assert on cache state (delivered_seq==0, delivery_status=='in_flight', resync_generation incremented, reconciler.pending touched) and on the mock's request log (a compensating Ended was sent for #43 and none for #48). The mock needs a per-request 'gate' Event and an ordered request log.",
+  "area": "tests"
+ },
+ {
+  "id": "t41-failopen-hollow",
+  "title": "#41 mktemp-failure fail-open test is a no-op",
+  "status": "test-weak",
+  "severity": "high",
+  "plan_refs": "\u00a710.1 #41",
+  "code_refs": "L4285-4302: `HOOK_GUARD_TEMPLATE.replace('mktemp \"$STATE_HOME/.guard_stdin.XXXXXX\"','false')` matches nothing because the template uses `$_HB_STATE_HOME` (L276), which I verified. HERDR_PANE_ID='pFailOpen' with no workspace also canonicalizes to '' and skips the guard entirely.",
+  "required_change": "Use a PATH `mktemp` shim that exits 1, or point the state dir at a read-only directory, and use HERDR_PANE_ID='w1:pFailOpen' with a fresh marker and herdr reported healthy. Assert rc==0, that the vendor body received the full stdin byte-for-byte, and that no .vendor_active or .guard_stdin.* was created. Also assert that the replace actually changed the template if the replace approach is kept.",
+  "area": "tests"
+ },
+ {
+  "id": "t32-bypass",
+  "title": "#32 >64KB byte-exact capture bypasses the guard",
+  "status": "test-weak",
+  "severity": "high",
+  "plan_refs": "\u00a710.1 #32",
+  "code_refs": "L3865-3885: HERDR_PANE_ID='unconfigured_pane_bypass' with no workspace gives canonical '', so the capture code never runs (unless HERDR_WORKSPACE_ID leaks from the parent env)",
+  "required_change": "Use a valid canonical pane (e.g. 'w1:pLarge') in a clean env, in the fall-through case (no marker). Assert that the vendor `cat` output equals the 196KB payload byte-for-byte, with and without a trailing newline and with NUL/binary bytes. Repeat in the healthy-suppress case to confirm there is no leftover .guard_stdin.*.",
+  "area": "tests"
+ },
+ {
+  "id": "t22-install-mode",
+  "title": "#22 hook mode preservation never calls install_hooks",
+  "status": "test-weak",
+  "severity": "high",
+  "plan_refs": "\u00a710.1 #22; \u00a77.3",
+  "code_refs": "L3505-3518: the test writes and chmods its own file and checks its own os.replace",
+  "required_change": "Create sandboxed vendor hooks with modes 0644 and 0750. Run install_hooks() and assert st_mode&0o7777 == orig|0o100, that the guard block is present exactly once, and that the .pristine backup and vendor-hook-sha.json were written. Run it twice to check idempotence, then run uninstall_hooks() and assert the content is restored.",
+  "area": "tests"
+ },
+ {
+  "id": "t21-bartender-resync",
+  "title": "#21 Bartender PID change re-sync assertion is hollow",
+  "status": "test-weak",
+  "severity": "high",
+  "plan_refs": "\u00a710.1 #21",
+  "code_refs": "L3480-3503 asserts delivered_seq==2/delivered, which equals the seeded state; reconcile L1578-1595 uses get_bartender_pid() (pgrep -x 'Bartender 6'/'Bartender', L1455-1477), which returns None on Linux, so the re-sync branch never runs",
+  "required_change": "Use a pgrep/ps shim that reports a new Bartender PID and start time, and seed last_bartender_pid with a dead PID. Clear the mock history, then reconcile. Assert that the mock received a fresh POST for wSyncTest (history), that last_bartender_pid and last_bartender_start_time were updated, and that salvaged and Ended sessions were not re-sent. Add a negative case where the old PID is still alive with the same start time and assert no re-sync.",
+  "area": "tests"
+ },
+ {
+  "id": "t8-response-matrix",
+  "title": "#8 response-code matrix covers only 4xx-on-Ended",
+  "status": "test-weak",
+  "severity": "high",
+  "plan_refs": "\u00a710.1 #8; \u00a73.3 table rows 200/ok:false, 3xx, 4xx",
+  "code_refs": "test L3210-3218; MockBartenderHandler L3017-3077 cannot return 200 {ok:false} or 3xx with a body, and it returns before logging when return_code!=200",
+  "required_change": "Extend the mock with a scripted response queue (status, body, delay) and log every request, failed ones included. Parameterize over 200+{ok:false}, 301/302, 400 and 404 for both Working and Ended. Assert delivery_status=='non_retryable_failed', the delivery_error value, rejected_seq, that panes/<hex>.failed exists, and that the marker was removed. Then run the guard with a fresh event and assert it falls through (PASSTHROUGH, .vendor_active created).",
+  "area": "tests"
+ },
+ {
+  "id": "t13-process-deadline",
+  "title": "#13 bounded timeout is tested on one function call, not at the process level",
+  "status": "test-weak",
+  "severity": "high",
+  "plan_refs": "\u00a710.1 #13; \u00a76.1",
+  "code_refs": "L3231-3239 calls post_bartender_event(timeout=0.5) in-process with PROCESS_DEADLINE_SECONDS overridden to 60 (L3083)",
+  "required_change": "Spawn `bin/herdr-bartender` as a subprocess with HERDR_PLUGIN_EVENT=pane.agent_status_changed, event JSON, NOTCHBAR_AGENTS_PORT=<mock> and a pgrep shim that reports Bartender alive (the _raw_post_event gate at L826 requires it when bridge_url is None), against a mock that delays 3s. Assert the process exits 0 within 1.5s wall time and leaves the cache consistent with delivered_seq < seq and reconciler.pending or a spawned helper.",
+  "area": "tests"
+ },
+ {
+  "id": "t15-ttl",
+  "title": "#15 has no Working 12h TTL test and does not check exact TTL boundaries",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #15; \u00a710.2 injectable clock; \u00a73.3 Stale TTL row",
+  "code_refs": "L3310-3353 cover only Waiting (25h kept, ~55h expired) and Idle (25h expired); code TTLs L1629-1633 (86400/172800/43200); 12h hard horizon L1636 is untested",
+  "required_change": "With a frozen clock (patch time.time and time.time_ns), assert that each state is retained at TTL-1s and staged Ended at TTL+1s: Working 43200, Idle/Done 86400, Waiting 172800. Also test the 12h past-TTL undelivered export-and-evict horizon and the 5-minute salvaged horizon (\u00a76.3).",
+  "area": "tests"
+ },
+ {
+  "id": "t2-lifecycle",
+  "title": "#2 lifecycle sequence stops at Waiting",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #2",
+  "code_refs": "L3121-3138",
+  "required_change": "Continue the same pane through done\u2192Done and idle\u2192Idle. Assert each bridge payload state in order from the mock history, and the cache desired_state, delivered_state and seq increments.",
+  "area": "tests"
+ },
+ {
+  "id": "t3-cascade-lease",
+  "title": "#3 container cascades do not check that active leases are respected",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #3",
+  "code_refs": "L3148-3169 (counts only; also depends on state left by test #2)",
+  "required_change": "Seed a session under a live foreign lease (sleep process PID + start time, deadline in the future). Fire tab.closed and workspace.closed, then assert the Ended is deferred (lease token unchanged, reconciler.pending touched). Then expire the lease and assert reconcile delivers the Ended and records tombstones. Use fresh state per test instead of relying on the counts from earlier tests.",
+  "area": "tests"
+ },
+ {
+  "id": "t4-qualification",
+  "title": "#4 has no test that unassisted shell panes are ignored, and agent:null exit is untested",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #4; \u00a72.2",
+  "code_refs": "no dedicated test; #27 L3697 and #59 L4766 only touch on it with agent ''",
+  "required_change": "Send a status for a pane with no agent field and no existing session, and assert no session is created and no POST is made. Then for an admitted session, send agent: None and separately agent: '', and assert an Ended POST reaches the mock and the session is evicted.",
+  "area": "tests"
+ },
+ {
+  "id": "t6-drain-supersession",
+  "title": "#6 does not simulate Ended in flight in the drain loop",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #6",
+  "code_refs": "L3191-3208 (Ended fails with 500, then Working arrives sequentially; only desired_state is asserted)",
+  "required_change": "Block the mock on the Ended POST using a gate Event. While it is blocked, deliver a Working event from another thread or process, then release. Assert the session is not deleted from the cache and that the mock received Working after Ended (final mock state Working).",
+  "area": "tests"
+ },
+ {
+  "id": "t7-seq-monotonic",
+  "title": "#7 does not check that seq increases monotonically",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #7",
+  "code_refs": "L3171-3189 asserts only seq>=1",
+  "required_change": "Send N events and record seq after each one. Assert they strictly increase by 1 for accepted events, and that the payload seq sent to the mock is also strictly increasing.",
+  "area": "tests"
+ },
+ {
+  "id": "t9-marker-lifecycle",
+  "title": "#9 tests marker helpers directly instead of the delivery, close and heartbeat paths",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #9",
+  "code_refs": "L3289-3300",
+  "required_change": "Assert the marker appears after a confirmed handle_agent_status_changed delivery and not after a 500. Assert it is removed after handle_pane_closed. Age it with os.utime and assert run_reconcile_background(loop_once=True) refreshes its mtime.",
+  "area": "tests"
+ },
+ {
+  "id": "t10-spool-fifo",
+  "title": "#10 spool FIFO order is not asserted",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #10",
+  "code_refs": "L3241-3274 counts delivered events only",
+  "required_change": "Write envelopes with out-of-order filenames and arrival times. Assert that the mock history order matches FIFO by filename or arrival, and that superseded (older-seq) envelopes are dropped.",
+  "area": "tests"
+ },
+ {
+  "id": "t11-helper-singleton",
+  "title": "#11 does not verify that new work is completed or the fixed backoff",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #11; \u00a75.1",
+  "code_refs": "L3276-3287 only checks that reconciler.pending is touched and unlinked",
+  "required_change": "Seed an undelivered session and touch reconciler.pending, then run without loop_once and with an injected sleep. Assert the loop re-scans and delivers before exiting. Assert retry sleeps follow 0/1/2/4/8s through a patched time.sleep recorder.",
+  "area": "tests"
+ },
+ {
+  "id": "t12-quarantine-signal",
+  "title": "#12 does not assert salvage invariants or signal safety",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #12; \u00a76.1, \u00a76.3",
+  "code_refs": "L3220-3229",
+  "required_change": "After quarantine, assert the salvaged record has seq==delivered_seq, desired_state!='Ended', salvaged True and delivery_status 'salvaged', that the mock received no POST for it on the next reconcile, and that the .corrupt.<timestamp> name matches the pattern. For signal safety, set IN_CRITICAL_SECTION=True, send SIGALRM through _timeout_watchdog, and assert PENDING_WATCHDOG_EXIT is set with no exit. Alternatively, run a subprocess with a tiny deadline and assert the cache is never left half-written.",
+  "area": "tests"
+ },
+ {
+  "id": "t14-disabled",
+  "title": "#14 DISABLED test checks only is_disabled()",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #14",
+  "code_refs": "L3302-3308; main L5204-5205",
+  "required_change": "Run the plugin as a subprocess with DISABLED present and an event env set, and assert exit 0, no POST and no cache mutation. Run `--cleanup` with DISABLED present and assert it still sends Ended and returns 0.",
+  "area": "tests"
+ },
+ {
+  "id": "t17-delivery-down",
+  "title": "#17 does not drive failures through delivery",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #17; \u00a73.3 5xx/network rows",
+  "code_refs": "L3394-3404 calls touch/clear helpers directly",
+  "required_change": "Make the mock return 500 three times across three events. Assert .failed exists after the first, DELIVERY_DOWN is absent after two and present after three, and consecutive_failures is tracked. Then a 200 clears both.",
+  "area": "tests"
+ },
+ {
+  "id": "t30-outside-lock",
+  "title": "#30 does not assert that the vendor dismissal is sent outside the lock",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #30",
+  "code_refs": "L3814-3835 (the _raw_post_event raise under UNIT_TESTING at L822-825 is an implicit oracle only)",
+  "required_change": "Record the IN_CRITICAL_SECTION value in the mock handler (same process) or patch _raw_post_event with a recorder. Explicitly assert it was False for the vendor-UUID Ended POST, and that the dismissal was staged in the cache under lock first.",
+  "area": "tests"
+ },
+ {
+  "id": "t31-37-parity-dup",
+  "title": "#31 and #37 parity tests run a hand-copied bash snippet, not HOOK_GUARD_TEMPLATE",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #31, #37",
+  "code_refs": "L3837-3863, L4158-4185 (inline bash duplicates template L229-238)",
+  "required_change": "Run the actual guard in fall-through mode (herdr-unhealthy shim). Read back which panes/<hex>.vendor_active filename it created, and compare it with get_hex_pane_id(normalize_pane_id(raw, ws)). Use an exhaustive fixture table: 48-char limit, 49 chars rejected, invalid chars, multi-colon, empty workspace, colon-less without workspace rejected (no file created).",
+  "area": "tests"
+ },
+ {
+  "id": "t33-terminal-matrix",
+  "title": "#33 terminal-event matrix is incomplete",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #33, #23",
+  "code_refs": "L3887-3918 covers only Done and Ended in argv; the 'condition 3 fails' sub-case uses Ended, which always passes, so it proves nothing",
+  "required_change": "Parameterize over {Stop, Done, AgentDone, AgentWaiting, agent-turn-complete} (expect pass-through, .vendor_active retained) and {Ended, SessionEnd, session-end} (expect pass-through, .vendor_active removed). Cover each delivery mode: argv token, stdin JSON hook_event_name and argv JSON. Run each under both healthy and unhealthy Herdr shims.",
+  "area": "tests"
+ },
+ {
+  "id": "t35-backward-clock",
+  "title": "#35 does not test dropping older-generation spool events",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #35",
+  "code_refs": "L4091-4117",
+  "required_change": "Patch time.time to step backward after admission. Enqueue a spool envelope carrying the older generation and replay it. Assert it is dropped and that generation and cache_seq strictly increase.",
+  "area": "tests"
+ },
+ {
+  "id": "t44-cross-ws",
+  "title": "#44 does not cover lock or state isolation across workspaces",
+  "status": "test-weak",
+  "severity": "low",
+  "plan_refs": "\u00a710.1 #44",
+  "code_refs": "L4381-4396",
+  "required_change": "Admit w1:p1 and w2:p1 and assert two distinct session IDs, hex_w1 != hex_w2, and independent markers. Close w1 and assert the w2 session, marker and .vendor_active are untouched.",
+  "area": "tests"
+ },
+ {
+  "id": "t45-bare-60s",
+  "title": "#45 does not test bare-touch preservation past 60s",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #45",
+  "code_refs": "L4398-4414 tests only the unlink paths",
+  "required_change": "Age the bare-touch .vendor_active to 120s with os.utime while the session is active, run a reconcile pass, and assert the file still exists (no blind expiry). Then pane close removes it.",
+  "area": "tests"
+ },
+ {
+  "id": "t46-56-bounds",
+  "title": "Stdin-capture timing bounds are looser than the spec, and the remainder splice is not verified",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #46 (<=1.0s), #56 (prefix + remainder, <2.0s)",
+  "code_refs": "#46 L4416-4449 asserts <2.5s; #56 L4670-4701 writes one line and never sends a remainder",
+  "required_change": "#46: assert elapsed <= 1.0s plus a small tolerance (e.g. <1.5s) and rc 0. #56: the writer sends line 1, sleeps 1.5s (past the alarm), then sends line 2 and closes. Run the vendor as `cat` and assert stdout == line1+line2 byte-for-byte, that the guard returned control within 2.0s, and that no .guard_splice.* or .guard_stdin.* remains.",
+  "area": "tests"
+ },
+ {
+  "id": "t50-salvage-hostname",
+  "title": "#50 salvage assertions are conditional and keyed to the wrong host",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #50",
+  "code_refs": "L4516-4552: the corrupt cache uses 'herdr:macbook:...', the lookup uses host_test, and the checks sit under `if salvaged_sess:`, so they are skipped",
+  "required_change": "Use the same session ID for the seed and the lookup, and assert unconditionally: salvaged is True, desired_state and delivered_state are 'Idle', delivery_status is 'salvaged', and generation >= 1_700_000_000. Assert all pane markers were removed and that no POST was sent for salvaged sessions on the next reconcile.",
+  "area": "tests"
+ },
+ {
+  "id": "t54-drain-reverify",
+  "title": "#54 does not test the re-verification abort or forced re-sync branches",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #54",
+  "code_refs": "L4614-4636",
+  "required_change": "Add cases where (a) the compensation target was re-admitted with a fresh session, so assert no Ended is sent and the entry is purged, and (b) a race happens during the send through a mock gate, so assert delivered_seq is reset to 0 and status is in_flight. Also assert that an Ended was actually sent for the plain case (mock history).",
+  "area": "tests"
+ },
+ {
+  "id": "t60-cancel-triggers",
+  "title": "#60 covers only the .vendor_active cancellation trigger",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #60; \u00a71 L56 (DISABLED, NO_HOOKS, .vendor_active, .failed, herdr dead)",
+  "code_refs": "L4805-4824; HERDR_BARTENDER_UNIT_TESTING forces is_herdr_alive() True (L211-213), so the herdr-dead trigger cannot be tested",
+  "required_change": "Parameterize over each trigger (.vendor_active, .failed, DISABLED, NO_HOOKS, herdr dead via a pgrep shim or injectable liveness). Assert the entry is purged and no Ended is sent. Replace the env-var short-circuit in is_herdr_alive with the PATH shim so tests can drive both states.",
+  "area": "tests"
+ },
+ {
+  "id": "t65-settling",
+  "title": "#65 does not test the 2.0s interval gate or the 5-attempt cap, and its comment follows the stale 3-attempt reading",
+  "status": "test-weak",
+  "severity": "medium",
+  "plan_refs": "\u00a710.1 #65; \u00a75.1 L645 vs L646",
+  "code_refs": "L4970-5000 (the comment says 'attempts 1 (< 3)'); code L1549-1568 uses 5",
+  "required_change": "With a frozen clock: (a) last_attempt 1.0s ago gives no POST and attempts unchanged; (b) 2.0s ago gives a POST and attempts+1; (c) attempts==5 gives a purge without POST; (d) age >=10s gives a purge; (e) a confirmed 200 gives a purge (code currently retains on 200 within the window; confirm that against the spec). Fix the comment.",
+  "area": "tests"
+ },
+ {
+  "id": "t1-19-57-62-minor",
+  "title": "Minor weak assertions in #1, #19, #57 and #62",
+  "status": "test-weak",
+  "severity": "low",
+  "plan_refs": "\u00a710.1 #1, #19, #57, #62",
+  "code_refs": "#1 L3116-3119 (no 'port' check); #19 L3420-3448 (UUID dismissal Ended POST not asserted); #57 L4703-4736 (Idle only, not Done); #62 L4861-4878 (closed pipe only, no TTY case)",
+  "required_change": "#1: assert health['port']==mock_port. #19: assert the mock history contains {state: Ended, session_id: 'test_v_uuid_123'}. #57: add a Done session. #62: run the guard with stdin attached to a pty (pty.openpty) and no argv, and assert PASSTHROUGH within 1s.",
+  "area": "tests"
+ },
+ {
+  "id": "portability-guard-herdr-liveness",
+  "title": "Guard and Python liveness checks depend on real host processes (herdr, Bartender) and on platform tools",
+  "status": "portability",
+  "severity": "high",
+  "plan_refs": "\u00a710.1 #13, #21, #23, #53, #55, #60, #61, #67; \u00a78",
+  "code_refs": "guard L354 `pgrep -f \"Herdr.app\" || pgrep -xi herdr` (the -f form also false-matches any cmdline containing 'Herdr.app'); get_herdr_pid L176 `pgrep -xi` + `ps -o comm=`; get_bartender_pid L1458 `pgrep -x 'Bartender 6'`; get_process_start_time L63 `ps -o lstart=` parsed with a locale-dependent strptime; osascript L1916; perl/python3 capture L279-288; is_herdr_alive short-circuited by HERDR_BARTENDER_UNIT_TESTING L211",
+  "required_change": "Provide test PATH shims for pgrep, ps, osascript and stat (GNU- and BSD-flavored), controlled by files in the sandbox: e.g. shims/state/herdr_pids, bartender_pids, lstart.<pid>, and osascript writes calls to a log. procps-ng pgrep 4.0.4 here does support -x and -i, so the flags are not the problem; process presence is. Make the guard pgrep pattern anchored (e.g. `pgrep -f '/Herdr\\.app/Contents/MacOS/'`) to avoid self-matches. Remove the UNIT_TESTING liveness short-circuit in favor of the shims so Herdr-dead paths become testable.",
+  "area": "tests"
+ },
+ {
+  "id": "clock-injection",
+  "title": "\u00a710.2 injectable clock is not implemented",
+  "status": "missing",
+  "severity": "high",
+  "plan_refs": "\u00a710.2 'Injectable Clock Interface'",
+  "code_refs": "No clock abstraction. time.time()/time.time_ns()/time.monotonic() are called directly throughout. Tests only back-date last_event_at (L3313-3353) and use os.utime once (#57 L4710). Module globals PROCESS_ARRIVAL_TIME/_NS (L55-57) are frozen at import.",
+  "required_change": "Add a `FakeClock` test fixture that patches time.time, time.time_ns, time.monotonic and time.sleep in the loaded module namespace (the module imports `time`, so patch `mod.time` with a shim object or use unittest.mock.patch.object on time functions within a context). The fixture should support advance() and step_back(). Use it for exact boundary tests: TTLs, the 12h absence horizon, the 300s salvage horizon, lease deadline +0.5s grace rows (which currently rely on real-time sleeps in the #34 Row 4/5 offsets), the settling window and retry backoff.",
+  "area": "tests"
+ },
+ {
+  "id": "multiprocess-harness",
+  "title": "\u00a710.2 multi-process harness does not exist; every race test is sequential and in-process",
+  "status": "missing",
+  "severity": "high",
+  "plan_refs": "\u00a710.2 title; \u00a710.1 #6, #13, #27, #34, #42, #43, #48, #63",
+  "code_refs": "run_unit_tests L3080-5081 calls handlers in one process. Lease rows simulate other holders by editing the cache. The only real foreign process is `sleep 30` (L3946).",
+  "required_change": "Build a harness that (1) spawns N copies of bin/herdr-bartender with HERDR_PLUGIN_EVENT, HERDR_PLUGIN_EVENT_JSON and HERDR_PLUGIN_CONTEXT_JSON set and a sandboxed env, against (2) a mock bridge with per-request gates and an ordered log, with barrier-style release. Then assert the final cache and the bridge state. Required scenarios: concurrent close vs status, concurrent senders on one pane (lease), hung sender (SIGSTOP/SIGCONT a child to force takeover), deadline exit under a delayed bridge, and the reconciler singleton under concurrent spawn.",
+  "area": "tests"
+ },
+ {
+  "id": "live-test-flag",
+  "title": "\u00a710.2 `--live-test` flag is not recognized; code uses `--test` and the live test does not verify outcomes",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "\u00a710.2 live checklist item 1 (`./bin/herdr-bartender --live-test`)",
+  "code_refs": "main L5149 `if \"--test\" in args`; README L55 documents --test; run_live_test L5084-5139 only prints and never asserts that /health sessions return to 0. Running `--live-test` today silently falls through to normal event dispatch and exits 0 with no output.",
+  "required_change": "Accept `--live-test`, keeping `--test` as an alias. Record health['sessions'] before and after, and assert the post-Ended count equals the baseline (or 0). Exit non-zero on failure, then update the README. Document live checklist items 2-3 (Herdr symlink, vendor handover via killall herdr) as a scripted or manual procedure in docs, optionally with a `--live-test --handover` interactive mode.",
+  "area": "tests"
+ },
+ {
+  "id": "suite-structure",
+  "title": "Suite is one 2,000-line function with bare asserts that stops on first failure, and tests depend on each other's leftover state",
+  "status": "test-weak",
+  "severity": "high",
+  "plan_refs": "\u00a710.1 preamble",
+  "code_refs": "run_unit_tests L3080-5081. Bare asserts are stripped under `python -O`. #3 depends on the session count from #2 (L3164). Earlier sections leave sessions behind (e.g. 'herdr:macbook:*'). server.shutdown is only reached on success (L5080). Plan items 1-23 do not line up with the code's section numbers (code #13/#14 cover plan #15, code #16 is extra, plan #4 has no section).",
+  "required_change": "Move to stdlib unittest under tests/, one file per area: test_bridge_contract, test_lifecycle, test_cascades_tombstones, test_generations_ordering, test_spool, test_cache_salvage, test_leases, test_reconciler, test_orphans_cleanup, test_hook_guard, test_install_hooks, test_parity, test_multiprocess. Base TestCase setUp gives a fresh sandbox (HOME, XDG_STATE_HOME, HERDR_PLUGIN_STATE_DIR, PATH shims, env scrub) and loads the script with importlib.machinery.SourceFileLoader('herdr_bartender', 'bin/herdr-bartender'). Note that import runs `ps` at module load (L72 PROCESS_START_TIME), so the shims must be in place first. A class-level mock bridge fixture uses a scripted response queue, gate Events and a full request log including failed requests. Use self.assert* everywhere and name each test after its plan number (test_p23_...). `--unit-test` should run `unittest.defaultTestLoader.discover(<repo>/tests)` and exit with that status, falling back to an error if tests/ is missing. Helpers worth keeping and moving into tests/support: MockBartenderHandler (extend it), the 'guard template + echo SENTINEL' script builder, the FIFO stalled-writer pattern from #46/#56, the `sleep 30` live-PID plus get_process_start_time lease fixture, direct cache seeding via `with BoundedSessionCache(...) as data: ...; save()`, os.utime marker aging, run_reconcile_background(loop_once=True), the reject_complex_ended flag, ensure_reconciler_running being a no-op under the test env, and the _raw_post_event IN_CRITICAL_SECTION raise as an invariant oracle.",
+  "area": "tests"
+ },
+ {
+  "id": "plan-contradiction-count",
+  "title": "Plan says '60 core invariants' but lists 68",
+  "status": "plan-contradiction",
+  "severity": "low",
+  "plan_refs": "\u00a710.1 L1203 vs items 1-68 (L1204-1271)",
+  "code_refs": "n/a",
+  "required_change": "Change the plan to '68'. All 68 are normative, and items 61-68 are referenced elsewhere in the spec.",
+  "area": "tests"
+ },
+ {
+  "id": "plan-contradiction-dismissal-attempts",
+  "title": "Plan disagrees on the dismissal retry cap (3 vs 5) and on the purge criteria",
+  "status": "plan-contradiction",
+  "severity": "medium",
+  "plan_refs": "\u00a75.1 L645 ('3 attempts') vs L646, \u00a71 L43, L56, \u00a710.1 #65 L1268 ('5 attempts'); L43/L56 example schedule t=0,2,4,6,8,10 is 6 sends; L56 adds a purge if age >60s",
+  "code_refs": "reconciler L1549-1568 uses 5 attempts and 10s, with no 60s age purge visible; test #65 comment L4984 uses the 3 reading",
+  "required_change": "Treat 5 attempts, a 2.0s interval and a 10s window as authoritative: it appears in 4 places, matches the code and is what #65 asserts. Delete L645, change the example schedule to t=0,2,4,6,8 (5 sends), and either implement and test the 60s age purge from L56 or remove it from the plan.",
+  "area": "tests"
+ },
+ {
+  "id": "subprocess-no-timeout",
+  "title": "pgrep/ps liveness probes run with no subprocess timeout on the watchdog-bounded hot path",
+  "status": "missing",
+  "severity": "high",
+  "plan_refs": "plan \u00a76.1 L700-706 (bounded operations), budget table L712 (liveness check worst case 35ms), \u00a71 L135 (liveness gate before every send)",
+  "code_refs": "bin/herdr-bartender get_process_start_time L63, get_herdr_pid L176 and L185, get_bartender_pid L1458: subprocess.run(...) without timeout=. get_bartender_pid is called from _raw_post_event L827 on every send, PROCESS_START_TIME forks ps at import (L76), and is_process_instance_alive forks ps inside the Step A critical section",
+  "required_change": "Pass timeout=0.1 (or min(0.1, time_remaining()-0.3)) to every ps/pgrep call and catch subprocess.TimeoutExpired. On timeout, treat the result as unknown: the liveness gate returns 'unknown, defer to reconciler' and the start time is None, never a fabricated value. Also run ps with env LC_ALL=C. Combine this with the 0.5s memo the liveness-cache gap already requires. Add a test where a PATH shim makes pgrep sleep 5s and assert that the handler process still exits within 1.5s.",
+  "area": "critic"
+ },
+ {
+  "id": "save-errors-swallowed",
+  "title": "BoundedSessionCache.save() swallows write failures, so callers send over the network on a lease/seq that was never persisted",
+  "status": "divergent",
+  "severity": "high",
+  "plan_refs": "plan \u00a76.2 L730-733 (every mutation is atomically persisted), \u00a74.3 Step A then B ordering (lease claim persisted before transmission), user rule 'never silently swallow errors'",
+  "code_refs": "save() L1096-1164: `except Exception as e: log_debug(...)` returns normally; tmp_path is left behind; every handler then proceeds to post_bartender_event (e.g. handle_agent_status_changed L2392-2396) as if the lease, seq and desired_payload were on disk",
+  "required_change": "Make save() raise a CacheWriteError (or return False). Unlink tmp_path on failure. In Step A, a failed save must abort the send path: enqueue to the spool if possible, touch reconciler.pending and exit 0. In Step C, a failed save must write a results/ envelope so the confirmation is not lost. Add a test that makes the state dir read-only (or monkeypatches os.replace to raise) and asserts that no POST was made and that a spool or results file or log line exists.",
+  "area": "critic"
+ },
+ {
+  "id": "vendor-dismissal-send-before-stage",
+  "title": "cleanup_vendor_active sends the vendor Ended before staging the dismissal in cache, the reverse of the stage-then-dispatch rule",
+  "status": "divergent",
+  "severity": "medium",
+  "plan_refs": "plan \u00a71 L9 (dismissals are staged under lock and dispatched outside the lock), L56 (record uuid with attempts:1 and last_attempt), \u00a75.1 5a/5b",
+  "code_refs": "cleanup_vendor_active L751-791: _raw_post_event first, then unlink .vendor_active, then a separate lock to add dismissed_vendor_uuids[v_sid] without attempts/last_attempt; all exceptions are swallowed",
+  "required_change": "Under the cache lock, first record dismissed_vendor_uuids[uuid] = {timestamp, pane_hex, attempts: 0, last_attempt: 0}. Release the lock, then POST (budget-gated by time_remaining() > 0.3). Then re-lock and set attempts=1 and last_attempt, and purge the entry on ok:true. Only after the entry is recorded may .vendor_active be unlinked. If the process is killed between the send and the record, the reconciler then still owns the retry. Add a test that kills the process (raises SystemExit) right after the POST and asserts the dismissal survives in the cache.",
+  "area": "critic"
+ },
+ {
+  "id": "watchdog-handler-io",
+  "title": "SIGALRM handler does unlocked cache reads, log I/O and a raw Popen that skips the singleton or unit-test guard; its spawn criterion differs from the spec",
+  "status": "partial",
+  "severity": "medium",
+  "plan_refs": "plan \u00a73.4 L245 (handler sets PENDING_WATCHDOG_EXIT, zero file I/O in handler context; outside critical sections, a non-blocking helper spawn then exit 0), \u00a76.1 L727-729",
+  "code_refs": "_timeout_watchdog L111-134: log_debug (which may rotate the log), open and json.load of active-sessions.json without the lock, subprocess.Popen directly (not ensure_reconciler_running, so the HERDR_BARTENDER_UNIT_TESTING no-op is skipped), spawn only if delivered_seq<seq or Ended, ignoring pending_compensations, pending_vendor_cleanups, spool and results",
+  "required_change": "Reduce the handler to: set PENDING_WATCHDOG_EXIT=True; if IN_CRITICAL_SECTION, return; otherwise touch reconciler.pending (a single open/close, or os.utime), call ensure_reconciler_running() and os._exit(0) (or sys.exit(0)). The spawn decision belongs to the reconciler, which exits on its own when there is nothing to do. Add a test that calls _timeout_watchdog with IN_CRITICAL_SECTION False and asserts exactly one spawn request through the test hook, with no cache read.",
+  "area": "critic"
+ },
+ {
+  "id": "pane-closed-suffix-match",
+  "title": "handle_pane_closed matches sessions by sid suffix, so closing w1:p1 also closes a multi-colon pane x:w1:p1",
+  "status": "divergent",
+  "severity": "low",
+  "plan_refs": "plan \u00a72.1 L151 (evict the matching pane session), PANE_ID regex allows multi-colon IDs (L15)",
+  "code_refs": "handle_pane_closed L2597 and L2609: `info.get('pane_id') == canonical_pane or sid.endswith(f':{canonical_pane}')`",
+  "required_change": "Match only on equality: info.get('pane_id') == canonical_pane, or sid == f\"herdr:{data['host']}:{canonical_pane}\". Add a regression test with the sessions w1:p1 and x:w1:p1 where closing w1:p1 leaves x:w1:p1 intact. This is separate from the auditors' tab and workspace loose-match finding.",
+  "area": "critic"
+ },
+ {
+  "id": "save-reads-orphans-under-lock",
+  "title": "save() reads ~/.herdr-bartender-orphans.json inside the cache critical section without the orphan lock",
+  "status": "divergent",
+  "severity": "low",
+  "plan_refs": "plan \u00a71 L108 (orphan file operations are executed strictly OUTSIDE the cache lock, <10ms CPU bound), \u00a75.1 item 12, L107 (pane_generations prune protects orphan-referenced keys)",
+  "code_refs": "BoundedSessionCache.save L1129-1145 (json.load of the orphan file during the 512-cap prune, path hard-coded via Path.home())",
+  "required_change": "Compute the protected orphan pane set outside the lock: read it under the orphan lock before entering the cache lock, or persist an 'orphan_panes' set in the cache whenever export_orphan_record or remove_orphan_record runs. Pass that set into the prune. Resolve the orphan path through the shared get_orphan_path() so tests can sandbox it.",
+  "area": "critic"
+ },
+ {
+  "id": "manifest-no-argv-event",
+  "title": "Manifest [[events]] commands do not pass the event name, so the spec's argv fallback cannot work",
+  "status": "partial",
+  "severity": "low",
+  "plan_refs": "plan \u00a73.4 L243 (invoked as ./bin/herdr-bartender <event_name>; argv ${1:-} fallback when stdin is empty or malformed)",
+  "code_refs": "herdr-plugin.toml [[events]] command = [\"./bin/herdr-bartender\"] for all four events; main() L5213 never reads argv[1]",
+  "required_change": "Confirm whether Herdr appends the event name to the command. If it does not, set the command per event, e.g. [\"./bin/herdr-bartender\", \"pane.closed\"]. Pair this with the main-stdin-envelope fix so that argv[1], when it is not a flag, is the fallback event name. Add a manifest lint test asserting that each [[events]] entry's command, plus the event name, resolves to a known handler.",
+  "area": "critic"
+ }
+]
