@@ -6,9 +6,15 @@ import os
 import re
 import socket
 
+from .log import log_debug, log_warning
+
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7823
+PORT_ENV = "NOTCHBAR_AGENTS_PORT"
+MIN_PORT = 1024
+MAX_PORT = 65535
+_PORT_REGEX = re.compile(r'^[0-9]{1,5}$')
 
 AGENT_NAME_OVERRIDES = {
     "claude": "Claude",
@@ -28,21 +34,45 @@ STATUS_MAP = {
     "idle": "Idle",         # Idle at prompt
 }
 
-CSI_REGEX = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
-OSC_REGEX = re.compile(r'\x1b\][^\x07\x1b]*(\x07|\x1b\\)')
-DCS_REGEX = re.compile(r'\x1bP[^\x1b]*\x1b\\')
-CONTROL_REGEX = re.compile(r'[\x00-\x1f\x7f-\x9f]')
 PANE_ID_REGEX = re.compile(r'^[a-zA-Z0-9_:-]{1,48}$')
 CONTAINER_ID_REGEX = re.compile(r'^[a-zA-Z0-9_:-]{1,48}$')
 SESSION_ID_REGEX = re.compile(r'^herdr:[a-zA-Z0-9_-]{1,32}:[a-zA-Z0-9_:-]{1,48}$')
 
 
+HOST_MAX_LEN = 32
+
+
 def get_sanitized_hostname() -> str:
-    raw = socket.gethostname().split('.')[0].lower()
-    clean = re.sub(r'[^a-z0-9_-]', '', raw)
-    return clean or "local"
+    """Plan §2.3 session_id row: lowercase short host, [a-z0-9_-] only, at most 32 chars, else 'local'."""
+    try:
+        raw = socket.gethostname()
+    except OSError as e:
+        log_debug(f"gethostname failed ({e}); using 'local'")
+        raw = ""
+    clean = re.sub(r'[^a-z0-9_-]', '', raw.split('.')[0].lower())
+    return clean[:HOST_MAX_LEN] or "local"
+
+
+def parse_port(raw: str | None) -> int | None:
+    """Strictly parse a bridge port: a 1-5 digit integer in 1024-65535, else None."""
+    if raw is None or not _PORT_REGEX.match(raw):
+        return None
+    port = int(raw)
+    return port if MIN_PORT <= port <= MAX_PORT else None
+
+
+def get_bridge_port() -> int:
+    """Validated NOTCHBAR_AGENTS_PORT (Plan §8): unset/empty -> 7823; invalid -> 7823 plus a warning."""
+    raw = os.environ.get(PORT_ENV)
+    if not raw:
+        return DEFAULT_PORT
+    port = parse_port(raw)
+    if port is None:
+        log_warning(f"invalid {PORT_ENV}={raw!r} (need integer {MIN_PORT}-{MAX_PORT}); using {DEFAULT_PORT}")
+        return DEFAULT_PORT
+    return port
 
 
 def get_bridge_url() -> str:
-    port = os.environ.get("NOTCHBAR_AGENTS_PORT") or str(DEFAULT_PORT)
-    return f"http://127.0.0.1:{port}"
+    """Literal-loopback bridge URL (Plan §8 L1087: no hostname resolution)."""
+    return f"http://{DEFAULT_HOST}:{get_bridge_port()}"

@@ -6,20 +6,20 @@ min_herdr_version = "0.9.0"
 platforms = ["macos"]
 
 [[startup]]
-command = ["./bin/herdr-bartender", "--cleanup"]
+command = ["./bin/herdr-bartender", "--reconcile-background"]
 
 [[events]]
 on = "pane.agent_status_changed"
-command = ["./bin/herdr-bartender"]
+command = ["./bin/herdr-bartender", "pane.agent_status_changed"]
 
 [[events]]
 on = "pane.closed"
-command = ["./bin/herdr-bartender"]
+command = ["./bin/herdr-bartender", "pane.closed"]
 
 [[events]]
 on = "tab.closed"
-command = ["./bin/herdr-bartender"]
+command = ["./bin/herdr-bartender", "tab.closed"]
 
 [[events]]
 on = "workspace.closed"
-command = ["./bin/herdr-bartender"]
+command = ["./bin/herdr-bartender", "workspace.closed"]

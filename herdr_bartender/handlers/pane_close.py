@@ -7,13 +7,12 @@ import os
 from .. import clock
 from ..bridge import post_bartender_event
 from ..cache import BoundedSessionCache
-from ..config import PANE_ID_REGEX
 from ..log import log_debug
 from ..markers import remove_pane_marker, touch_heartbeat, touch_pane_failed
 from ..orphans import export_orphan_record, remove_orphan_record
 from ..paths import get_state_dir
 from ..process import is_process_instance_alive, own_start_time
-from ..sanitize import normalize_pane_id
+from ..intake import PANE_CLOSED, build_close_payload, resolve_host, resolve_identity, session_matches_pane
 from ..sender import ensure_reconciler_running, touch_reconciler_pending
 from ..vendor import cleanup_vendor_active
 
@@ -21,18 +20,14 @@ from ..vendor import cleanup_vendor_active
 def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None = None, arrival_ns: int | None = None, spool_generation: int | None = None):
     touch_heartbeat()
     arr_ns = arrival_ns or clock.time_ns()
-    raw_pane = event_data.get("pane_id") or context.get("focused_pane_id")
-    workspace_id = event_data.get("workspace_id") or context.get("workspace_id")
-    if not workspace_id and ":" in raw_pane:
-        workspace_id = raw_pane.split(":", 1)[0]
-    if ":" not in raw_pane and not workspace_id:
-        log_debug(f"Rejecting colon-less pane ID {raw_pane} without workspace_id")
+    event_data = event_data if isinstance(event_data, dict) else {}
+    # Identity from event data only: never the focused pane or context.workspace_id (§2.3, R1/R2).
+    identity, notes = resolve_identity(event_data, {})
+    for note in notes:
+        log_debug(note)
+    if identity is None:
         return
-
-    canonical_pane = normalize_pane_id(raw_pane, workspace_id)
-    if not PANE_ID_REGEX.match(canonical_pane):
-        log_debug(f"Invalid canonical pane ID: {canonical_pane}")
-        return
+    canonical_pane = identity.canonical_pane
     cache_mgr = BoundedSessionCache(get_state_dir())
     target_sessions = []
     now_wall = clock.time()
@@ -40,9 +35,10 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
 
     with cache_mgr as data:
         sessions = data.get("sessions", {})
+        host = resolve_host(data.get("host"))
         matching_last_source_ts = 0.0
         for sid, info in sessions.items():
-            if info.get("pane_id") == canonical_pane or sid.endswith(f":{canonical_pane}"):
+            if session_matches_pane(sid, info, canonical_pane, host):
                 ts = info.get("last_source_timestamp", 0.0)
                 if ts and ts > matching_last_source_ts:
                     matching_last_source_ts = ts
@@ -54,7 +50,7 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
         }
 
         for sid, info in list(sessions.items()):
-            if info.get("pane_id") == canonical_pane or sid.endswith(f":{canonical_pane}"):
+            if session_matches_pane(sid, info, canonical_pane, host):
                 if spool_generation is not None and info.get("generation", 1) > spool_generation:
                     log_debug(f"Ignoring spooled close with older generation {spool_generation} < {info.get('generation')}")
                     continue
@@ -66,6 +62,8 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
                 info["seq"] = seq
                 info["closed_at_ns"] = arr_ns
                 info["close_kind"] = "container"
+                close_payload = build_close_payload(sid, info, PANE_CLOSED, seq)
+                info["desired_payload"] = close_payload
                 lease_deadline = info.get("lease_deadline") or 0.0
                 sending_pid = info.get("sending_pid")
                 l_tok = info.get("lease_token") or ""
@@ -79,7 +77,7 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
                     info["lease_deadline"] = now_wall + 1.5
                     my_resync_gen = info.get("resync_generation", 0)
                     info["lease_resync_gen"] = my_resync_gen
-                    target_sessions.append((sid, canonical_pane, info.get("agent", "Herdr"), seq, my_token, my_resync_gen))
+                    target_sessions.append((sid, canonical_pane, close_payload, seq, my_token, my_resync_gen))
                 else:
                     touch_reconciler_pending()
                     ensure_reconciler_running()
@@ -87,11 +85,8 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None =
             cache_mgr.save(data)
 
     # Dispatch Ended outside lock
-    for sid, pane_id, agent_name, target_seq, my_token, my_resync_gen in target_sessions:
-        success, is_non_retryable = post_bartender_event(
-            {"state": "Ended", "agent": agent_name, "session_id": sid},
-            bridge_url=bridge_url
-        )
+    for sid, pane_id, close_payload, target_seq, my_token, my_resync_gen in target_sessions:
+        success, is_non_retryable = post_bartender_event(close_payload, bridge_url=bridge_url)
         vendor_to_clean = None
         orphans_to_export = []
         orphans_to_remove = []

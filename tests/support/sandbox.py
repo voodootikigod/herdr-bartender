@@ -37,17 +37,26 @@ SCRUB_NAMES = (
 )
 DEFAULT_LSTART = "Sat Oct  4 09:00:00 2026"
 TEST_DEADLINE_SECONDS = 60.0
+DEFAULT_BARTENDER_PID = 424200
 
 
 class SandboxTestCase(unittest.TestCase):
     """Base class: fresh sandbox, PATH shims, mock bridge and reset runtime state."""
 
     start_bridge = True
+    # Register a fake `Bartender 6` and a live fake Herdr by default so the bridge
+    # liveness gate and is_herdr_alive() decide from the shim process table alone.
+    # Tests that manage the process table themselves set this to False.
+    default_liveness = True
 
     def setUp(self) -> None:
         super().setUp()
+        self._preserve_umask()
         self._install_env()
         self._reset_runtime()
+        if self.default_liveness:
+            self.add_fake_process("Bartender 6", pid=DEFAULT_BARTENDER_PID)
+            self.set_herdr_alive()
         if self.start_bridge:
             self.bridge = MockBridge().start()
             self.addCleanup(self.bridge.stop)
@@ -88,6 +97,12 @@ class SandboxTestCase(unittest.TestCase):
             "HB_REAL_PATH": real_path,
             "PATH": f"{SHIM_DIR}{os.pathsep}{real_path}",
         })
+
+    def _preserve_umask(self) -> None:
+        """In-process runtime.mark_process_start() applies umask 077; undo it after each test."""
+        saved = os.umask(0o022)
+        os.umask(saved)
+        self.addCleanup(os.umask, saved)
 
     @staticmethod
     def _restore_env(saved: dict) -> None:

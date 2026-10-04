@@ -7,9 +7,19 @@ single copy.
 
 from __future__ import annotations
 
-from . import clock
+import signal
+from typing import Optional
+
+from . import clock, paths
 
 DEFAULT_DEADLINE_SECONDS = 1.4
+
+# Deadline modes (Plan §6.1). The ``time_remaining() - 0.3`` budget formulas bind only the
+# watchdog-bounded event path; the reconciler, --cleanup and --replay-orphans are exempt
+# from the 1.5s watchdog (Plan L619, L686) and use their callers' own timeouts.
+DEADLINE_BOUNDED = "bounded"
+DEADLINE_UNBOUNDED = "unbounded"
+_DEADLINE_MODES = (None, DEADLINE_BOUNDED, DEADLINE_UNBOUNDED)
 
 PROCESS_DEADLINE_SECONDS = DEFAULT_DEADLINE_SECONDS
 START_TIME = clock.monotonic()
@@ -20,6 +30,8 @@ IN_CRITICAL_SECTION = False
 PENDING_WATCHDOG_EXIT = False
 # Resolved lazily by process.own_start_time(); never looked up at import.
 PROCESS_START_TIME = None
+# None: inferred by deadline_bounded(); otherwise DEADLINE_BOUNDED / DEADLINE_UNBOUNDED.
+DEADLINE_MODE: Optional[str] = None
 
 
 def mark_process_start() -> None:
@@ -30,8 +42,12 @@ def mark_process_start() -> None:
     package, runtime is imported before ~20 sibling modules (which may need
     compiling when bytecode cannot be cached); cli.main() calls this first so the
     budget is measured from the same point as before.
+
+    Being main()'s first statement, it is also where the process takes the private
+    umask 077 (Plan §8 L1089), before any state file or directory is created.
     """
     global START_TIME, PROCESS_ARRIVAL_TIME, PROCESS_ARRIVAL_TIME_NS, MODULE_LOAD_TIME
+    paths.apply_private_umask()
     START_TIME = clock.monotonic()
     PROCESS_ARRIVAL_TIME = clock.time()
     PROCESS_ARRIVAL_TIME_NS = clock.time_ns()
@@ -42,6 +58,47 @@ def time_remaining() -> float:
     elapsed = clock.monotonic() - START_TIME
     rem = PROCESS_DEADLINE_SECONDS - elapsed
     return max(0.1, rem)
+
+
+def set_deadline_mode(mode: Optional[str]) -> None:
+    """Declare this process bounded/unbounded (None: infer it). Entry points call this once."""
+    global DEADLINE_MODE
+    if mode not in _DEADLINE_MODES:
+        raise ValueError(f"unknown deadline mode: {mode!r}")
+    DEADLINE_MODE = mode
+
+
+def _watchdog_armed() -> bool:
+    """True while an ITIMER_REAL (the SIGALRM watchdog) is pending."""
+    getitimer = getattr(signal, "getitimer", None)
+    if getitimer is None or not hasattr(signal, "ITIMER_REAL"):
+        return False
+    try:
+        return getitimer(signal.ITIMER_REAL)[0] > 0
+    except (OSError, ValueError):
+        return False
+
+
+def deadline_bounded() -> bool:
+    """True when this process must honour the Plan §6.1 1.5s budget.
+
+    An explicit DEADLINE_MODE wins. Otherwise the process is bounded while the
+    SIGALRM watchdog is armed (or has fired), and during its first
+    PROCESS_DEADLINE_SECONDS (the event path's identity warm-up before
+    arm_watchdog()). Past that window with no watchdog it is an unbounded mode
+    (reconciler, --cleanup, --replay-orphans): time_remaining() is pinned at its
+    floor there and must not shrink every timeout to the minimum.
+    """
+    if DEADLINE_MODE is not None:
+        return DEADLINE_MODE == DEADLINE_BOUNDED
+    if PENDING_WATCHDOG_EXIT or _watchdog_armed():
+        return True
+    return clock.monotonic() - START_TIME < PROCESS_DEADLINE_SECONDS
+
+
+def budget_allows(reserve: float) -> bool:
+    """Plan §6.1 gate ``time_remaining() > reserve``; always True outside the bounded path."""
+    return not deadline_bounded() or time_remaining() > reserve
 
 
 def snapshot() -> dict:
@@ -57,6 +114,7 @@ def snapshot() -> dict:
             "IN_CRITICAL_SECTION",
             "PENDING_WATCHDOG_EXIT",
             "PROCESS_START_TIME",
+            "DEADLINE_MODE",
         )
     }
 

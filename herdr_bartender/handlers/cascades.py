@@ -7,7 +7,15 @@ import os
 from .. import clock
 from ..bridge import post_bartender_event
 from ..cache import BoundedSessionCache
-from ..config import CONTAINER_ID_REGEX
+from ..intake import (
+    TAB_CLOSED,
+    WORKSPACE_CLOSED,
+    build_close_payload,
+    container_id,
+    loggable,
+    session_matches_tab,
+    session_matches_workspace,
+)
 from ..log import log_debug
 from ..markers import remove_pane_marker, touch_heartbeat, touch_pane_failed
 from ..orphans import export_orphan_record, remove_orphan_record
@@ -20,12 +28,13 @@ from ..vendor import cleanup_vendor_active
 def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = None, arrival_ns: int | None = None, spool_generation: int | None = None):
     touch_heartbeat()
     arr_ns = arrival_ns or clock.time_ns()
-    tab_id = event_data.get("tab_id") or (context.get("tab_id") if context.get("focused_pane_id") else None)
+    event_data = event_data if isinstance(event_data, dict) else {}
+    # Exact container ids from event data only; no focused-context fallback (§2.1, gap cascade-container-matching).
+    tab_id = container_id(event_data, "tab_id")
     if not tab_id:
+        log_debug(f"Ignoring tab.closed without a valid tab_id: {loggable(event_data.get('tab_id'))}")
         return
-    if not CONTAINER_ID_REGEX.match(str(tab_id)):
-        log_debug(f"Invalid tab_id: {tab_id}")
-        return
+    closed_ws = container_id(event_data, "workspace_id")
 
     cache_mgr = BoundedSessionCache(get_state_dir())
     target_sessions = []
@@ -35,8 +44,7 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
     with cache_mgr as data:
         sessions = data.get("sessions", {})
         for sid, info in list(sessions.items()):
-            s_tab = info.get("tab_id")
-            if s_tab and (s_tab == tab_id or tab_id.endswith(str(s_tab))):
+            if session_matches_tab(info, tab_id, closed_ws):
                 if spool_generation is not None and info.get("generation", 1) > spool_generation:
                     continue
                 if info.get("admitted_at_ns", 0) > arr_ns:
@@ -46,6 +54,8 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
                 info["seq"] = seq
                 info["closed_at_ns"] = arr_ns
                 info["close_kind"] = "container"
+                close_payload = build_close_payload(sid, info, TAB_CLOSED, seq)
+                info["desired_payload"] = close_payload
                 lease_deadline = info.get("lease_deadline") or 0.0
                 sending_pid = info.get("sending_pid")
                 l_tok = info.get("lease_token") or ""
@@ -59,7 +69,7 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
                     info["lease_deadline"] = now_wall + 1.5
                     my_resync_gen = info.get("resync_generation", 0)
                     info["lease_resync_gen"] = my_resync_gen
-                    target_sessions.append((sid, info.get("pane_id"), info.get("agent", "Herdr"), seq, my_token, my_resync_gen))
+                    target_sessions.append((sid, info.get("pane_id"), close_payload, seq, my_token, my_resync_gen))
                     if info.get("pane_id"):
                         p_pane = info.get("pane_id")
                         closed_source_ts = max(float(event_data.get("timestamp") or 0.0), info.get("last_source_timestamp", 0.0), float(arr_ns) / 1e9)
@@ -89,11 +99,8 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
             cache_mgr.save(data)
         ensure_reconciler_running()
 
-    for sid, pane_id, agent_name, target_seq, my_token, my_resync_gen in sync_sessions:
-        success, is_non_retryable = post_bartender_event(
-            {"state": "Ended", "agent": agent_name, "session_id": sid},
-            bridge_url=bridge_url
-        )
+    for sid, pane_id, close_payload, target_seq, my_token, my_resync_gen in sync_sessions:
+        success, is_non_retryable = post_bartender_event(close_payload, bridge_url=bridge_url)
         vendor_to_clean = None
         orphans_to_export = []
         orphans_to_remove = []
@@ -169,11 +176,10 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
 def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | None = None, arrival_ns: int | None = None, spool_generation: int | None = None):
     touch_heartbeat()
     arr_ns = arrival_ns or clock.time_ns()
-    workspace_id = event_data.get("workspace_id") or (context.get("workspace_id") if context.get("focused_pane_id") else None)
+    event_data = event_data if isinstance(event_data, dict) else {}
+    workspace_id = container_id(event_data, "workspace_id")
     if not workspace_id:
-        return
-    if not CONTAINER_ID_REGEX.match(str(workspace_id)):
-        log_debug(f"Invalid workspace_id: {workspace_id}")
+        log_debug(f"Ignoring workspace.closed without a valid workspace_id: {loggable(event_data.get('workspace_id'))}")
         return
 
     cache_mgr = BoundedSessionCache(get_state_dir())
@@ -184,8 +190,7 @@ def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | N
     with cache_mgr as data:
         sessions = data.get("sessions", {})
         for sid, info in list(sessions.items()):
-            s_ws = info.get("workspace_id")
-            if s_ws and (s_ws == workspace_id or f":{workspace_id}:" in sid):
+            if session_matches_workspace(info, workspace_id):
                 if spool_generation is not None and info.get("generation", 1) > spool_generation:
                     continue
                 if info.get("admitted_at_ns", 0) > arr_ns:
@@ -197,6 +202,8 @@ def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | N
                 closed_source_ts = max(float(event_data.get("timestamp") or 0.0), info.get("last_source_timestamp", 0.0), float(arr_ns) / 1e9)
                 info["closed_source_ts"] = closed_source_ts
                 info["close_kind"] = "container"
+                close_payload = build_close_payload(sid, info, WORKSPACE_CLOSED, seq)
+                info["desired_payload"] = close_payload
                 lease_deadline = info.get("lease_deadline") or 0.0
                 sending_pid = info.get("sending_pid")
                 l_tok = info.get("lease_token") or ""
@@ -209,7 +216,7 @@ def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | N
                     info["sending_pid"] = my_pid
                     info["lease_deadline"] = now_wall + 1.5
                     my_resync_gen = info.get("resync_generation", 0)
-                    target_sessions.append((sid, info.get("pane_id"), info.get("agent", "Herdr"), seq, my_token, my_resync_gen))
+                    target_sessions.append((sid, info.get("pane_id"), close_payload, seq, my_token, my_resync_gen))
                     if info.get("pane_id"):
                         p_pane = info.get("pane_id")
                         data.setdefault("tombstones", {})[p_pane] = {
@@ -237,11 +244,8 @@ def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | N
             cache_mgr.save(data)
         ensure_reconciler_running()
 
-    for sid, pane_id, agent_name, target_seq, my_token, my_resync_gen in sync_sessions:
-        success, is_non_retryable = post_bartender_event(
-            {"state": "Ended", "agent": agent_name, "session_id": sid},
-            bridge_url=bridge_url
-        )
+    for sid, pane_id, close_payload, target_seq, my_token, my_resync_gen in sync_sessions:
+        success, is_non_retryable = post_bartender_event(close_payload, bridge_url=bridge_url)
         vendor_to_clean = None
         orphans_to_export = []
         orphans_to_remove = []

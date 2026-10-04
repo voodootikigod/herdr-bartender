@@ -39,6 +39,7 @@ class SandboxIsolationTests(SandboxTestCase):
 
 class ShimTests(SandboxTestCase):
     start_bridge = False
+    default_liveness = False  # this class drives the shim process table itself
 
     def test_pgrep_sees_only_fake_processes(self):
         """The pgrep shim never reports real processes (e.g. a real herdr on the host)."""
@@ -110,3 +111,31 @@ class MockBridgeTests(SandboxTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DefaultLivenessTests(SandboxTestCase):
+    """The sandbox registers a fake Bartender and a live fake Herdr so no production test-mode bypass is needed."""
+
+    def test_default_sandbox_has_bartender_and_herdr(self):
+        """Plan §1 L135 / §8 L1085 (gap liveness-gate-bypass): liveness comes from the shim table, not UNIT_TESTING."""
+        from herdr_bartender import process
+        self.assertIsNotNone(get_bartender_pid())
+        self.assertIs(process.herdr_liveness(), True)
+        self.assertEqual(post_bartender_event({"state": "Working", "agent": "A", "session_id": "d-1"},
+                                              bridge_url=self.mock_url), (True, False))
+
+    def test_umask_is_restored_after_each_test(self):
+        """Plan §8 L1089 (gap perms-umask): an in-process mark_process_start() (umask 077) does not leak."""
+
+        class _Inner(SandboxTestCase):
+            start_bridge = False
+
+            def runTest(self):
+                runtime.mark_process_start()
+
+        old = os.umask(0o022)
+        self.addCleanup(os.umask, old)
+        result = unittest.TestResult()
+        _Inner().run(result)
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        self.assertEqual(os.umask(0o022), 0o022)

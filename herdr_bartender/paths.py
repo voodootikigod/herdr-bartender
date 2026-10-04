@@ -7,6 +7,36 @@ from pathlib import Path
 
 VENDOR_HOOKS_DIR_ENV = "HERDR_BARTENDER_VENDOR_HOOKS_DIR"
 ORPHAN_FILE_NAME = ".herdr-bartender-orphans.json"
+PRIVATE_UMASK = 0o077
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+
+
+def apply_private_umask() -> int:
+    """Set the process umask to 077 (Plan §8 L1089); returns the previous mask.
+
+    Call it as the first statement of the process entry point so every file the
+    plugin creates (cache, markers, spool, results, logs) is 0600 and every
+    directory 0700.
+    """
+    return os.umask(PRIVATE_UMASK)
+
+
+def ensure_private_dir(path: Path) -> Path:
+    """Create ``path`` (and parents) and make the leaf directory 0700 (Plan §8 L1089).
+
+    Parents keep their default mode: they may be shared (e.g. $XDG_STATE_HOME/herdr).
+    Tightening an existing directory is best-effort: a directory we do not own
+    (or cannot chmod) stays usable rather than breaking the hook path.
+    """
+    path.mkdir(mode=PRIVATE_DIR_MODE, parents=True, exist_ok=True)
+    try:
+        st = path.stat()
+        if st.st_mode & 0o077 and st.st_uid == os.getuid():
+            os.chmod(path, PRIVATE_DIR_MODE)
+    except OSError:
+        pass  # best-effort hardening; callers still get a usable directory
+    return path
 
 
 def get_state_dir() -> Path:
@@ -19,8 +49,7 @@ def get_state_dir() -> Path:
             p = Path(xdg_state) / "herdr" / "plugins" / "herdr-bartender"
         else:
             p = Path.home() / ".local" / "state" / "herdr" / "plugins" / "herdr-bartender"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    return ensure_private_dir(p)
 
 
 def get_orphan_path() -> Path:

@@ -7,7 +7,6 @@ import os
 from .. import clock, runtime
 from ..bridge import _raw_post_event, post_bartender_event
 from ..cache import BoundedSessionCache
-from ..config import PANE_ID_REGEX, STATUS_MAP, get_sanitized_hostname
 from ..log import log_debug
 from ..markers import (
     clear_delivery_down,
@@ -21,46 +20,48 @@ from ..markers import (
 from ..orphans import export_orphan_record, remove_orphan_record
 from ..paths import get_state_dir
 from ..process import is_herdr_alive, is_process_instance_alive, own_start_time
-from ..sanitize import format_agent_name, normalize_pane_id, sanitize_title
+from ..intake import (
+    admit_status,
+    build_session_id,
+    classify_status,
+    loggable,
+    resolve_fields,
+    resolve_host,
+    resolve_identity,
+)
+from ..sanitize import format_agent_name
 from ..sender import ensure_reconciler_running, touch_reconciler_pending
 from ..vendor import cleanup_vendor_active
+
+
+def _as_dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
 
 
 def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str | None = None, arrival_time: float | None = None, arrival_ns: int | None = None, spool_generation: int | None = None):
     touch_heartbeat()
     arr_time = arrival_time or clock.time()
     arr_ns = arrival_ns or clock.time_ns()
-    raw_pane = event_data.get("pane_id") or context.get("focused_pane_id")
-    if not raw_pane:
-        return
-
-    focused_id = context.get("focused_pane_id")
-    is_focused = bool(focused_id and focused_id == raw_pane)
-
-    workspace_id = event_data.get("workspace_id")
-    if not workspace_id and ":" in raw_pane:
-        workspace_id = raw_pane.split(":", 1)[0]
-
-    if ":" not in raw_pane and not workspace_id:
-        log_debug(f"Rejecting colon-less pane ID {raw_pane} without workspace_id")
-        return
-
-    canonical_pane = normalize_pane_id(raw_pane, workspace_id)
-    if not canonical_pane or not PANE_ID_REGEX.match(canonical_pane):
-        log_debug(f"Invalid canonical pane ID: {canonical_pane}")
-        return
-
-    is_focused = bool(focused_id and focused_id in (canonical_pane, raw_pane))
-
-    if not workspace_id:
-        workspace_id = canonical_pane.split(":", 1)[0]
-
+    event_data, context = _as_dict(event_data), _as_dict(context)
     agent_status = event_data.get("agent_status")
+    identity, notes = resolve_identity(event_data, context)
+    for note in notes:
+        log_debug(note)
+    if identity is None:
+        return
+    canonical_pane = identity.canonical_pane
+    status_kind = classify_status(agent_status)
+    if status_kind == "unrecognized":
+        log_debug(f"Warning: unrecognized agent_status {loggable(agent_status)} for pane {canonical_pane}")
+        return
 
     cache_mgr = BoundedSessionCache(get_state_dir())
     with cache_mgr as data:
-        host = data.get("host") or get_sanitized_hostname()
-    session_id = f"herdr:{host}:{canonical_pane}" 
+        host = resolve_host(data.get("host"))
+    session_id = build_session_id(host, canonical_pane)
+    if not session_id:
+        log_debug(f"Rejecting out-of-bounds session_id for host {loggable(host)} pane {canonical_pane}")
+        return
 
     # 1. Critical section: Update cache & manage per-session monotonic lease
     with cache_mgr as data:
@@ -119,52 +120,19 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             return
         cached_s = sessions.get(session_id, {})
 
-        raw_agent = event_data.get("agent")
-        if not raw_agent and is_focused:
-            raw_agent = context.get("focused_pane_agent")
-        if not raw_agent and agent_status != "idle":
-            raw_agent = cached_s.get("raw_agent")
-
         # Anti-Flap Rule: Herdr may report unknown transiently during reattach/startup.
-        if agent_status == "unknown":
+        if status_kind == "unknown":
             log_debug(f"Debouncing transient unknown status for pane {canonical_pane}")
             return
 
-        # Qualification filter: pane must have agent metadata or already exist in cache
-        if cached_s and cached_s.get("desired_state") == "Ended":
-            if not raw_agent:
-                return  # Bare prompt does not resurrect an Ended session
-        elif not raw_agent and session_id not in sessions:
+        # §2.2 admission + Cases A/B/C, then §2.3 field resolution (intake.py)
+        admission = admit_status(agent_status, event_data, context, identity, cached_s)
+        if admission is None:
             return
-
-        if agent_status == "idle":
-            if raw_agent is not None and str(raw_agent).strip() != "":
-                mapped_state = "Idle"
-            elif session_id in sessions and cached_s.get("desired_state") != "Ended":
-                # Agent process exited interactive shell
-                mapped_state = "Ended"
-            else:
-                return  # Unassisted shell
-        else:
-            mapped_state = STATUS_MAP.get(agent_status)
-            if not mapped_state:
-                return
-
-        resolved_raw_agent = raw_agent
-        agent_name = format_agent_name(resolved_raw_agent)
-
-        raw_title = event_data.get("title") or cached_s.get("title") or (context.get("workspace_label") if is_focused else None) or f"Pane {canonical_pane}"
-        title = sanitize_title(raw_title)
-
-        cwd = event_data.get("cwd")
-        if not cwd and is_focused:
-            cwd = context.get("focused_pane_cwd")
-        if not cwd:
-            cwd = cached_s.get("cwd") or (context.get("workspace_cwd") if is_focused else "") or ""
-
-        tab_id = event_data.get("tab_id") or cached_s.get("tab_id") or (context.get("tab_id") if is_focused else None)
-        if not workspace_id or workspace_id == "default":
-            workspace_id = cached_s.get("workspace_id") or workspace_id
+        mapped_state, raw_agent = admission
+        agent_name = format_agent_name(raw_agent)
+        fields = resolve_fields(event_data, context, identity, cached_s)
+        title, cwd, tab_id, workspace_id = fields.title, fields.cwd, fields.tab_id, fields.workspace_id
 
         now_wall = clock.time()
         source_ts = event_data.get("timestamp")

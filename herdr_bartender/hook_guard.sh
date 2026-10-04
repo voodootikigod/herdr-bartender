@@ -1,6 +1,6 @@
 # BEGIN HERDR-BARTENDER DEDUP GUARD
 if [ -n "${HERDR_PANE_ID:-}" ]; then
-  if printf '%s' "$HERDR_PANE_ID" | grep -Eq '^[a-zA-Z0-9_:-]{1,48}$'; then
+  if printf '%s' "$HERDR_PANE_ID" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_:-]{1,48}$'; then
     _HB_CANONICAL_PANE=""
     if printf '%s' "$HERDR_PANE_ID" | grep -q ':'; then
       _HB_CANONICAL_PANE="$HERDR_PANE_ID"
@@ -9,11 +9,14 @@ if [ -n "${HERDR_PANE_ID:-}" ]; then
     else
       _HB_CANONICAL_PANE=""
     fi
-    if printf '%s' "$_HB_CANONICAL_PANE" | grep -Eq '^[a-zA-Z0-9_:-]{1,48}$'; then
+    if printf '%s' "$_HB_CANONICAL_PANE" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_:-]{1,48}$'; then
       _HB_STATE_HOME="${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/herdr-bartender}"
-      _HB_HEX_PANE=$(printf '%s' "$_HB_CANONICAL_PANE" | od -An -tx1 | tr -d ' \t\n')
+      _HB_HEX_PANE=$(printf '%s' "$_HB_CANONICAL_PANE" | LC_ALL=C od -An -v -tx1 | tr -d ' \t\n')
       _HB_PANE_MARKER="$_HB_STATE_HOME/panes/${_HB_HEX_PANE}"
       _HB_VENDOR_ACTIVE="$_HB_STATE_HOME/panes/${_HB_HEX_PANE}.vendor_active"
+      # R16: every file the guard writes is private; caller umask restored before the block ends.
+      _HB_OLD_UMASK=$(umask)
+      umask 077
 
       _HB_IS_SESSION_TERMINAL=0
       _HB_IS_TURN_TERMINAL=0
@@ -27,7 +30,7 @@ if [ -n "${HERDR_PANE_ID:-}" ]; then
           if [ -z "$_HB_RAW_SID" ]; then
             _HB_RAW_SID=$(printf '%s' "$1" | grep -m1 -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | sed 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
           fi
-          if printf '%s' "$_HB_RAW_SID" | grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
+          if printf '%s' "$_HB_RAW_SID" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
             _HB_ARGV_SID="$_HB_RAW_SID"
           fi
           if printf '%s' "$1" | grep -m1 -Eq '(\{|,)[[:space:]]*"(hook_event_name|event|state|type)"[[:space:]]*:[[:space:]]*"(Ended|SessionEnd|session-end)"' 2>/dev/null; then
@@ -44,11 +47,8 @@ if [ -n "${HERDR_PANE_ID:-}" ]; then
       _HB_CAPTURE_ERR=0
       if [ "$_HB_IS_SESSION_TERMINAL" -eq 0 ]; then
         if [ ! -t 0 ]; then
-          _HB_OLD_UMASK=$(umask)
-          umask 077
           mkdir -m 700 -p "$_HB_STATE_HOME" 2>/dev/null || true
           _HB_GUARD_TMP=$(mktemp "$_HB_STATE_HOME/.guard_stdin.XXXXXX" 2>/dev/null || true)
-          umask "$_HB_OLD_UMASK"
           if [ -n "$_HB_GUARD_TMP" ]; then
             if command -v perl >/dev/null 2>&1; then
               perl -e '$SIG{ALRM} = sub { exit 142 }; alarm 1; while (sysread(STDIN, my $b, 65536)) { print $b; } alarm 0; exit 0;' > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
@@ -70,8 +70,10 @@ signal.alarm(0)' > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
               if [ -s "$_HB_GUARD_TMP" ]; then
                 _HB_SPLICE_FIFO=$(mktemp -u "$_HB_STATE_HOME/.guard_splice.XXXXXX" 2>/dev/null || true)
                 if [ -n "$_HB_SPLICE_FIFO" ] && mkfifo "$_HB_SPLICE_FIFO" 2>/dev/null; then
-                  ( cat "$_HB_GUARD_TMP"; rm -f "$_HB_GUARD_TMP" 2>/dev/null || true; exec cat ) > "$_HB_SPLICE_FIFO" 2>/dev/null &
-                  exec < "$_HB_SPLICE_FIFO"
+                  # An async list gets /dev/null as stdin in POSIX shells (dash ignores a `<&0` override),
+                  # so hand the real stdin over on fd 9, scoped to the group so the caller's fd 9 is untouched.
+                  { ( cat "$_HB_GUARD_TMP"; rm -f "$_HB_GUARD_TMP" 2>/dev/null || true; exec cat <&9 9<&- ) > "$_HB_SPLICE_FIFO" 2>/dev/null & } 9<&0
+                  exec < "$_HB_SPLICE_FIFO" || true
                   rm -f "$_HB_SPLICE_FIFO" 2>/dev/null || true
                 else
                   rm -f "$_HB_GUARD_TMP" 2>/dev/null || true
@@ -106,7 +108,7 @@ signal.alarm(0)' > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
         if [ -z "$_HB_RAW_SID" ]; then
           _HB_RAW_SID=$(grep -m1 -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' "$_HB_GUARD_TMP" 2>/dev/null | head -n1 | sed 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
         fi
-        if printf '%s' "$_HB_RAW_SID" | grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
+        if printf '%s' "$_HB_RAW_SID" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
           _HB_VENDOR_SID="$_HB_RAW_SID"
         fi
         if grep -m1 -Eq '(\{|,)[[:space:]]*"(hook_event_name|event|state|type)"[[:space:]]*:[[:space:]]*"(Ended|SessionEnd|session-end)"' "$_HB_GUARD_TMP" 2>/dev/null; then
@@ -125,8 +127,17 @@ signal.alarm(0)' > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
       if [ ! -f "$_HB_STATE_HOME/DISABLED" ] && [ ! -f "$_HB_STATE_HOME/DELIVERY_DOWN" ] && [ -f "$_HB_PANE_MARKER" ] && [ ! -f "${_HB_PANE_MARKER}.failed" ]; then
         _HB_MARKER_MTIME=$(stat -c %Y "$_HB_PANE_MARKER" 2>/dev/null) || _HB_MARKER_MTIME=$(stat -f %m "$_HB_PANE_MARKER" 2>/dev/null) || _HB_MARKER_MTIME=0
         case "$_HB_MARKER_MTIME" in ''|*[!0-9]*) _HB_MARKER_MTIME=0 ;; esac
-        _HB_NOW_TIME=$(date +%s)
-        if [ $((_HB_NOW_TIME - _HB_MARKER_MTIME)) -lt 60 ] && (pgrep -f "Herdr.app" >/dev/null 2>&1 || pgrep -xi "herdr" >/dev/null 2>&1); then
+        _HB_NOW_TIME=$(date +%s 2>/dev/null) || _HB_NOW_TIME=0
+        case "$_HB_NOW_TIME" in ''|*[!0-9]*) _HB_NOW_TIME=0 ;; esac
+        # R15: exact process name, or an executable inside the app bundle (never a loose cmdline match).
+        # Fresh only when both clocks are known and 0 <= age < 60; a failed `date`/`stat` or a
+        # future (skewed) mtime is "unknown freshness" and must fail open (pass through).
+        _HB_MARKER_AGE=-1
+        if [ "$_HB_NOW_TIME" -gt 0 ] && [ "$_HB_MARKER_MTIME" -gt 0 ]; then
+          _HB_MARKER_AGE=$((_HB_NOW_TIME - _HB_MARKER_MTIME))
+        fi
+        if [ "$_HB_MARKER_AGE" -ge 0 ] && [ "$_HB_MARKER_AGE" -lt 60 ] && \
+           { pgrep -xi "herdr" >/dev/null 2>&1 || pgrep -f '^[^[:space:]]*/Herdr\.app/Contents/MacOS/' >/dev/null 2>&1; }; then
           _HB_HERDR_HEALTHY=1
         fi
       fi
@@ -139,7 +150,7 @@ signal.alarm(0)' > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
         if [ "$_HB_VA_HAS_UUID" -eq 0 ] && [ -n "$_HB_VENDOR_SID" ]; then
           _HB_VA_TMP=$(mktemp "$_HB_STATE_HOME/panes/.va.tmp.XXXXXX" 2>/dev/null || true)
           if [ -n "$_HB_VA_TMP" ]; then
-            printf '{"vendor_session_id":"%s"}' "$_HB_VENDOR_SID" > "$_HB_VA_TMP"
+            printf '{"vendor_session_id":"%s"}' "$_HB_VENDOR_SID" > "$_HB_VA_TMP" 2>/dev/null || true
             mv -f "$_HB_VA_TMP" "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
           else
             printf '{"vendor_session_id":"%s"}' "$_HB_VENDOR_SID" > "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
@@ -159,7 +170,7 @@ signal.alarm(0)' > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
           if [ -n "$_HB_VENDOR_SID" ]; then
             _HB_VA_TMP=$(mktemp "$_HB_STATE_HOME/panes/.va.tmp.XXXXXX" 2>/dev/null || true)
             if [ -n "$_HB_VA_TMP" ]; then
-              printf '{"vendor_session_id":"%s"}' "$_HB_VENDOR_SID" > "$_HB_VA_TMP"
+              printf '{"vendor_session_id":"%s"}' "$_HB_VENDOR_SID" > "$_HB_VA_TMP" 2>/dev/null || true
               mv -f "$_HB_VA_TMP" "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
             else
               printf '{"vendor_session_id":"%s"}' "$_HB_VENDOR_SID" > "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
@@ -186,7 +197,7 @@ signal.alarm(0)' > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
         if [ -n "$_HB_VENDOR_SID" ]; then
           _HB_VA_TMP=$(mktemp "$_HB_STATE_HOME/panes/.va.tmp.XXXXXX" 2>/dev/null || true)
           if [ -n "$_HB_VA_TMP" ]; then
-            printf '{"vendor_session_id":"%s"}' "$_HB_VENDOR_SID" > "$_HB_VA_TMP"
+            printf '{"vendor_session_id":"%s"}' "$_HB_VENDOR_SID" > "$_HB_VA_TMP" 2>/dev/null || true
             mv -f "$_HB_VA_TMP" "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
           else
             printf '{"vendor_session_id":"%s"}' "$_HB_VENDOR_SID" > "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
@@ -201,12 +212,13 @@ signal.alarm(0)' > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
         touch "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
       fi
       if [ -n "$_HB_GUARD_TMP" ] && [ -f "$_HB_GUARD_TMP" ]; then
-        exec < "$_HB_GUARD_TMP"
+        exec < "$_HB_GUARD_TMP" || true
         rm -f "$_HB_GUARD_TMP" 2>/dev/null || true
       fi
+      umask "$_HB_OLD_UMASK" 2>/dev/null || true
       unset _HB_CANONICAL_PANE _HB_HEX_PANE _HB_STATE_HOME _HB_PANE_MARKER _HB_VENDOR_ACTIVE \
             _HB_IS_SESSION_TERMINAL _HB_IS_TURN_TERMINAL _HB_VENDOR_SID _HB_VA_HAS_UUID \
-            _HB_HERDR_HEALTHY _HB_MARKER_MTIME _HB_NOW_TIME _HB_OLD_UMASK _HB_FIRST_LINE \
+            _HB_HERDR_HEALTHY _HB_MARKER_MTIME _HB_MARKER_AGE _HB_NOW_TIME _HB_OLD_UMASK _HB_FIRST_LINE \
             _HB_READ_STATUS _HB_RAW_SID _HB_VA_TMP _HB_CAPTURE_ERR _HB_GUARD_TMP _HB_SPLICE_FIFO \
             _HB_ARGV_IS_JSON _HB_ARGV_SID
     fi
