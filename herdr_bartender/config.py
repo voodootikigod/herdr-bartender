@@ -37,6 +37,8 @@ STATUS_MAP = {
 PANE_ID_REGEX = re.compile(r'^[a-zA-Z0-9_:-]{1,48}$')
 CONTAINER_ID_REGEX = re.compile(r'^[a-zA-Z0-9_:-]{1,48}$')
 SESSION_ID_REGEX = re.compile(r'^herdr:[a-zA-Z0-9_-]{1,32}:[a-zA-Z0-9_:-]{1,48}$')
+# Plan §1 L38: the hook guard records only vendor session UUIDs matching this pattern.
+VENDOR_UUID_REGEX = re.compile(r'^[a-zA-Z0-9_-]{16,64}$')
 
 
 HOST_MAX_LEN = 32

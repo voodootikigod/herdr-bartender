@@ -18,7 +18,7 @@ from .markers import (
     touch_pane_failed,
     touch_pane_marker,
 )
-from .orphans import export_orphan_record, remove_orphan_record
+from .orphans import export_orphan_record, orphan_pane_ids, remove_orphan_record
 from .process import (
     get_bartender_pid,
     get_herdr_pid,
@@ -28,8 +28,38 @@ from .process import (
     is_process_instance_alive,
     own_start_time,
 )
-from .sender import touch_reconciler_pending
+from .handoff import touch_reconciler_pending
+from .sender import BACKGROUND_POLICY, compensate
+from .sender.compensation import valid_entry as valid_compensation
 from .vendor import cleanup_vendor_active
+
+
+def _owed_compensations(cache_mgr: BoundedSessionCache) -> list:
+    """Snapshot of the well-formed owed compensations; malformed entries are purged (they could never be sent)."""
+    with cache_mgr as data:
+        entries = data.get("pending_compensations", [])
+        valid = [c for c in entries if valid_compensation(c)]
+        if len(valid) != len(entries):
+            log_debug(f"Dropping {len(entries) - len(valid)} malformed pending_compensations entries")
+            data["pending_compensations"] = valid
+            cache_mgr.save(data)
+    return valid
+
+
+def drain_compensations(cache_mgr: BoundedSessionCache, bridge_url: str | None = None) -> bool:
+    """Drain persisted compensations through the Universal Sender; True when ``reconciler.pending`` was flagged.
+
+    Each entry gets the under-lock re-verification (target generation, retry schedule), its attempt recorded, the
+    POST, then clear + re-sync detection; it is cleared only by an abort, a landed POST or its export to the orphan
+    file once its attempts are exhausted. A forced re-sync (a re-admission an Ended may have dismissed) flags another
+    pass. An owed entry is NOT re-flagged: the loop sleeps until it is due (background._compensation_wait).
+    """
+    need = False
+    for comp in _owed_compensations(cache_mgr):
+        need = compensate(cache_mgr, comp, BACKGROUND_POLICY, bridge_url) or need
+    if need:
+        touch_reconciler_pending()
+    return need
 
 
 def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
@@ -38,35 +68,7 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
     own_start_time()
     cache_mgr = BoundedSessionCache(state_dir)
 
-    # Drain persisted compensations with under-lock re-verification
-    with cache_mgr as data:
-        pending_comps = list(data.get("pending_compensations", []))
-    for comp in pending_comps:
-        c_sid = comp.get("session_id")
-        c_agent = comp.get("agent", "Herdr")
-        abort_comp = False
-        with cache_mgr as data:
-            active_s = data.get("sessions", {}).get(c_sid)
-            if active_s and active_s.get("desired_state") != "Ended":
-                abort_comp = True
-            data["pending_compensations"] = [
-                c for c in data.get("pending_compensations", [])
-                if c.get("session_id") != c_sid
-            ]
-            cache_mgr.save(data)
-        if not abort_comp:
-            post_bartender_event(
-                {"state": "Ended", "agent": c_agent, "session_id": c_sid},
-                timeout=0.2,
-                bridge_url=bridge_url
-            )
-            with cache_mgr as data:
-                active_s = data.get("sessions", {}).get(c_sid)
-                if active_s and active_s.get("desired_state") != "Ended":
-                    active_s["delivered_seq"] = 0
-                    active_s["delivery_status"] = "in_flight"
-                    touch_reconciler_pending()
-                    cache_mgr.save(data)
+    drain_compensations(cache_mgr, bridge_url)
 
     # Drain persisted vendor cleanups
     with cache_mgr as data:
@@ -127,6 +129,7 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
                 cache_mgr.save(data)
 
     targets = []
+    orphan_panes = orphan_pane_ids()  # read outside the cache lock (gap save-reads-orphans-under-lock)
     with cache_mgr as data:
         sessions = data.get("sessions", {})
         if not sessions:
@@ -168,10 +171,12 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
                     s["desired_state"] = "Ended"
                     s["seq"] = int(s.get("seq", 0)) + 1
             data["last_herdr_pid"] = curr_herdr_pid
+            data["herdr_instance_id"] = f"{curr_herdr_pid}:{curr_herdr_st or ''}"
             if curr_herdr_st:
                 data["last_herdr_start_time"] = curr_herdr_st
         elif last_herdr_pid is None and curr_herdr_pid is not None:
             data["last_herdr_pid"] = curr_herdr_pid
+            data["herdr_instance_id"] = f"{curr_herdr_pid}:{curr_herdr_st or ''}"
             if curr_herdr_st:
                 data["last_herdr_start_time"] = curr_herdr_st
 
@@ -243,7 +248,7 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
                 s["lease_deadline"] = now_wall + 1.5
                 my_resync_gen = s.get("resync_generation", 0)
                 targets.append((sid, s.get("desired_state"), s.get("seq", 1), pane_id, payload, my_token, my_resync_gen))
-        cache_mgr.save(data)
+        cache_mgr.save(data, orphan_panes=orphan_panes)
 
     for sid, target_state, target_seq, pane_id, payload, my_token, my_resync_gen in targets:
         with cache_mgr as data:

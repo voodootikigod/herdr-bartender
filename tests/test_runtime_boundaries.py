@@ -1,14 +1,16 @@
 """W1 refactor boundaries: no import-time I/O, no subprocess inside cache locks, guarded spawns."""
 
-import json
-import os
+import ast
+import subprocess
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from herdr_bartender import hooks, process, runtime, sender, watchdog
+from herdr_bartender import handoff, hooks, process, runtime, watchdog
 from herdr_bartender.reconciler import reconcile_active_sessions
-from tests.support import SandboxTestCase
+from tests.support import LAUNCHER, SandboxTestCase
+from tests.support.lock_holder import hold_lock
 
 
 class RuntimeBoundaryTests(SandboxTestCase):
@@ -45,26 +47,76 @@ class RuntimeBoundaryTests(SandboxTestCase):
             reconcile_active_sessions(self.state_dir)
         self.assertEqual(seen, [False], "start time must be looked up exactly once, outside the critical section")
 
-    def test_watchdog_handoff_respects_unit_testing_guard(self):
-        """The SIGALRM hand-off spawns via ensure_reconciler_running(), which is a no-op under unit tests."""
-        self.assertTrue(os.environ.get("HERDR_BARTENDER_UNIT_TESTING"))
-        (self.state_dir / "active-sessions.json").write_text(json.dumps(
-            {"sessions": {self.sid("w1:pWatchdog"): {"seq": 2, "delivered_seq": 1}}}))
+    def test_watchdog_handoff_goes_through_the_injected_spawner(self):
+        """The SIGALRM hand-off (run outside the handler by run_bounded) spawns via the injectable handoff
+        spawner (the sandbox records instead of starting a process); no Popen happens."""
         runtime.IN_CRITICAL_SECTION = False
-        with mock.patch.object(sender.subprocess, "Popen") as popen, \
-                mock.patch.object(watchdog, "ensure_reconciler_running",
-                                  wraps=sender.ensure_reconciler_running) as handoff:
-            with self.assertRaises(SystemExit):
-                watchdog._timeout_watchdog(None, None)
-        handoff.assert_called_once()
+
+        def expire():
+            watchdog._timeout_watchdog(None, None)
+
+        with mock.patch.object(handoff.subprocess, "Popen") as popen:
+            self.assertEqual(watchdog.run_bounded(expire), 0)
+        self.assertEqual(self.spawner.calls, [handoff.reconciler_argv()])
         popen.assert_not_called()
 
+    def test_production_spawner_is_detached_and_singleton(self):
+        """Plan §5.1 singleton: the production spawner starts `--reconcile-background` in a new session with no
+        inherited stdio, and ensure_reconciler_running() does not spawn while reconciler.lock is held."""
+        handoff.set_spawner(handoff.DetachedSpawner())
+        with mock.patch.object(handoff.subprocess, "Popen") as popen:
+            self.assertTrue(handoff.ensure_reconciler_running())
+        hold_lock(self, self.state_dir / handoff.RECONCILER_LOCK_NAME)  # a running reconciler (another process)
+        with mock.patch.object(handoff.subprocess, "Popen") as again:
+            self.assertFalse(handoff.ensure_reconciler_running())
+        again.assert_not_called()
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args.args[0][-1], "--reconcile-background")
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        for stream in ("stdin", "stdout", "stderr"):
+            self.assertIs(popen.call_args.kwargs[stream], subprocess.DEVNULL)
+
+    def test_disabled_never_spawns(self):
+        (self.state_dir / "DISABLED").touch()
+        self.assertFalse(handoff.ensure_reconciler_running())
+        self.assertEqual(self.spawner.calls, [])
+
     def test_mark_process_start_rebaselines_clock(self):
-        """cli.main() re-baselines the deadline budget once imports are done (as the monolith did)."""
+        """Without a launcher baseline (in-process callers) cli.main() baselines the budget at its first statement."""
         runtime.START_TIME = -1000.0
         runtime.mark_process_start()
         self.assertGreater(runtime.time_remaining(), 0.1)
         self.assertGreater(runtime.PROCESS_ARRIVAL_TIME_NS, 0)
+
+    def test_launcher_baseline_counts_package_import_against_the_deadline(self):
+        """Plan §6.1 budget table ('process startup & module load' is inside the 1.5s) / gap watchdog-deadline-1p4:
+        the launcher's pre-import baseline is the deadline origin and the arrival stamp, so the watchdog is armed
+        for 1.5s minus the time spent importing the package."""
+        runtime.PROCESS_DEADLINE_SECONDS = runtime.DEFAULT_DEADLINE_SECONDS
+        launched_mono, launched_ns = time.monotonic() - 0.4, time.time_ns() - 400_000_000
+        runtime.mark_process_start(launched_at=(launched_mono, launched_ns))
+        self.assertEqual((runtime.START_TIME, runtime.PROCESS_ARRIVAL_TIME_NS), (launched_mono, launched_ns))
+        self.assertAlmostEqual(runtime.PROCESS_ARRIVAL_TIME, launched_ns / 1e9, places=6)
+        with mock.patch.object(watchdog.signal, "setitimer") as setitimer, \
+                mock.patch.object(watchdog.signal, "signal"):
+            self.assertTrue(watchdog.arm_watchdog())
+        self.assertAlmostEqual(setitimer.call_args.args[1], 1.1, delta=0.05)
+
+    def test_launcher_takes_the_baseline_before_importing_the_package(self):
+        """Gap watchdog-deadline-1p4: bin/herdr-bartender captures the clock before importing herdr_bartender and
+        hands it to main(launched_at=...)."""
+        source = LAUNCHER.read_text()
+        body = ast.parse(source).body
+
+        def first(predicate):
+            return next((i for i, node in enumerate(body) if predicate(node)), None)
+
+        captured = first(lambda node: "time.monotonic()" in (ast.get_source_segment(source, node) or ""))
+        imported = first(lambda node: isinstance(node, ast.ImportFrom) and (node.module or "").startswith("herdr_bartender"))
+        self.assertIsNotNone(captured, "the launcher must capture time.monotonic()")
+        self.assertIsNotNone(imported)
+        self.assertLess(captured, imported)
+        self.assertIn("main(launched_at=", source)
 
 
 if __name__ == "__main__":

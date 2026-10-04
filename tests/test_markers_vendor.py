@@ -1,9 +1,12 @@
 """Pane markers, state flags and .vendor_active lifecycle."""
 
 import json
+import os
+import time
 import unittest
 
-from herdr_bartender.handlers import handle_agent_status_changed
+from herdr_bartender.background import run_reconcile_background
+from herdr_bartender.handlers import handle_agent_status_changed, handle_pane_closed
 from herdr_bartender.markers import (
     clear_delivery_down,
     clear_pane_failed,
@@ -20,7 +23,25 @@ from tests.support import SandboxTestCase
 
 
 class MarkerVendorTests(SandboxTestCase):
-    # WEAK: t9-marker-lifecycle
+    def test_p09_marker_lifecycle_through_delivery_close_and_heartbeat(self):
+        """Plan §10.1 #9 (gap t9-marker-lifecycle): no marker after a failed (500) delivery, a marker after the
+        confirmed one, its mtime refreshed by the reconciler heartbeat, and removal on pane close."""
+        pane = "w1:pMark"
+        marker = self.state_dir / "panes" / get_hex_pane_id(pane)
+        event = {"agent_status": "working", "pane_id": pane, "workspace_id": "w1", "agent": "claude"}
+        self.bridge.return_code = 500
+        handle_agent_status_changed(event, {}, bridge_url=self.mock_url)
+        self.assertFalse(marker.exists(), "no marker without a confirmed delivery")
+        self.bridge.return_code = 200
+        handle_agent_status_changed({**event, "agent_status": "blocked"}, {}, bridge_url=self.mock_url)
+        self.assertTrue(marker.exists())
+        aged = time.time() - 120
+        os.utime(marker, (aged, aged))
+        run_reconcile_background(bridge_url=self.mock_url, loop_once=True)
+        self.assertGreater(marker.stat().st_mtime, aged + 60, "the heartbeat refreshed the marker")
+        handle_pane_closed({"pane_id": pane}, {}, bridge_url=self.mock_url)
+        self.assertFalse(marker.exists())
+
     def test_p09_hex_marker_lifecycle(self):
         """Plan §10.1 #9: injective hex marker holds a unix timestamp and is removed by remove_pane_marker."""
         test_pane = "w1:test/dangerous:pane..id"
@@ -42,9 +63,8 @@ class MarkerVendorTests(SandboxTestCase):
         disabled_path.unlink()
         self.assertIs(is_disabled(), False, "DISABLED flag removal should be recognized")
 
-    # WEAK: t17-delivery-down
     def test_p17_delivery_down_and_pane_failed_markers(self):
-        """Plan §10.1 #17: DELIVERY_DOWN and <hex>.failed markers are set and cleared."""
+        """Plan §10.1 #17 helpers (the delivery-driven test is tests/test_response_matrix.DeliveryDownTests)."""
         touch_delivery_down()
         self.assertIs(is_delivery_down(), True, "DELIVERY_DOWN marker must be recognized")
         touch_pane_failed("w1:pFail")
@@ -77,13 +97,13 @@ class MarkerVendorTests(SandboxTestCase):
         cleanup_vendor_active(vendor_pane, bridge_url=self.mock_url)
         self.assertFalse(vendor_active_file.exists(), "Bare vendor active marker must be unlinked by cleanup_vendor_active on confirmed delivery")
 
-        vendor_active_file.write_text(json.dumps({"vendor_session_id": "test_v_uuid_123"}), encoding="utf-8")
+        vendor_active_file.write_text(json.dumps({"vendor_session_id": "test_v_uuid_1234567"}), encoding="utf-8")
         cleanup_vendor_active(vendor_pane, bridge_url=self.mock_url)
         self.assertFalse(vendor_active_file.exists(), "UUID-bearing vendor active marker must be unlinked after dismissal")
 
-    # WEAK: t30-outside-lock
     def test_p30_stranded_vendor_dismissal(self):
-        """Plan §10.1 #30: confirmed delivery dismisses a stranded vendor UUID via an Ended outside the lock."""
+        """Plan §10.1 #30: confirmed delivery dismisses a stranded vendor UUID via an Ended outside the lock
+        (lock state at the POST is asserted in tests/test_vendor_dismissal)."""
         stranded_file = self.state_dir / "panes" / f"{get_hex_pane_id('w1:pStranded')}.vendor_active"
         stranded_file.parent.mkdir(parents=True, exist_ok=True)
         stranded_file.write_text(json.dumps({"vendor_session_id": "vendor_stranded_uuid_999"}), encoding="utf-8")
@@ -100,7 +120,31 @@ class MarkerVendorTests(SandboxTestCase):
         )
         self.assertTrue(dismissed, "Ended event for vendor_stranded_uuid_999 must have been sent to bridge")
 
-    # WEAK: t44-cross-ws
+    def test_p44_cross_workspace_isolation(self):
+        """Plan §10.1 #44 (gap t44-cross-ws): the same raw pane id in two workspaces gives two sessions and two
+        markers; closing w1's pane leaves w2's session, marker and .vendor_active untouched."""
+        for ws in ("w1", "w2"):
+            handle_agent_status_changed({"agent_status": "working", "pane_id": "pSame", "workspace_id": ws,
+                                         "agent": "claude"}, {}, bridge_url=self.mock_url)
+        sid1, sid2 = self.sid("w1:pSame"), self.sid("w2:pSame")
+        hex1, hex2 = get_hex_pane_id("w1:pSame"), get_hex_pane_id("w2:pSame")
+        self.assertNotEqual(sid1, sid2)
+        self.assertNotEqual(hex1, hex2)
+        panes = self.state_dir / "panes"
+        self.assertTrue((panes / hex1).exists() and (panes / hex2).exists())
+        self.assertFalse((panes / get_hex_pane_id("pSame")).exists(), "no raw, unscoped marker")
+        vendor2 = panes / f"{hex2}.vendor_active"
+        vendor2.write_text(json.dumps({"vendor_session_id": "vendor_w2_uuid_000001"}))
+        handle_pane_closed({"pane_id": "pSame", "workspace_id": "w1"}, {}, bridge_url=self.mock_url)
+        with self.cache_mgr as data:
+            self.assertNotIn(sid1, data["sessions"])
+            self.assertEqual(data["sessions"][sid2]["desired_state"], "Working")
+            self.assertNotIn("w2:pSame", data["tombstones"])
+        self.assertFalse((panes / hex1).exists())
+        self.assertTrue((panes / hex2).exists())
+        self.assertTrue(vendor2.exists())
+        self.assertIn(sid2, self.bridge.sessions)
+
     def test_p44_cross_workspace_marker_isolation(self):
         """Plan §10.1 #44: the same raw pane ID in two workspaces yields distinct markers; no raw marker is made."""
         pid_w1 = "w1:pSame"

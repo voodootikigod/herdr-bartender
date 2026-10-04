@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest import mock
 
-from herdr_bartender import cli, intake
+from herdr_bartender import cli, handoff, intake
 from herdr_bartender.markers import touch_delivery_down, touch_pane_marker
 from tests.support import LAUNCHER, REPO_ROOT, SandboxTestCase
 
@@ -109,15 +109,14 @@ class LauncherTests(SandboxTestCase):
 
     def test_payloadless_known_event_starts_reconciler(self):
         """R20 (gap event-input-contract): a known argv event without payload calls ensure_reconciler_running()."""
-        with mock.patch.object(cli, "ensure_reconciler_running") as ensure, \
-                mock.patch.object(cli, "dispatch_event") as dispatch:
+        with mock.patch.object(cli, "dispatch_event") as dispatch:
             self.assertEqual(cli.run_event(["tab.closed"], b"", {}), 0)
-            ensure.assert_called_once_with()
+            self.assertEqual(self.spawner.calls, [handoff.reconciler_argv()])
             dispatch.assert_not_called()
-            ensure.reset_mock()
+            self.spawner.reset()
             cli.run_event(["not.an.event"], b"", {})
             cli.run_event([], b"", {})
-            ensure.assert_not_called()
+            self.assertEqual(self.spawner.calls, [])
             dispatch.assert_not_called()
 
     def test_run_event_dispatches_parsed_payload(self):
@@ -195,6 +194,8 @@ class LauncherTests(SandboxTestCase):
         self.assertLess(elapsed, 2.0, "startup hook must return inside Herdr's 2.0s supervisor budget")
         self.assertFalse((self.state_dir / "reconciler.lock").exists(),
                          "the startup process itself must not take the reconciler singleton lock")
+        self.assertEqual([argv[-2:] for argv in self.subprocess_spawns()],
+                         [["--reconcile-background", cli.FOREGROUND_FLAG]], "exactly one detached loop requested")
 
 
 class ReconcileCommandTests(SandboxTestCase):
@@ -204,12 +205,13 @@ class ReconcileCommandTests(SandboxTestCase):
 
     def setUp(self):
         super().setUp()
-        os.environ.pop("HERDR_BARTENDER_UNIT_TESTING", None)
+        previous = handoff.set_spawner(handoff.DetachedSpawner())  # the production spawner, Popen mocked below
+        self.addCleanup(handoff.set_spawner, previous)
 
     def test_plain_invocation_spawns_detached_foreground_child(self):
         """R21 (gap manifest-no-argv-event): a plain --reconcile-background spawns one detached
         `--reconcile-background --foreground` child (own session, no inherited stdio) and returns 0."""
-        with mock.patch.object(cli.subprocess, "Popen") as popen, \
+        with mock.patch.object(handoff.subprocess, "Popen") as popen, \
                 mock.patch.object(cli, "run_reconcile_background") as loop:
             code = cli.run_reconcile_command(["--reconcile-background"])
         self.assertEqual(code, 0)
@@ -225,7 +227,7 @@ class ReconcileCommandTests(SandboxTestCase):
 
     def test_foreground_flag_runs_loop_without_respawning(self):
         """R21 (gap manifest-no-argv-event): the --foreground child runs the loop itself and never respawns."""
-        with mock.patch.object(cli.subprocess, "Popen") as popen, \
+        with mock.patch.object(handoff.subprocess, "Popen") as popen, \
                 mock.patch.object(cli, "run_reconcile_background") as loop:
             code = cli.run_reconcile_command(["--reconcile-background", cli.FOREGROUND_FLAG])
         self.assertEqual(code, 0)
@@ -235,7 +237,7 @@ class ReconcileCommandTests(SandboxTestCase):
     def test_disabled_startup_spawns_nothing(self):
         """Plan §10.1 #14 / R21 (gap manifest-no-argv-event): with DISABLED present the startup hook spawns nothing."""
         (self.state_dir / "DISABLED").touch()
-        with mock.patch.object(cli.subprocess, "Popen") as popen, \
+        with mock.patch.object(handoff.subprocess, "Popen") as popen, \
                 mock.patch.object(cli, "run_reconcile_background") as loop:
             code = cli.run_reconcile_command(["--reconcile-background"])
         self.assertEqual(code, 0)
@@ -244,8 +246,8 @@ class ReconcileCommandTests(SandboxTestCase):
 
     def test_spawn_failure_is_reported(self):
         """R21 (gap manifest-no-argv-event): a failed detach is logged and reported via a non-zero exit, not swallowed."""
-        with mock.patch.object(cli.subprocess, "Popen", side_effect=OSError("no fork")), \
-                mock.patch.object(cli, "log_debug") as log:
+        with mock.patch.object(handoff.subprocess, "Popen", side_effect=OSError("no fork")), \
+                mock.patch.object(handoff, "log_debug") as log:
             code = cli.run_reconcile_command(["--reconcile-background"])
         self.assertEqual(code, 1)
         self.assertTrue(any("no fork" in str(c.args[0]) for c in log.call_args_list))

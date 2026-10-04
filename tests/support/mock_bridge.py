@@ -11,6 +11,15 @@ Default behavior mirrors the original embedded MockBartenderHandler:
 
 On top of that, ``enqueue(status, body, delay)`` scripts the next responses in
 FIFO order, and ``requests`` logs every request (including failed ones).
+
+Hooks (run in the server thread while the client is blocked on its request):
+
+* ``probe()`` returns extra fields merged into each ``requests`` entry (e.g. whether
+  the client process held the cache lock at that moment);
+* ``on_post(payload)`` runs before the event is applied and answered, so a test can
+  drive a concurrent handler (or mutate the cache) while a real send is in flight;
+* ``after_apply(payload)`` runs after the event was applied to ``sessions`` but before
+  the response is sent (the request "landed" while the sender still waits for it).
 """
 
 from __future__ import annotations
@@ -21,6 +30,7 @@ import threading
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Callable, Optional
 
 
 @dataclass(frozen=True)
@@ -70,25 +80,28 @@ class _Handler(BaseHTTPRequestHandler):
             data = json.loads(raw.decode("utf-8"))
         except Exception:
             data = None
+        extra = bridge._observe(data)
         scripted = bridge._pop_scripted()
         delay = scripted.delay if scripted else bridge.delay
         if delay > 0:
             time.sleep(delay)
 
         if scripted is not None:
-            bridge._record("POST", self.path, data, scripted.status)
+            bridge._record("POST", self.path, data, scripted.status, extra)
             self._send(scripted.status, scripted.body)
             return
         if bridge.return_code != 200:
-            bridge._record("POST", self.path, data, bridge.return_code)
+            bridge._record("POST", self.path, data, bridge.return_code, extra)
             self._send(bridge.return_code)
             return
         if self.path != "/event":
-            bridge._record("POST", self.path, data, 404)
+            bridge._record("POST", self.path, data, 404, extra)
             self._send(404)
             return
         status = bridge._apply_event(data)
-        bridge._record("POST", self.path, data, status)
+        bridge._record("POST", self.path, data, status, extra)
+        if bridge.after_apply is not None:
+            bridge.after_apply(data)
         if status == 400:
             self._send(400, b'{"ok":false,"error":"bad_payload"}')
         else:
@@ -99,11 +112,15 @@ class MockBridge:
     def __init__(self) -> None:
         self.sessions: dict = {}
         self.history: list = []
-        self.requests: list = []
+        self.requests: list = []      # completed requests, in response order
+        self.arrivals: list = []      # POST bodies in arrival order (before any hook or response)
         self.delay = 0.0
         self.return_code = 200
         self.reject_complex_ended = False
         self.health_ok = True
+        self.probe: Optional[Callable[[], dict]] = None
+        self.on_post: Optional[Callable[[Any], None]] = None
+        self.after_apply: Optional[Callable[[Any], None]] = None
         self._scripted: collections.deque = collections.deque()
         self._lock = threading.Lock()
         self._server: _Server | None = None
@@ -148,14 +165,28 @@ class MockBridge:
     def events_for(self, session_id: str) -> list:
         return [e for e in self.history if isinstance(e, dict) and e.get("session_id") == session_id]
 
+    def posts(self) -> list:
+        """Every POST body in arrival order, whatever its response."""
+        with self._lock:
+            return [r["body"] for r in self.requests if r["method"] == "POST"]
+
     # -- internals ---------------------------------------------------------
     def _pop_scripted(self) -> ScriptedResponse | None:
         with self._lock:
             return self._scripted.popleft() if self._scripted else None
 
-    def _record(self, method: str, path: str, body, status: int) -> None:
+    def _observe(self, data) -> dict:
+        """Record the arrival, then run the probe and the on_post hook (server thread, before the response)."""
         with self._lock:
-            self.requests.append({"method": method, "path": path, "body": body, "status": status})
+            self.arrivals.append(data)
+        extra = dict(self.probe()) if self.probe is not None else {}
+        if self.on_post is not None:
+            self.on_post(data)
+        return extra
+
+    def _record(self, method: str, path: str, body, status: int, extra: Optional[dict] = None) -> None:
+        with self._lock:
+            self.requests.append({"method": method, "path": path, "body": body, "status": status, **(extra or {})})
 
     def _apply_event(self, data) -> int:
         with self._lock:

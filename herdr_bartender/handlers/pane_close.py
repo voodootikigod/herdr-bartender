@@ -1,159 +1,44 @@
-"""pane.closed handler."""
+"""pane.closed handler (Plan §2.1, §4.1 tombstones, §4.3; Step A staging in ``staging.stage_pane_close``).
+
+Step A ends every matching session (close origin persisted on the session, R7),
+tombstones the pane only when the close is not stale against the admission (R8), and
+queues the pane's vendor dismissal under the same lock; the Universal Sender delivers at
+most one Ended inline and hands any remainder to the reconciler.
+"""
 
 from __future__ import annotations
 
-import os
+from typing import Optional
 
 from .. import clock
-from ..bridge import post_bartender_event
-from ..cache import BoundedSessionCache
+from ..intake import PANE_CLOSED, resolve_identity
 from ..log import log_debug
-from ..markers import remove_pane_marker, touch_heartbeat, touch_pane_failed
-from ..orphans import export_orphan_record, remove_orphan_record
-from ..paths import get_state_dir
-from ..process import is_process_instance_alive, own_start_time
-from ..intake import PANE_CLOSED, build_close_payload, resolve_host, resolve_identity, session_matches_pane
-from ..sender import ensure_reconciler_running, touch_reconciler_pending
-from ..vendor import cleanup_vendor_active
+from ..markers import touch_heartbeat
+from ..sender import Stage, Staged, Target
+from ..staging import stage_pane_close
+from .flow import run_event
 
 
-def handle_pane_closed(event_data: dict, context: dict, bridge_url: str | None = None, arrival_ns: int | None = None, spool_generation: int | None = None):
-    touch_heartbeat()
+def _pane_stage(pane: str, event_data: dict, arr_ns: int, spool_generation: Optional[int]) -> Stage:
+    def stage(data: dict) -> Staged:
+        targets = stage_pane_close(data, pane, event_data, arr_ns, spool_generation)
+        return Staged(tuple(Target(t.session_id, t.pane_id, t.record) for t in targets), mutated=True)
+    return stage
+
+
+def handle_pane_closed(event_data: dict, context: dict, bridge_url: Optional[str] = None,
+                       arrival_ns: Optional[int] = None, spool_generation: Optional[int] = None) -> None:
     arr_ns = arrival_ns or clock.time_ns()
     event_data = event_data if isinstance(event_data, dict) else {}
-    # Identity from event data only: never the focused pane or context.workspace_id (§2.3, R1/R2).
-    identity, notes = resolve_identity(event_data, {})
-    for note in notes:
-        log_debug(note)
-    if identity is None:
-        return
-    canonical_pane = identity.canonical_pane
-    cache_mgr = BoundedSessionCache(get_state_dir())
-    target_sessions = []
-    now_wall = clock.time()
-    my_pid = os.getpid()
 
-    with cache_mgr as data:
-        sessions = data.get("sessions", {})
-        host = resolve_host(data.get("host"))
-        matching_last_source_ts = 0.0
-        for sid, info in sessions.items():
-            if session_matches_pane(sid, info, canonical_pane, host):
-                ts = info.get("last_source_timestamp", 0.0)
-                if ts and ts > matching_last_source_ts:
-                    matching_last_source_ts = ts
-        closed_source_ts = max(float(event_data.get("timestamp") or 0.0), matching_last_source_ts, float(arr_ns) / 1e9)
-        data.setdefault("tombstones", {})[canonical_pane] = {
-            "closed_at_ns": arr_ns,
-            "closed_source_ts": closed_source_ts,
-            "last_source_timestamp": max(matching_last_source_ts, float(event_data.get("timestamp") or 0.0)),
-        }
+    def prepare() -> Optional[Stage]:
+        touch_heartbeat()
+        # Identity from event data only: never the focused pane or context.workspace_id (§2.3, R1/R2).
+        identity, notes = resolve_identity(event_data, {})
+        for note in notes:
+            log_debug(note)
+        if identity is None:
+            return None
+        return _pane_stage(identity.canonical_pane, event_data, arr_ns, spool_generation)
 
-        for sid, info in list(sessions.items()):
-            if session_matches_pane(sid, info, canonical_pane, host):
-                if spool_generation is not None and info.get("generation", 1) > spool_generation:
-                    log_debug(f"Ignoring spooled close with older generation {spool_generation} < {info.get('generation')}")
-                    continue
-                if info.get("admitted_at_ns", 0) > arr_ns:
-                    log_debug(f"Ignoring close event predating session admission: close {arr_ns} < admitted {info.get('admitted_at_ns')}")
-                    continue
-                seq = int(info.get("seq", 0)) + 1
-                info["desired_state"] = "Ended"
-                info["seq"] = seq
-                info["closed_at_ns"] = arr_ns
-                info["close_kind"] = "container"
-                close_payload = build_close_payload(sid, info, PANE_CLOSED, seq)
-                info["desired_payload"] = close_payload
-                lease_deadline = info.get("lease_deadline") or 0.0
-                sending_pid = info.get("sending_pid")
-                l_tok = info.get("lease_token") or ""
-                l_parts = l_tok.split(":")
-                holder_st = l_parts[1] if len(l_parts) >= 2 else None
-                is_active = (sending_pid is not None) and (sending_pid != my_pid) and is_process_instance_alive(sending_pid, holder_st) and (now_wall < lease_deadline + 0.5)
-                if not is_active:
-                    my_token = f"{my_pid}:{own_start_time()}:{clock.time()}:{sid}"
-                    info["lease_token"] = my_token
-                    info["sending_pid"] = my_pid
-                    info["lease_deadline"] = now_wall + 1.5
-                    my_resync_gen = info.get("resync_generation", 0)
-                    info["lease_resync_gen"] = my_resync_gen
-                    target_sessions.append((sid, canonical_pane, close_payload, seq, my_token, my_resync_gen))
-                else:
-                    touch_reconciler_pending()
-                    ensure_reconciler_running()
-        if sessions:
-            cache_mgr.save(data)
-
-    # Dispatch Ended outside lock
-    for sid, pane_id, close_payload, target_seq, my_token, my_resync_gen in target_sessions:
-        success, is_non_retryable = post_bartender_event(close_payload, bridge_url=bridge_url)
-        vendor_to_clean = None
-        orphans_to_export = []
-        orphans_to_remove = []
-        should_spawn_reconciler = False
-        with cache_mgr as data:
-            s = data.get("sessions", {}).get(sid)
-            if not s:
-                continue
-            if s.get("lease_token") != my_token:
-                log_debug(f"Lease token superseded for {sid} during pane.closed, forcing re-sync")
-                s["delivered_seq"] = 0
-                s["delivery_status"] = "in_flight"
-                s["resync_generation"] = s.get("resync_generation", 0) + 1
-                touch_reconciler_pending()
-                should_spawn_reconciler = True
-                cache_mgr.save(data)
-                continue
-
-            s["sending_pid"] = None
-            s["lease_token"] = None
-            s["lease_deadline"] = None
-
-            if success:
-                if s.get("resync_generation", 0) > my_resync_gen:
-                    log_debug(f"Superseding sender landed during pane.closed for {sid}, forcing re-sync")
-                    s["delivered_seq"] = 0
-                    s["delivery_status"] = "in_flight"
-                    touch_reconciler_pending()
-                    should_spawn_reconciler = True
-                    cache_mgr.save(data)
-                    continue
-
-                if s.get("desired_state") == "Ended" and s.get("seq") == target_seq:
-                    data.get("sessions", {}).pop(sid, None)
-                    remove_pane_marker(pane_id)
-                    orphans_to_remove.append(sid)
-                    if s.get("close_kind") == "container":
-                        data.setdefault("tombstones", {})[canonical_pane] = {
-                            "closed_at_ns": s.get("closed_at_ns") or arr_ns,
-                            "closed_source_ts": s.get("closed_source_ts", 0.0),
-                            "last_source_timestamp": s.get("last_source_timestamp", 0.0),
-                        }
-                    vendor_to_clean = pane_id
-            elif is_non_retryable:
-                s["delivery_status"] = "non_retryable_failed"
-                s["rejected_seq"] = target_seq
-                s["delivery_error"] = "bridge_rejected"
-                touch_pane_failed(pane_id)
-                if s.get("desired_state") == "Ended":
-                    s["orphaned_ended"] = True
-                    orphans_to_export.append((sid, dict(s)))
-            else:
-                s["delivery_attempts"] = s.get("delivery_attempts", 0) + 1
-                s["delivery_error"] = "retryable network error"
-                touch_pane_failed(pane_id)
-                if s.get("delivery_attempts", 0) >= 5:
-                    s["delivery_status"] = "retryable_exhausted"
-                    if s.get("desired_state") == "Ended":
-                        s["orphaned_ended"] = True
-                        orphans_to_export.append((sid, dict(s)))
-            cache_mgr.save(data)
-
-        for o_sid, o_info in orphans_to_export:
-            export_orphan_record(o_sid, o_info)
-        for o_sid in orphans_to_remove:
-            remove_orphan_record(o_sid)
-        if should_spawn_reconciler:
-            ensure_reconciler_running()
-        if vendor_to_clean:
-            cleanup_vendor_active(vendor_to_clean, is_pane_closed=True, bridge_url=bridge_url)
+    run_event(PANE_CLOSED, event_data, context if isinstance(context, dict) else {}, arr_ns, prepare, bridge_url)

@@ -1,14 +1,49 @@
 """Generation counters and arrival ordering."""
 
+import json
 import time
 import unittest
 
 from herdr_bartender.handlers import handle_agent_status_changed, handle_pane_closed
+from herdr_bartender.spool import spool_dir
 from tests.support import SandboxTestCase
 
 
 class GenerationTests(SandboxTestCase):
-    # WEAK: t35-backward-clock
+    def test_p35_backward_clock_keeps_generations_monotonic_and_drops_older_spool(self):
+        """Plan §10.1 #35 (gap t35-backward-clock): with the wall clock stepping backward between admissions,
+        every new admission still gets a strictly larger generation, cache_seq keeps increasing, and a spooled
+        event carrying an older generation is dropped (consumed without effect) on replay."""
+        fake = self.use_fake_clock(start=2_000_000_000.0)
+
+        def admit(pane):
+            handle_agent_status_changed({"agent_status": "working", "pane_id": pane, "workspace_id": "w1",
+                                         "agent": "claude"}, {}, bridge_url=self.mock_url)
+            with self.cache_mgr as data:
+                return data["sessions"][self.sid(pane)]["generation"], data["cache_seq"]
+
+        gen_a, seq_a = admit("w1:pGenA")
+        envelope = {"event_name": "pane.agent_status_changed", "context": {}, "generation": gen_a - 1,
+                    "event_data": {"agent_status": "done", "pane_id": "w1:pGenA", "workspace_id": "w1",
+                                   "agent": "claude"},
+                    "arrival_ns": fake.time_ns() + 1, "enqueued_ns": fake.time_ns() + 1}
+        path = spool_dir() / f"{fake.time_ns() + 1:020d}_1_1.json"
+        path.write_text(json.dumps(envelope))
+        fake.step_back(30.0)
+        gen_b, seq_b = admit("w1:pGenB")  # Step A replays the spool first
+        fake.step_back(30.0)
+        gen_c, seq_c = admit("w1:pGenC")
+        self.assertLess(gen_a, gen_b)
+        self.assertLess(gen_b, gen_c)
+        self.assertLess(seq_a, seq_b)
+        self.assertLess(seq_b, seq_c)
+        self.assertFalse(path.exists(), "the older-generation envelope was consumed")
+        with self.cache_mgr as data:
+            a = data["sessions"][self.sid("w1:pGenA")]
+            self.assertEqual((a["desired_state"], a["seq"], a["generation"]), ("Working", 1, gen_a),
+                             "the older-generation event had no effect")
+            self.assertEqual(data["next_generation"], gen_c)
+
     def test_p35_generation_monotonic_under_backward_clock(self):
         """Plan §10.1 #35: re-admission after Ended bumps generation and cache_seq despite a backward wall clock."""
         now_tt = time.time()

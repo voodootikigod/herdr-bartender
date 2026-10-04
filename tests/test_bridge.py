@@ -29,7 +29,7 @@ class BridgeContractTests(SandboxTestCase):
         self.assertTrue(health and health["ok"] is True, "Health check failed")
         self.assertEqual(health["port"], self.bridge.port)
 
-    # WEAK: t13-process-deadline
+    # Process-level bound: tests/test_watchdog.py ProcessDeadlineTests (gap t13-process-deadline).
     def test_p13_bounded_request_timeout(self):
         """Plan §10.1 #13: a delayed bridge cannot stall a POST past its bounded timeout."""
         self.bridge.delay = 3.0
@@ -83,6 +83,18 @@ class BridgeContractTests(SandboxTestCase):
         self.bridge.enqueue(400)
         self.assertEqual(deliver_event(ended, bridge_url=self.mock_url).outcome, "success")
         self.assertEqual(len(self.bridge.requests), 4)
+
+    def test_network_io_under_the_cache_lock_raises_in_every_mode(self):
+        """Plan §1 L9 (`assert not IN_CRITICAL_SECTION`): the bridge refuses I/O under the lock with no
+        test-only switch, so production enforces exactly what the suite does."""
+        os.environ.pop("HERDR_BARTENDER_UNIT_TESTING", None)
+        runtime.IN_CRITICAL_SECTION = True
+        try:
+            with self.assertRaises(bridge.CriticalSectionViolation):
+                deliver_event({"state": "Working", "agent": "A", "session_id": "s-locked"}, bridge_url=self.mock_url)
+        finally:
+            runtime.IN_CRITICAL_SECTION = False
+        self.assertEqual(self.bridge.requests, [])
 
 
 class BudgetModeTests(SandboxTestCase):

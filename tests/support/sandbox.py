@@ -5,6 +5,11 @@ and HERDR_BARTENDER_VENDOR_HOOKS_DIR all point inside it. Inherited HERDR_*,
 NOTCHBAR_* and proxy variables are scrubbed. PATH is prefixed with
 tests/support/shims, so pgrep/ps/osascript/herdr are fakes driven by files in
 the sandbox. Runtime globals are reset, and everything is restored in cleanups.
+
+Reconciler hand-offs never start real processes: in-process the
+``handoff`` spawner is a ``RecordingSpawner`` (``self.spawner``); subprocesses get
+a file-recording spawner through ``tests/support/sitecustom`` on PYTHONPATH
+(``self.subprocess_spawns()``).
 """
 
 from __future__ import annotations
@@ -17,16 +22,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from herdr_bartender import clock, process, runtime
+from herdr_bartender import clock, handoff, process, runtime
 from herdr_bartender.cache import BoundedSessionCache
 from herdr_bartender.config import get_sanitized_hostname
 from herdr_bartender.paths import get_state_dir
 
 from .fake_clock import FakeClock
 from .mock_bridge import MockBridge
+from .spawner import RecordingSpawner, read_spawn_log
 
 SUPPORT_DIR = Path(__file__).resolve().parent
 SHIM_DIR = SUPPORT_DIR / "shims"
+SITECUSTOM_DIR = SUPPORT_DIR / "sitecustom"
 REPO_ROOT = SUPPORT_DIR.parent.parent
 LAUNCHER = REPO_ROOT / "bin" / "herdr-bartender"
 
@@ -54,6 +61,7 @@ class SandboxTestCase(unittest.TestCase):
         self._preserve_umask()
         self._install_env()
         self._reset_runtime()
+        self._install_spawner()
         if self.default_liveness:
             self.add_fake_process("Bartender 6", pid=DEFAULT_BARTENDER_PID)
             self.set_herdr_alive()
@@ -87,15 +95,16 @@ class SandboxTestCase(unittest.TestCase):
             if key.startswith(SCRUB_PREFIXES) or key in SCRUB_NAMES:
                 del os.environ[key]
         real_path = saved.get("PATH", "/usr/bin:/bin")
+        python_path = os.pathsep.join(p for p in (str(SITECUSTOM_DIR), saved.get("PYTHONPATH", "")) if p)
         os.environ.update({
             "HOME": str(self.home),
             "XDG_STATE_HOME": str(self.xdg_state),
             "HERDR_PLUGIN_STATE_DIR": str(self.state_root),
             "HERDR_BARTENDER_VENDOR_HOOKS_DIR": str(self.vendor_hooks_dir),
-            "HERDR_BARTENDER_UNIT_TESTING": "1",
             "HB_TEST_SANDBOX": str(self.sandbox),
             "HB_REAL_PATH": real_path,
             "PATH": f"{SHIM_DIR}{os.pathsep}{real_path}",
+            "PYTHONPATH": python_path,
         })
 
     def _preserve_umask(self) -> None:
@@ -118,6 +127,15 @@ class SandboxTestCase(unittest.TestCase):
         runtime.PENDING_WATCHDOG_EXIT = False
         process.reset_caches()
         self.addCleanup(process.reset_caches)
+
+    def _install_spawner(self) -> None:
+        self.spawner = RecordingSpawner()
+        previous = handoff.set_spawner(self.spawner)
+        self.addCleanup(handoff.set_spawner, previous)
+
+    def subprocess_spawns(self) -> list:
+        """argv lists that sandboxed subprocesses asked the hand-off spawner to start."""
+        return read_spawn_log(self.sandbox)
 
     def _assert_sandboxed(self, path: Path) -> None:
         resolved = Path(path).resolve()

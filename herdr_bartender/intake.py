@@ -213,6 +213,16 @@ def _admit_idle(data: Mapping, cached: Mapping, live: bool) -> Optional[Admissio
     return None
 
 
+def is_agent_exit_signal(data: Mapping) -> bool:
+    """§3.4 L249 / Case B: ``idle`` with an explicitly empty agent, i.e. a potential agent exit to Ended.
+
+    Pure and cache-free, so it can classify spooled envelopes (close protection,
+    salvage) without knowing whether the pane had a live session.
+    """
+    data = _as_dict(data)
+    return data.get("agent_status") == "idle" and "agent" in data and not sanitize_agent(data.get("agent"))
+
+
 def admit_status(agent_status: str, data: Mapping, context: Mapping, identity: Identity,
                  cached: Mapping) -> Optional[Admission]:
     """§2.2 admission + Cases A/B/C. ``cached`` is the existing session record ({} if none).

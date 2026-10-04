@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
+from typing import Optional, Tuple
 
-from . import intake, process, runtime
+from . import handoff, intake, process, runtime
 from .background import run_reconcile_background
 from .bridge import check_bridge_health
-from .cache import BoundedSessionCache
+from .cache import BoundedSessionCache, CacheError
 from .cleanup import run_cleanup
 from .handlers import (
     handle_agent_status_changed,
@@ -23,9 +23,8 @@ from .live_test import run_live_test
 from .log import log_debug
 from .markers import is_disabled, touch_heartbeat
 from .orphans import run_replay_orphans
-from .paths import get_state_dir, launcher_path, repo_root
-from .sender import ensure_reconciler_running
-from .watchdog import arm_watchdog
+from .paths import get_state_dir, repo_root
+from .watchdog import arm_watchdog, run_bounded
 
 
 EVENT_HANDLERS = {
@@ -60,7 +59,7 @@ def run_event(argv, stdin_bytes: bytes, env) -> int:
         return 0
     if data is None:
         log_debug(f"Event invocation with no usable payload for {event_name!r}; safe no-op, ensuring reconciler")
-        ensure_reconciler_running()
+        handoff.ensure_reconciler_running()
         return 0
     dispatch_event(event_name, data, context)
     return 0
@@ -70,22 +69,12 @@ FOREGROUND_FLAG = "--foreground"  # internal: the detached child that actually r
 
 
 def _spawn_detached_reconciler() -> int:
-    """R21: start the reconciler loop in its own session with no inherited stdio, then return at once."""
-    if os.environ.get("HERDR_BARTENDER_UNIT_TESTING"):
-        log_debug("Unit-testing mode: not spawning a detached reconciler")
-        return 0
-    argv = [sys.executable, str(launcher_path()), "--reconcile-background", FOREGROUND_FLAG]
-    try:
-        subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-        )
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        log_debug(f"Failed to spawn detached reconciler: {exc}")
+    """R21: start the reconciler loop in its own session with no inherited stdio, then return at once.
+
+    The process is created by the injectable ``handoff`` spawner (production: a detached ``Popen``).
+    """
+    if not handoff.get_spawner().spawn(handoff.reconciler_argv(FOREGROUND_FLAG)):
+        log_debug("Failed to spawn detached reconciler")
         return 1
     return 0
 
@@ -118,8 +107,19 @@ def run_unit_tests() -> int:
     return 0 if result.wasSuccessful() else 1
 
 
-def main():
-    runtime.mark_process_start()
+def _read_cache_or_exit(state_dir) -> dict:
+    """Snapshot the cache under its lock for read-only commands; exit 1 with a message when unavailable."""
+    try:
+        with BoundedSessionCache(state_dir) as data:
+            return data
+    except CacheError as exc:
+        print(f"[-] Session cache unavailable: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def main(launched_at: Optional[Tuple[float, int]] = None):
+    """``launched_at``: the launcher's pre-import (monotonic, wall ns) baseline (see runtime.mark_process_start)."""
+    runtime.mark_process_start(launched_at)
     args = sys.argv[1:]
 
     if "--unit-test" in args:
@@ -143,12 +143,11 @@ def main():
         state_dir = get_state_dir()
         if (state_dir / "HOOK_NEEDS_REVIEW").exists():
             print("[WARNING] Vendor hook modified upstream (SHA mismatch). Run 'herdr-bartender --install-hooks' to re-verify and approve changes.")
-        cache_mgr = BoundedSessionCache(state_dir)
-        with cache_mgr as data:
-            sessions = data.get("sessions", {})
-            print(f"Active sessions: {len(sessions)}")
-            for sid, s in sessions.items():
-                print(f"  {sid}: state={s.get('desired_state')} status={s.get('delivery_status')}")
+        data = _read_cache_or_exit(state_dir)
+        sessions = data.get("sessions", {})
+        print(f"Active sessions: {len(sessions)}")
+        for sid, s in sessions.items():
+            print(f"  {sid}: state={s.get('desired_state')} status={s.get('delivery_status')}")
         return
 
     if "--install-hooks" in args:
@@ -174,9 +173,7 @@ def main():
             sys.exit(1)
 
     if "--sessions" in args:
-        cache_mgr = BoundedSessionCache(get_state_dir())
-        with cache_mgr as data:
-            print(json.dumps(data, indent=2))
+        print(json.dumps(_read_cache_or_exit(get_state_dir()), indent=2))
         return
 
     if "--reconcile-background" in args:
@@ -190,6 +187,11 @@ def main():
     # and never inside a cache-lock critical section.
     process.warm_process_identity()
     arm_watchdog()
+    sys.exit(run_bounded(_run_event_path, args))
+
+
+def _run_event_path(args) -> int:
+    """The watchdog-bounded event path (Plan §6.1): a SIGALRM here unwinds to run_bounded()."""
     touch_heartbeat()
     stdin_bytes = intake.read_stdin_bounded(sys.stdin, budget=_stdin_budget())
-    sys.exit(run_event(args, stdin_bytes, os.environ))
+    return run_event(args, stdin_bytes, os.environ)

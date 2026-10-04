@@ -21,7 +21,7 @@ NO_SUCH_PID = 999_999_999  # above every pid_max: the real ps always fails for i
 
 
 def hot_path_budget() -> None:
-    """Run as the watchdog-bounded plugin process does (1.4s deadline from now)."""
+    """Run as the watchdog-bounded plugin process does (1.5s deadline from now)."""
     runtime.PROCESS_DEADLINE_SECONDS = runtime.DEFAULT_DEADLINE_SECONDS
     runtime.START_TIME = time.monotonic()
     runtime.set_deadline_mode(runtime.DEADLINE_BOUNDED)
@@ -242,13 +242,13 @@ class DeadlineModeTests(SandboxTestCase):
         hot_path_budget()
         self.assertGreaterEqual(process.HOT_PATH_PROBE_TIMEOUT, 0.2)
         self.assertAlmostEqual(process.probe_timeout(), process.HOT_PATH_PROBE_TIMEOUT, delta=0.01)
-        runtime.START_TIME = time.monotonic() - 0.95  # ~0.45s left
+        runtime.START_TIME = time.monotonic() - (runtime.DEFAULT_DEADLINE_SECONDS - 0.45)  # ~0.45s left
         self.assertLess(process.probe_timeout(), process.HOT_PATH_PROBE_TIMEOUT)
         self.assertGreater(process.probe_timeout(), process.MIN_PROBE_TIMEOUT)
 
     def test_startup_window_before_the_watchdog_is_bounded(self):
         """Plan §6.1 (gap subprocess-no-timeout): before arm_watchdog() (identity warm-up) an
-        inferred-mode process still honours the 1.4s budget."""
+        inferred-mode process still honours the 1.5s budget."""
         runtime.PROCESS_DEADLINE_SECONDS = runtime.DEFAULT_DEADLINE_SECONDS
         runtime.START_TIME = time.monotonic()
         runtime.set_deadline_mode(None)

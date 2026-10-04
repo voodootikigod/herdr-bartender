@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import http.client
 import json
-import os
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -48,7 +47,6 @@ DEFAULT_HEALTH_TIMEOUT = 0.6
 MIN_SOCKET_TIMEOUT = 0.05
 NETWORK_BUDGET_RESERVE = 0.3
 MAX_RESPONSE_BYTES = 65536
-UNIT_TESTING_ENV = "HERDR_BARTENDER_UNIT_TESTING"
 
 
 @dataclass(frozen=True)
@@ -173,11 +171,15 @@ def _bartender_gate_open(bridge_url: Optional[str]) -> bool:
     return False
 
 
+class CriticalSectionViolation(AssertionError):
+    """Network I/O was attempted while this process held the cache lock (Plan §1 L9)."""
+
+
 def _guard_critical_section() -> None:
+    """``assert not IN_CRITICAL_SECTION`` (Plan §1 L9), enforced in every mode."""
     if runtime.IN_CRITICAL_SECTION:
-        log_debug("FATAL: Network I/O attempted while holding critical section file lock!")
-        if os.environ.get(UNIT_TESTING_ENV):
-            raise AssertionError("Network I/O attempted while holding critical section file lock!")
+        log_debug("FATAL: network I/O attempted while holding the cache lock")
+        raise CriticalSectionViolation("network I/O attempted while holding the cache lock")
 
 
 def _perform(req: urllib.request.Request, timeout: float

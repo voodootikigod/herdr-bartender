@@ -4,10 +4,18 @@
 Resolves its own real path (so it works when symlinked into
 ~/.config/herdr/plugins), puts the repository root on sys.path and runs
 herdr_bartender.cli.main().
+
+The clock is read before anything else is imported: Plan §6.1 counts process
+start-up and module load against the 1.5s deadline, and Plan §4.3 step 1 takes
+the arrival stamp at process entry.
 """
 
-import os
-import sys
+import time
+
+_LAUNCHED_AT = (time.monotonic(), time.time_ns())
+
+import os  # noqa: E402
+import sys  # noqa: E402
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -16,4 +24,4 @@ if _REPO_ROOT not in sys.path:
 from herdr_bartender.cli import main  # noqa: E402
 
 if __name__ == "__main__":
-    main()
+    main(launched_at=_LAUNCHED_AT)

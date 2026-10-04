@@ -29,10 +29,20 @@ class StatusEventTests(SandboxTestCase):
         )
         self.assertEqual(list(self.bridge.sessions.values())[0]["state"], "Waiting")
 
-    # WEAK: t2-lifecycle
     def test_p02_lifecycle_transitions(self):
-        """Plan §10.1 #2: working -> Working, then blocked -> Waiting, delivered to the bridge."""
+        """Plan §10.1 #2 (gap t2-lifecycle): working -> blocked -> done -> idle on one pane; each state reaches the
+        bridge in order and the cache tracks desired/delivered state with seq advancing by one."""
         self._lifecycle_prefix()
+        for status in ("done", "idle"):
+            handle_agent_status_changed({"agent_status": status, "pane_id": "w1:p1", "workspace_id": "w1",
+                                         "agent": "claude"}, {"tab_id": "w1:t1"}, bridge_url=self.mock_url)
+        sid = self.sid("w1:p1")
+        sent = [(e["state"], e["seq"]) for e in self.bridge.events_for(sid)]
+        self.assertEqual(sent, [("Working", 1), ("Waiting", 2), ("Done", 3), ("Idle", 4)])
+        with self.cache_mgr as data:
+            s = data["sessions"][sid]
+        self.assertEqual((s["desired_state"], s["delivered_state"], s["seq"], s["delivered_seq"]), ("Idle", "Idle", 4, 4))
+        self.assertEqual(self.bridge.sessions[sid]["state"], "Idle")
 
     def test_p05_unknown_status_debounced(self):
         """Plan §10.1 #5: an `unknown` status does not evict the active session (anti-flap)."""
@@ -44,7 +54,20 @@ class StatusEventTests(SandboxTestCase):
         )
         self.assertEqual(len(self.bridge.sessions), 1)
 
-    # WEAK: t7-seq-monotonic
+    def test_p07_seq_strictly_monotonic(self):
+        """Plan §10.1 #7 (gap t7-seq-monotonic): every accepted event advances seq by exactly one, dropped events
+        do not, and the seq carried by the bridge payloads strictly increases."""
+        t_base, seqs = time.time(), []
+        events = [("working", 1), ("blocked", 2), ("working", 3), ("done", 0.5), ("idle", 4)]  # 0.5: stale, dropped
+        for status, offset in events:
+            handle_agent_status_changed({"agent_status": status, "pane_id": "w1:pMono", "workspace_id": "w1",
+                                         "agent": "claude", "timestamp": t_base + offset}, {}, bridge_url=self.mock_url)
+            with self.cache_mgr as data:
+                seqs.append(data["sessions"][self.sid("w1:pMono")]["seq"])
+        self.assertEqual(seqs, [1, 2, 3, 3, 4])
+        sent = [e["seq"] for e in self.bridge.events_for(self.sid("w1:pMono"))]
+        self.assertEqual(sent, [1, 2, 3, 4])
+
     def test_p07_out_of_order_source_timestamp(self):
         """Plan §10.1 #7: an older source timestamp is dropped and the integer seq is incremented."""
         t_base = time.time()
@@ -142,6 +165,31 @@ class StatusEventTests(SandboxTestCase):
         with self.cache_mgr as data:
             self.assertNotIn(self.sid("wCap:p257"), data["sessions"], "Session 257 must be rejected when 256 active sessions exist")
             self.assertEqual(len(data["sessions"]), 256)
+
+    def test_p51_capacity_prunes_salvaged_before_rejecting(self):
+        """Plan §10.1 #51 / §4.3 capacity check (gap capacity-prune-before-reject): with 255 live sessions and one
+        salvaged record cached, session 257 is admitted after pruning the salvaged record, and delivered."""
+        live = {
+            f"herdr:{self.host}:wCap:p{i}": {"desired_state": "Working", "seq": 1, "pane_id": f"wCap:p{i}",
+                                              "agent": "Claude (Herdr)", "last_event_at": time.time()}
+            for i in range(255)
+        }
+        salvaged_sid = self.sid("wOld:pSalvaged")
+        with self.cache_mgr as data:
+            data["sessions"] = {**live, salvaged_sid: {
+                "desired_state": "Idle", "delivered_state": "Idle", "seq": 1, "delivered_seq": 1, "salvaged": True,
+                "delivery_status": "salvaged", "pane_id": "wOld:pSalvaged", "last_event_at": time.time() - 60}}
+            self.cache_mgr.save(data)
+
+        handle_agent_status_changed(
+            {"agent_status": "working", "pane_id": "wCap:p257", "workspace_id": "wCap", "agent": "claude"},
+            {}, bridge_url=self.mock_url,
+        )
+        with self.cache_mgr as data:
+            self.assertTrue(self.sid("wCap:p257") in data["sessions"], "session 257 admitted after pruning")
+            self.assertFalse(salvaged_sid in data["sessions"], "the salvaged record made room")
+            self.assertEqual(len(data["sessions"]), 256)
+        self.assertEqual([e["state"] for e in self.bridge.events_for(self.sid("wCap:p257"))], ["Working"])
 
     def test_p59_agent_exit_without_container_tombstone(self):
         """Plan §10.1 #59: agent exit evicts without a container tombstone, records agent_exits, and a new agent re-admits."""

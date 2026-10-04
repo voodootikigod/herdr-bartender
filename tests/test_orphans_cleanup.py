@@ -3,13 +3,16 @@
 import json
 import time
 import unittest
+from unittest import mock
 
+from herdr_bartender import cache, cleanup, runtime
 from herdr_bartender.bridge import post_bartender_event
 from herdr_bartender.cleanup import run_cleanup
 from herdr_bartender.markers import touch_pane_marker
 from herdr_bartender.orphans import run_replay_orphans
 from herdr_bartender.paths import get_orphan_path
 from tests.support import SandboxTestCase
+from tests.support.lock_holder import hold_lock
 
 
 class OrphanCleanupTests(SandboxTestCase):
@@ -94,6 +97,50 @@ class OrphanCleanupTests(SandboxTestCase):
             h.get("session_id") == sid_orphan and h.get("state") == "Ended" for h in self.bridge.history
         )
         self.assertFalse(ended_dispatched, "Orphan replay must NOT dispatch Ended for session superseded by newer generation")
+
+
+
+class CleanupLockTests(SandboxTestCase):
+    """--cleanup under the raising cache lock (finding: cleanup inherits the 0.2s event-path lock budget)."""
+
+    def setUp(self):
+        super().setUp()
+        self.sid_ = self.sid("w1:pCleanLock")
+        with self.cache_mgr as data:
+            data["sessions"][self.sid_] = {"desired_state": "Working", "seq": 1, "delivered_seq": 1,
+                                           "pane_id": "w1:pCleanLock", "agent": "Claude (Herdr)",
+                                           "last_event_at": time.time()}
+            self.cache_mgr.save(data)
+        runtime.PROCESS_DEADLINE_SECONDS = runtime.DEFAULT_DEADLINE_SECONDS
+        runtime.START_TIME = time.monotonic()  # inside the first 1.5s: the event-path budget would apply
+
+    def test_cleanup_is_unbounded_and_waits_out_brief_contention(self):
+        """Plan L619/L686 + R10: --cleanup is exempt from the 1.5s event budget; a lock held for 0.5s by another
+        process delays it instead of failing it with exit 1."""
+        hold_lock(self, self.cache_mgr.lock_file, seconds=0.5)
+        self.assertEqual(run_cleanup(bridge_url=self.mock_url), 0)
+        self.assertFalse(runtime.deadline_bounded())
+        with self.cache_mgr as data:
+            self.assertNotIn(self.sid_, data["sessions"])
+
+    def test_confirmation_is_kept_when_the_cache_cannot_be_relocked(self):
+        """Plan §4.3 L483 applied to --cleanup: a POST confirmed but not recordable under the lock goes to results/
+        (the reconciler applies it) instead of being lost behind exit 1."""
+        real_flock, posted = cache._flock_within, []
+
+        def post(payload, timeout=0.2, bridge_url=None):
+            posted.append(payload)
+            return True, False
+
+        def flock(fd, timeout):
+            return False if posted else real_flock(fd, timeout)
+
+        with mock.patch.object(cleanup, "post_bartender_event", side_effect=post), \
+                mock.patch.object(cache, "_flock_within", side_effect=flock):
+            self.assertEqual(run_cleanup(bridge_url=self.mock_url), 0)
+        (result,) = [json.loads(p.read_text()) for p in (self.state_dir / "results").glob("*.json")]
+        self.assertEqual((result["session_id"], result["transmitting_state"], result["status"]),
+                         (self.sid_, "Ended", "success"))
 
 
 if __name__ == "__main__":

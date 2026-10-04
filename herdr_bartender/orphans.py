@@ -7,7 +7,7 @@ import itertools
 import json
 import os
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import FrozenSet, Iterable, List, Optional, Tuple
 
 from . import clock, runtime
 from .bridge import post_bartender_event
@@ -16,7 +16,7 @@ from .config import SESSION_ID_REGEX
 from .log import log_debug
 from .markers import remove_pane_marker
 from .paths import PRIVATE_FILE_MODE, ensure_private_dir, get_orphan_path, get_state_dir
-from .sender import touch_reconciler_pending
+from .handoff import touch_reconciler_pending
 
 
 ORPHAN_LOCK_DEADLINE_SECONDS = 0.05   # R10 / Plan §6.1: event-path orphan lock budget
@@ -232,13 +232,51 @@ def remove_orphan_record(sid: str, orphan_file: Optional[Path] = None, blocking:
     return _locked_or_journaled(orphan_path, {"op": OP_REMOVE, "sid": sid}, blocking)
 
 
+def journal_orphan_exports(exports: Iterable[Tuple[str, dict]], orphan_file: Optional[Path] = None) -> None:
+    """Durably journal exports WITHOUT taking the orphan lock (so it may run under the cache lock).
+
+    Step A uses it for undelivered Ended records pruned at the 256 cap: the journal entry
+    is fsynced before the cache save that prunes the record, so a crash right after that
+    save cannot lose the owed Ended (a save that then fails leaves only a harmless duplicate
+    mirror of a record still cached). The next orphan-lock holder folds it into the file.
+    Raises OSError (or TypeError/ValueError for an unserializable record) on failure.
+    """
+    orphan_path = orphan_file or get_orphan_path()
+    for sid, record in exports:
+        _journal_op(orphan_path, {"op": OP_EXPORT, "sid": sid, "session": record})
+
+
+def run_orphan_io(exports: Iterable[Tuple[str, dict]], removals: Iterable[str], blocking: bool = False) -> None:
+    """Staged orphan exports, then removals, OUTSIDE the cache lock (Plan §1 L108); never raises.
+
+    On the event path (``blocking=False``) each operation is bounded by the 50ms
+    LOCK_NB orphan lock and otherwise journaled for the reconciler (R10), so callers
+    may run it inside ``watchdog.deferred_exit()`` without risking the deadline.
+    """
+    for sid, record in exports:
+        export_orphan_record(sid, record, blocking=blocking)
+    for sid in removals:
+        remove_orphan_record(sid, blocking=blocking)
+
+
+def _journal_waiting(orphan_path: Path) -> bool:
+    """Journal entries are queued (an unlistable journal counts as waiting, so the flush reports the error)."""
+    pending = pending_dir_for(orphan_path)
+    try:
+        return pending.is_dir() and any(pending.glob("*.json"))
+    except OSError as e:
+        log_debug(f"Could not list orphan journal {pending}: {e}")
+        return True
+
+
 def flush_pending_orphan_ops(orphan_file: Optional[Path] = None, blocking: bool = True) -> bool:
     """Replay journaled orphan ops into the orphan file (the reconciler calls this each pass).
 
     True when the journal is empty afterwards; False when the lock was unavailable or I/O failed.
+    An empty journal returns at once, without taking (or waiting for) the orphan lock.
     """
     orphan_path = orphan_file or get_orphan_path()
-    if not pending_dir_for(orphan_path).is_dir():
+    if not _journal_waiting(orphan_path):
         return True
     try:
         lock_fd = acquire_orphan_lock(orphan_path, blocking=blocking)
@@ -252,6 +290,36 @@ def flush_pending_orphan_ops(orphan_file: Optional[Path] = None, blocking: bool 
     except Exception as e:
         log_debug(f"Failed to flush orphan journal for {orphan_path}: {e}")
         return False
+
+
+def _pane_ids(records) -> FrozenSet[str]:
+    return frozenset(r["pane_id"] for r in records if isinstance(r, dict) and isinstance(r.get("pane_id"), str))
+
+
+def orphan_pane_ids(orphan_file: Optional[Path] = None) -> Optional[FrozenSet[str]]:
+    """Pane ids referenced by the orphan file and its pending journal (Plan §1 L107 prune protection).
+
+    Read under the orphan lock (LOCK_NB, 50ms) and never inside the cache critical
+    section; callers pass the result to ``BoundedSessionCache.save(orphan_panes=...)``.
+    None when the orphan lock is contended or the read fails (the prune is then deferred).
+    """
+    orphan_path = orphan_file or get_orphan_path()
+    if not orphan_path.exists() and not pending_dir_for(orphan_path).is_dir():
+        return frozenset()
+    try:
+        lock_fd = acquire_orphan_lock(orphan_path)
+    except OSError as e:
+        log_debug(f"Could not lock {orphan_path} to read orphan panes: {e}")
+        return None
+    if lock_fd is None:
+        return None
+    try:
+        sessions = _read_orphan_sessions(orphan_path)
+        _, ops = _load_journal(orphan_path)
+    finally:
+        release_orphan_lock(lock_fd)
+    exported = [op["session"] for op in ops if op.get("op") == OP_EXPORT]
+    return _pane_ids(list(sessions.values()) + exported)
 
 
 def run_replay_orphans(orphan_path_str: str, bridge_url: str | None = None) -> bool:

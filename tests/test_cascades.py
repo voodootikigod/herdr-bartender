@@ -13,9 +13,9 @@ from tests.support import SandboxTestCase
 
 
 class CascadeTests(SandboxTestCase):
-    # WEAK: t3-cascade-lease
     def test_p03_container_cascades(self):
-        """Plan §10.1 #3: pane.closed, tab.closed and workspace.closed end their matching sessions."""
+        """Plan §10.1 #3: pane.closed, tab.closed and workspace.closed end their matching sessions (lease
+        deferral, overflow and budget rules: tests/test_cascade_protocol.py)."""
         handle_agent_status_changed(
             {"agent_status": "working", "pane_id": "w1:p1", "workspace_id": "w1", "agent": "claude", "title": "Unit test turn"},
             {"tab_id": "w1:t1"},
@@ -59,9 +59,6 @@ class CascadeTests(SandboxTestCase):
             self.assertNotIn(self.sid("w1:pTombstone"), data.get("sessions", {}), "Late status event must not resurrect closed pane")
             self.assertIn("w1:pTombstone", data.get("tombstones", {}), "Tombstone must be recorded")
 
-    # GAP dispatch-protocol/tombstone-on-stale-close (pane.closed only saves the tombstone `if sessions:`;
-    # the original suite passed only because earlier sections left sessions in the shared cache)
-    @unittest.expectedFailure
     def test_p27_close_vs_status_positive_admission(self):
         """Plan §10.1 #27: within 60s of close only a positive, post-close agent event pops the tombstone."""
         t_race_close = time.time_ns()

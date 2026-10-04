@@ -67,11 +67,19 @@ def reset_caches() -> None:
     runtime.PROCESS_START_TIME = None
 
 
-def _cached(key: Tuple, compute: Callable[[], object]) -> object:
-    global _CACHE
+def _memo(key: Tuple) -> Tuple[bool, object]:
+    """(True, value) for a fresh memoised lookup, else (False, None). Never spawns."""
     hit = _CACHE.get(key)
     if hit is not None and clock.monotonic() - hit[0] < LIVENESS_TTL_SECONDS:
-        return hit[1]
+        return True, hit[1]
+    return False, None
+
+
+def _cached(key: Tuple, compute: Callable[[], object]) -> object:
+    global _CACHE
+    found, value = _memo(key)
+    if found:
+        return value
     value = compute()
     _CACHE = {**_CACHE, key: (clock.monotonic(), value)}
     return value
@@ -205,13 +213,37 @@ def is_pid_alive(pid: Optional[int]) -> bool:
         return False
 
 
-def is_process_instance_alive(pid: Optional[int], expected_start_time: Optional[str] = None) -> bool:
-    """PID is alive and, when both start times are known, it is still the same process instance."""
+def is_process_instance_alive(pid: Optional[int], expected_start_time: Optional[str] = None,
+                              start_time: Optional[Callable[[Optional[int]], Optional[str]]] = None) -> bool:
+    """PID is alive and, when both start times are known, it is still the same process instance.
+
+    ``start_time`` looks up the PID's start time (default: ``get_process_start_time``,
+    which may spawn ``ps``); under the cache lock pass ``memoised_start_time``.
+    """
     if not is_pid_alive(pid):
         return False
     if known_start_time(expected_start_time) is None:
         return True
-    return not start_times_differ(get_process_start_time(pid), expected_start_time)
+    lookup = get_process_start_time if start_time is None else start_time
+    return not start_times_differ(lookup(pid), expected_start_time)
+
+
+# -- memo-only lookups (safe under the cache lock: they never spawn) --------------------
+def memoised_start_time(pid: Optional[int]) -> Optional[str]:
+    """``get_process_start_time(pid)`` from the 0.5s memo only; not memoised is unknown (None, R14)."""
+    found, value = _memo(("start", pid))
+    return value if found else None  # type: ignore[return-value]
+
+
+def memoised_instance_alive(pid: Optional[int], expected_start_time: Optional[str] = None) -> bool:
+    """``is_process_instance_alive`` without spawning: an unresolved start time never rejects a holder (R14)."""
+    return is_process_instance_alive(pid, expected_start_time, start_time=memoised_start_time)
+
+
+def memoised_herdr_alive() -> bool:
+    """``is_herdr_alive()`` from the 0.5s memo only; not memoised counts as alive (same as a failed probe)."""
+    found, probe = _memo(("herdr",))
+    return not (found and probe.pid is None and probe.known)  # type: ignore[union-attr]
 
 
 def _earliest(pids: List[int]) -> Optional[int]:

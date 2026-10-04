@@ -1,109 +1,201 @@
-"""Spool directory: enqueue and FIFO replay of deferred events."""
+"""Event spool: contention envelopes (Plan §4.3 Step A contention rule) and FIFO replay under the lock.
+
+* ``defer_event()``: the event path could not take (or save) the cache lock. It
+  writes an R6 envelope to ``spool/<enqueued_ns:020d>_<pid>_<monotonic_ns>.json``
+  (atomic rename; at most 100 files, close envelopes never pruned), flags the
+  reconciler and returns, so the caller exits 0 without touching the cache.
+* ``replay_spool_locked(data)``: Step A, while the caller holds the cache lock.
+  Up to 16 envelopes in filename (FIFO) order are staged into ``data`` with the
+  pure ``staging`` functions; poison envelopes go to ``spool/bad`` (<= 20). The
+  caller saves, then calls ``batch.commit()`` (still under the lock) to unlink
+  exactly the envelopes whose mutations were saved. Delivery is left to the
+  universal sender / reconciler.
+"""
 
 from __future__ import annotations
 
-import json
 import os
 import time  # real monotonic_ns keeps spool filenames unique under a fake clock
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, List, Optional, Tuple
 
 from . import clock
-from .bridge import post_bartender_event
-from .handlers import (
-    handle_agent_status_changed,
-    handle_pane_closed,
-    handle_tab_closed,
-    handle_workspace_closed,
+from .cache import BoundedSessionCache
+from .envelopes import (
+    build_envelope,
+    is_close_envelope,
+    quarantine,
+    read_json,
+    unlink_files,
+    validate_envelope,
+    write_json_atomic,
 )
-from .log import log_debug
-from .paths import get_state_dir
+from .intake import PANE_CLOSED, STATUS_EVENT, resolve_identity
+from .log import log_debug, log_warning
+from .paths import ensure_private_dir, get_state_dir
+from .process import is_herdr_alive, memoised_herdr_alive
+from .handoff import ensure_reconciler_running, touch_reconciler_pending
+from .staging import stage_container_close, stage_pane_close, stage_status
+
+SPOOL_CAP = 100
+REPLAY_BATCH = 16
+WORKSPACE_ENV = "HERDR_WORKSPACE_ID"
 
 
-def enqueue_spool(event_name: str, event_data: dict, context: dict, arrival_time: float | None = None, arrival_ns: int | None = None):
+class SpoolWriteError(Exception):
+    """The contention envelope could not be written."""
+
+
+@dataclass(frozen=True)
+class ReplayBatch:
+    consumed: Tuple[Path, ...] = ()       # applied or superseded: unlink after the save
+    quarantined: Tuple[Path, ...] = ()
+    staged_sessions: Tuple[str, ...] = ()  # sessions left with an undelivered seq
+
+    @property
+    def needs_save(self) -> bool:
+        return bool(self.consumed)
+
+    def commit(self) -> None:
+        """Unlink the consumed envelopes. Call after a successful save, before releasing the lock."""
+        unlink_files(list(self.consumed))
+
+
+def spool_dir(state_dir: Optional[Path] = None) -> Path:
+    return ensure_private_dir((state_dir or get_state_dir()) / "spool")
+
+
+# -- enqueue ---------------------------------------------------------------------------
+def _with_env_workspace(event_data: dict) -> dict:
+    """R1: freeze this process's HERDR_WORKSPACE_ID into a colon-less pane event (the replayer's env differs)."""
+    pane, ws = event_data.get("pane_id"), os.environ.get(WORKSPACE_ENV)
+    if isinstance(pane, str) and ":" not in pane and not event_data.get("workspace_id") and ws:
+        return {**event_data, "workspace_id": ws}
+    return dict(event_data)
+
+
+def _make_room(directory: Path) -> None:
+    """Keep at most SPOOL_CAP - 1 envelopes before a write; only the oldest non-close ones are dropped."""
+    files = sorted(p for p in directory.glob("*.json") if p.is_file())
+    excess = len(files) - (SPOOL_CAP - 1)
+    for path in files:
+        if excess <= 0:
+            return
+        try:
+            env = read_json(path)
+        except (OSError, ValueError) as e:
+            excess -= int(quarantine(path, directory / "bad", f"unreadable while pruning: {e}"))
+            continue
+        if is_close_envelope(env):
+            continue
+        log_warning(f"Spool at capacity; dropping oldest status envelope {path.name}")
+        unlink_files([path])
+        excess -= 1
+
+
+def enqueue_spool(event_name: str, event_data: dict, context: dict, arrival_ns: Optional[int] = None,
+                  state_dir: Optional[Path] = None) -> Path:
+    """Write one R6 envelope atomically; raises SpoolWriteError."""
     try:
-        spool_dir = get_state_dir() / "spool"
-        spool_dir.mkdir(parents=True, exist_ok=True)
-        existing_spools = sorted([f for f in spool_dir.glob("*.json") if f.is_file()])
-        if len(existing_spools) >= 100:
-            # Protect close events from spool pruning; only prune oldest non-close events
-            to_prune = len(existing_spools) - 99
-            pruned = 0
-            for old_spool in existing_spools:
-                if pruned >= to_prune:
-                    break
-                try:
-                    with open(old_spool, "r", encoding="utf-8") as sf:
-                        s_env = json.load(sf)
-                    ev_name = s_env.get("event_name", "")
-                    ev_state = s_env.get("event_data", {}).get("state", "")
-                    if ev_name in ("pane.closed", "tab.closed", "workspace.closed") or ev_state == "Ended":
-                        continue
-                    old_spool.unlink(missing_ok=True)
-                    pruned += 1
-                except Exception:
-                    old_spool.unlink(missing_ok=True)
-                    pruned += 1
-        arr_time = arrival_time or clock.time()
-        arr_ns = arrival_ns or clock.time_ns()
-        envelope = {
-            "event_name": event_name,
-            "event_data": event_data,
-            "context": context,
-            "arrival_time": arr_time,
-            "arrival_ns": arr_ns,
-            "enqueued_at": clock.time(),
-            "enqueued_ns": arr_ns,
-        }
-        filename = f"{arr_ns:020d}_{os.getpid()}_{time.monotonic_ns()}.json"
-        tmp_file = spool_dir / f"{filename}.tmp"
-        final_file = spool_dir / filename
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(envelope, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_file, final_file)
-    except Exception as e:
-        log_debug(f"Failed to enqueue spool: {e}")
+        directory = spool_dir(state_dir)
+        _make_room(directory)
+        enqueued_ns = clock.time_ns()
+        env = build_envelope(event_name, _with_env_workspace(event_data if isinstance(event_data, dict) else {}),
+                             context, arrival_ns or enqueued_ns, enqueued_ns)
+        path = directory / f"{enqueued_ns:020d}_{os.getpid()}_{time.monotonic_ns()}.json"
+        write_json_atomic(path, env)
+        return path
+    except (OSError, TypeError, ValueError) as e:
+        raise SpoolWriteError(f"could not spool {event_name}: {e}") from e
 
 
-def replay_spool_dir(state_dir: Path, bridge_url: str | None = None, max_batch: int = 16):
-    spool_dir = state_dir / "spool"
-    if not spool_dir.exists():
-        return
-    bad_dir = spool_dir / "bad"
-    if bad_dir.exists():
-        try:
-            bad_files = sorted([f for f in bad_dir.glob("*.json") if f.is_file()], key=lambda f: f.stat().st_mtime)
-            if len(bad_files) >= 20:
-                for bf in bad_files[: len(bad_files) - 19]:
-                    bf.unlink(missing_ok=True)
-        except Exception:
-            pass
-    files = sorted([f for f in spool_dir.glob("*.json") if f.is_file()])
-    for file_path in files[:max_batch]:
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                envelope = json.load(f)
-            ename = envelope.get("event_name", "")
-            edata = envelope.get("event_data", {})
-            econtext = envelope.get("context", {})
-            arr_time = envelope.get("arrival_time", envelope.get("enqueued_at", clock.time()))
-            arr_ns = envelope.get("arrival_ns", envelope.get("enqueued_ns", int(arr_time * 1e9)))
-            if ename == "pane.agent_status_changed":
-                handle_agent_status_changed(edata, econtext, bridge_url=bridge_url, arrival_time=arr_time, arrival_ns=arr_ns)
-            elif ename == "pane.closed":
-                handle_pane_closed(edata, econtext, bridge_url=bridge_url, arrival_ns=arr_ns)
-            elif ename == "tab.closed":
-                handle_tab_closed(edata, econtext, bridge_url=bridge_url, arrival_ns=arr_ns)
-            elif ename == "workspace.closed":
-                handle_workspace_closed(edata, econtext, bridge_url=bridge_url, arrival_ns=arr_ns)
-            elif ename == "direct_post":
-                post_bartender_event(edata, bridge_url=bridge_url)
-            file_path.unlink(missing_ok=True)
-        except Exception as e:
-            log_debug(f"Error replaying spool file {file_path}, quarantining to spool/bad: {e}")
-            try:
-                bad_dir.mkdir(parents=True, exist_ok=True)
-                os.replace(file_path, bad_dir / file_path.name)
-            except Exception:
-                file_path.unlink(missing_ok=True)
+def defer_event(event_name: str, event_data: dict, context: dict, arrival_ns: int, reason: object) -> Optional[Path]:
+    """Contention path: spool the event, flag and ensure the reconciler; never raises, never touches the cache."""
+    path = None
+    try:
+        path = enqueue_spool(event_name, event_data, context, arrival_ns)
+        log_debug(f"Deferred {event_name} to spool/{path.name} ({reason})")
+    except SpoolWriteError as e:
+        log_warning(f"{event_name} lost: {reason}; {e}")
+    touch_reconciler_pending()
+    ensure_reconciler_running()
+    return path
+
+
+# -- replay ----------------------------------------------------------------------------
+def apply_envelope_locked(data: dict, env: dict, herdr_alive: Callable[[], bool]) -> Tuple[str, ...]:
+    """Stage one validated envelope into ``data``; returns the session ids it staged (none: dropped)."""
+    name, event_data, arrival_ns = env["event_name"], env["event_data"], env["arrival_ns"]
+    context = env.get("context") or {}
+    generation = env.get("generation")
+    if name in (STATUS_EVENT, PANE_CLOSED):
+        identity, notes = resolve_identity(event_data, context if name == STATUS_EVENT else {}, env={})
+        for note in notes:
+            log_debug(note)
+        if identity is None:
+            return ()
+        if name == PANE_CLOSED:
+            return tuple(t.session_id for t in stage_pane_close(data, identity.canonical_pane, event_data,
+                                                                arrival_ns, generation))
+        stage = stage_status(data, identity, event_data, context, arrival_ns, herdr_alive=herdr_alive,
+                             spool_generation=generation, require_newer=True)
+        return (stage.session_id,) if stage.staged else ()
+    return tuple(t.session_id for t in stage_container_close(data, name, event_data, arrival_ns, generation))
+
+
+def _replay_one(data: dict, path: Path, bad_dir: Path, herdr_alive: Callable[[], bool]) -> Optional[Tuple[str, ...]]:
+    """Staged session ids, or None when the envelope was quarantined."""
+    try:
+        env = read_json(path)
+    except (OSError, ValueError) as e:
+        quarantine(path, bad_dir, f"undecodable envelope: {e}")
+        return None
+    reason = validate_envelope(env)
+    if reason:
+        quarantine(path, bad_dir, reason)
+        return None
+    try:
+        return apply_envelope_locked(data, env, herdr_alive)
+    except Exception as e:  # a poison pill must never block the FIFO
+        quarantine(path, bad_dir, f"replay failed: {e!r}")
+        return None
+
+
+def replay_spool_locked(data: dict, state_dir: Optional[Path] = None, max_batch: int = REPLAY_BATCH,
+                        herdr_alive: Callable[[], bool] = memoised_herdr_alive) -> ReplayBatch:
+    """Plan §4.3 Step A spool replay; the caller holds the cache lock, then saves and commits.
+
+    ``herdr_alive`` (tombstone gate) must not spawn under the lock: callers warm the
+    0.5s liveness memo before locking (Plan §6.1).
+    """
+    directory = (state_dir or get_state_dir()) / "spool"
+    if not directory.is_dir():
+        return ReplayBatch()
+    consumed: List[Path] = []
+    quarantined: List[Path] = []
+    staged: List[str] = []
+    for path in sorted(p for p in directory.glob("*.json") if p.is_file())[:max_batch]:
+        result = _replay_one(data, path, directory / "bad", herdr_alive)
+        if result is None:
+            quarantined.append(path)
+        else:
+            consumed.append(path)
+            staged.extend(result)
+    return ReplayBatch(tuple(consumed), tuple(quarantined), tuple(dict.fromkeys(staged)))
+
+
+def replay_spool_dir(state_dir: Path, max_batch: int = REPLAY_BATCH,
+                     cache_mgr: Optional[BoundedSessionCache] = None) -> ReplayBatch:
+    """Reconciler step 1b: one locked replay pass (raises CacheError on lock/save failure)."""
+    directory = Path(state_dir) / "spool"
+    if not directory.is_dir() or not any(directory.glob("*.json")):
+        return ReplayBatch()
+    cache_mgr = cache_mgr or BoundedSessionCache(state_dir)
+    is_herdr_alive()  # resolve (memoise) before locking: no subprocess under the cache lock
+    with cache_mgr as data:
+        batch = replay_spool_locked(data, Path(state_dir), max_batch)
+        if batch.needs_save:
+            cache_mgr.save(data)
+            batch.commit()
+    return batch
