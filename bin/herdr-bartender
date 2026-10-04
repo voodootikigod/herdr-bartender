@@ -46,6 +46,7 @@ OSC_REGEX = re.compile(r'\x1b\][^\x07\x1b]*(\x07|\x1b\\)')
 DCS_REGEX = re.compile(r'\x1bP[^\x1b]*\x1b\\')
 CONTROL_REGEX = re.compile(r'[\x00-\x1f\x7f-\x9f]')
 PANE_ID_REGEX = re.compile(r'^[a-zA-Z0-9_:-]{1,48}$')
+CONTAINER_ID_REGEX = re.compile(r'^[a-zA-Z0-9_:-]{1,48}$')
 
 START_TIME = time.monotonic()
 PROCESS_ARRIVAL_TIME = time.time()
@@ -74,13 +75,8 @@ def get_sanitized_hostname() -> str:
 
 
 def get_bridge_url() -> str:
-    host = os.environ.get("NOTCHBAR_AGENTS_HOST") or DEFAULT_HOST
     port = os.environ.get("NOTCHBAR_AGENTS_PORT") or str(DEFAULT_PORT)
-    # Restrict to loopback unless explicitly overridden
-    if host not in ("127.0.0.1", "localhost") and os.environ.get("HERDR_ALLOW_REMOTE_NOTCHBAR") != "1":
-        log_debug(f"Warning: Non-loopback host {host} specified without HERDR_ALLOW_REMOTE_NOTCHBAR=1. Falling back to 127.0.0.1")
-        host = DEFAULT_HOST
-    return f"http://{host}:{port}"
+    return f"http://127.0.0.1:{port}"
 
 
 def time_remaining() -> float:
@@ -153,17 +149,68 @@ def is_herdr_alive() -> bool:
 HOOK_GUARD_TEMPLATE = """# BEGIN HERDR-BARTENDER DEDUP GUARD
 if [ -n "${HERDR_PANE_ID:-}" ]; then
   STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/herdr-bartender"
-  # Check tombstone disable flag
-  if [ ! -f "$STATE_HOME/DISABLED" ]; then
+  # Guard check: suppress vendor hook only if healthy, active, and delivering
+  if [ ! -f "$STATE_HOME/DISABLED" ] && [ ! -f "$STATE_HOME/DELIVERY_DOWN" ]; then
     HEX_PANE=$(printf '%s' "$HERDR_PANE_ID" | od -An -tx1 | tr -d ' \\n')
     PANE_MARKER="$STATE_HOME/panes/${HEX_PANE}"
-    # Guard check: suppress vendor hook if marker exists AND Herdr process is running
-    if [ -f "$PANE_MARKER" ] && pgrep -xi "herdr" >/dev/null 2>&1; then
+    if [ -f "$PANE_MARKER" ] && [ ! -f "${PANE_MARKER}.failed" ] && pgrep -xi "herdr" >/dev/null 2>&1; then
       exit 0
     fi
   fi
 fi
 # END HERDR-BARTENDER DEDUP GUARD"""
+
+
+def touch_pane_failed(pane_id: str):
+    if not pane_id or is_disabled():
+        return
+    try:
+        panes_dir = get_state_dir() / "panes"
+        panes_dir.mkdir(parents=True, exist_ok=True)
+        hex_id = get_hex_pane_id(pane_id)
+        failed_path = panes_dir / f"{hex_id}.failed"
+        with open(failed_path, "w", encoding="utf-8") as f:
+            f.write(str(int(time.time())))
+        marker_path = panes_dir / hex_id
+        if marker_path.exists():
+            marker_path.unlink()
+    except Exception:
+        pass
+
+
+def clear_pane_failed(pane_id: str):
+    if not pane_id:
+        return
+    try:
+        hex_id = get_hex_pane_id(pane_id)
+        failed = get_state_dir() / "panes" / f"{hex_id}.failed"
+        if failed.exists():
+            failed.unlink()
+    except Exception:
+        pass
+
+
+def touch_delivery_down():
+    try:
+        (get_state_dir() / "DELIVERY_DOWN").touch(exist_ok=True)
+    except Exception:
+        pass
+
+
+def clear_delivery_down():
+    try:
+        flag = get_state_dir() / "DELIVERY_DOWN"
+        if flag.exists():
+            flag.unlink()
+    except Exception:
+        pass
+
+
+def is_delivery_down() -> bool:
+    try:
+        return (get_state_dir() / "DELIVERY_DOWN").exists()
+    except Exception:
+        return False
 
 
 def get_vendor_hooks_dir() -> Path:
@@ -304,6 +351,9 @@ def touch_pane_marker(pane_id: str):
         marker_path = panes_dir / hex_id
         with open(marker_path, "w", encoding="utf-8") as f:
             f.write(str(int(time.time())))
+        failed_path = panes_dir / f"{hex_id}.failed"
+        if failed_path.exists():
+            failed_path.unlink()
     except Exception:
         pass
 
@@ -316,6 +366,9 @@ def remove_pane_marker(pane_id: str):
         marker = get_state_dir() / "panes" / hex_id
         if marker.exists():
             marker.unlink()
+        failed = get_state_dir() / "panes" / f"{hex_id}.failed"
+        if failed.exists():
+            failed.unlink()
     except Exception:
         pass
 
@@ -435,12 +488,32 @@ class BoundedSessionCache:
                     with open(self.cache_file, "r", encoding="utf-8", errors="ignore") as cf:
                         raw_text = cf.read()
                         matches = re.findall(r'herdr:[a-zA-Z0-9_-]+:[a-zA-Z0-9_:-]+', raw_text)
+                        now_salvage = time.time()
                         for m in set(matches):
+                            parts = m.split(":")
+                            pane_id = ":".join(parts[2:]) if len(parts) >= 3 else parts[-1]
+                            ws_id = pane_id.split(":", 1)[0] if ":" in pane_id else None
                             salvaged[m] = {
-                                "desired_state": "Idle",
+                                "pane_id": pane_id,
+                                "workspace_id": ws_id,
+                                "tab_id": None,
+                                "host": parts[1] if len(parts) >= 2 else get_sanitized_hostname(),
                                 "agent": "Herdr",
-                                "salvaged": True,
+                                "raw_agent": None,
+                                "title": f"Salvaged Session {pane_id}",
+                                "cwd": "",
+                                "desired_state": "Idle",
+                                "delivered_state": "Idle",
+                                "seq": 1,
+                                "delivered_seq": 1,
+                                "rejected_seq": 0,
+                                "desired_payload": None,
                                 "delivery_status": "salvaged",
+                                "delivery_error": None,
+                                "delivery_attempts": 0,
+                                "salvaged": True,
+                                "last_event_at": now_salvage,
+                                "last_applied_arrival_time": now_salvage,
                             }
                 except Exception:
                     pass
@@ -528,7 +601,7 @@ def enqueue_spool(event_name: str, event_data: dict, context: dict, arrival_time
         log_debug(f"Failed to enqueue spool: {e}")
 
 
-def replay_spool_dir(state_dir: Path, bridge_url: str | None = None, max_batch: int = 20):
+def replay_spool_dir(state_dir: Path, bridge_url: str | None = None, max_batch: int = 5):
     spool_dir = state_dir / "spool"
     if not spool_dir.exists():
         return
@@ -568,22 +641,29 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
         for sid, s in list(sessions.items()):
             pane_id = s.get("pane_id")
 
-            # Check for stale session (> 24 hours). EXEMPT Waiting sessions!
-            if s.get("desired_state") in ("Idle", "Done") and (now_wall - s.get("last_event_at", now_wall) > 86400):
+            # Check for stale session (> 24 hours for Idle/Done, > 48 hours for Waiting)
+            is_stale = False
+            last_ts = s.get("last_event_at", now_wall)
+            if s.get("desired_state") in ("Idle", "Done") and (now_wall - last_ts > 86400):
+                is_stale = True
+            elif s.get("desired_state") == "Waiting" and (now_wall - last_ts > 172800):
+                is_stale = True
+
+            if is_stale:
                 s["desired_state"] = "Ended"
                 s["seq"] = int(s.get("seq", 0)) + 1
                 s["desired_payload"] = {
                     "state": "Ended",
                     "agent": s.get("agent", "Herdr"),
                     "session_id": sid,
+                    "seq": s["seq"],
                 }
 
             if s.get("delivered_seq", 0) < s.get("seq", 0) or s.get("desired_state") == "Ended":
                 if s.get("desired_state") == "Ended" and s.get("delivery_attempts", 0) >= 5:
                     s["orphaned_ended"] = True
                     continue
-                if s.get("desired_state") != "Ended" and s.get("delivery_attempts", 0) >= 5:
-                    s["delivery_status"] = "delivery_failed"
+                if s.get("delivery_status") in ("non_retryable_failed", "retryable_exhausted"):
                     continue
 
                 lease = s.get("lease_deadline") or 0
@@ -597,6 +677,7 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
                         "state": s.get("desired_state", "Working"),
                         "agent": s.get("agent", "Herdr"),
                         "session_id": sid,
+                        "seq": s.get("seq", 1),
                     }
                 targets.append((sid, s.get("desired_state"), s.get("seq", 1), pane_id, payload))
         cache_mgr.save(data)
@@ -607,24 +688,39 @@ def reconcile_active_sessions(state_dir: Path, bridge_url: str | None = None):
             s = data.get("sessions", {}).get(sid)
             if not s:
                 continue
-            if success or is_non_retryable:
+            if success:
                 s["delivered_state"] = target_state
                 s["delivered_seq"] = target_seq
                 s["delivery_attempts"] = 0
-                s["delivery_status"] = "delivered" if success else "delivery_failed"
+                s["delivery_status"] = "delivered"
                 s.pop("delivery_error", None)
-                if success:
-                    data["last_successful_delivery"] = time.time()
-                    data["consecutive_failures"] = 0
+                data["last_successful_delivery"] = time.time()
+                data["consecutive_failures"] = 0
+                clear_delivery_down()
+                clear_pane_failed(pane_id)
+                for other_s in data.get("sessions", {}).values():
+                    if other_s.get("delivery_status") == "retryable_exhausted":
+                        other_s["delivery_attempts"] = 0
+                        other_s["delivery_status"] = "in_flight"
                 if target_state == "Ended" and s.get("seq") == target_seq:
                     data.get("sessions", {}).pop(sid, None)
                     remove_pane_marker(pane_id)
+            elif is_non_retryable:
+                s["delivery_status"] = "non_retryable_failed"
+                s["rejected_seq"] = target_seq
+                s["delivery_error"] = "bridge_rejected"
+                touch_pane_failed(pane_id)
+                if target_state == "Ended":
+                    s["orphaned_ended"] = True
             else:
                 s["delivery_attempts"] = s.get("delivery_attempts", 0) + 1
                 s["delivery_error"] = "retryable network error"
                 data["consecutive_failures"] = data.get("consecutive_failures", 0) + 1
+                if data["consecutive_failures"] >= 3:
+                    touch_delivery_down()
                 if s.get("delivery_attempts", 0) >= 5:
-                    s["delivery_status"] = "delivery_failed"
+                    s["delivery_status"] = "retryable_exhausted"
+                    touch_pane_failed(pane_id)
                     if s.get("desired_state") == "Ended":
                         s["orphaned_ended"] = True
             cache_mgr.save(data)
@@ -713,6 +809,52 @@ def run_cleanup(bridge_url: str | None = None) -> bool:
     return all_cleared
 
 
+def run_replay_orphans(orphan_path_str: str, bridge_url: str | None = None) -> bool:
+    orphan_path = Path(orphan_path_str).expanduser()
+    if not orphan_path.exists():
+        print(f"[-] Orphan file not found: {orphan_path}")
+        return False
+    try:
+        with open(orphan_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[-] Failed to read orphan file: {e}")
+        return False
+
+    sessions = data.get("sessions", {}) if isinstance(data, dict) else {}
+    if not sessions and isinstance(data, list):
+        sessions = {s.get("session_id", f"orphan_{i}"): s for i, s in enumerate(data)}
+    elif not sessions and isinstance(data, dict):
+        sessions = data
+
+    print(f"[*] Replaying {len(sessions)} orphaned session(s) from {orphan_path}...")
+    all_success = True
+    for sid, s in list(sessions.items()):
+        agent_name = s.get("agent") if isinstance(s, dict) else "Herdr"
+        pane_id = s.get("pane_id") if isinstance(s, dict) else None
+        payload = {
+            "state": "Ended",
+            "agent": agent_name or "Herdr",
+            "session_id": sid,
+        }
+        success, is_non_retryable = post_bartender_event(payload, timeout=0.5, bridge_url=bridge_url)
+        if success or is_non_retryable:
+            print(f"    [+] Cleared {sid}")
+            if pane_id:
+                remove_pane_marker(pane_id)
+        else:
+            print(f"    [-] Failed to deliver Ended for {sid}")
+            all_success = False
+
+    if all_success and sessions:
+        try:
+            orphan_path.unlink()
+            print(f"[+] Successfully cleared all orphaned sessions; removed {orphan_path}")
+        except Exception:
+            pass
+    return all_success
+
+
 def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str | None = None, arrival_time: float | None = None):
     touch_heartbeat()
     arr_time = arrival_time or PROCESS_ARRIVAL_TIME
@@ -759,9 +901,18 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
         elif not raw_agent and session_id not in sessions:
             return
 
-        mapped_state = STATUS_MAP.get(agent_status)
-        if not mapped_state:
-            return
+        if agent_status == "idle":
+            if raw_agent is not None and str(raw_agent).strip() != "":
+                mapped_state = "Idle"
+            elif session_id in sessions and sessions[session_id].get("desired_state") != "Ended":
+                # Agent process exited interactive shell
+                mapped_state = "Ended"
+            else:
+                return  # Unassisted shell
+        else:
+            mapped_state = STATUS_MAP.get(agent_status)
+            if not mapped_state:
+                return
 
         agent_name = format_agent_name(raw_agent or sessions.get(session_id, {}).get("raw_agent"))
         raw_title = event_data.get("title") or context.get("workspace_label") or f"Pane {canonical_pane}"
@@ -777,7 +928,7 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
 
         session_record = sessions.setdefault(session_id, {})
         last_applied_arr = session_record.get("last_applied_arrival_time", 0.0)
-        if arr_time < last_applied_arr:
+        if mapped_state != "Ended" and arr_time < last_applied_arr:
             log_debug(f"Dropping older event: arrival {arr_time} < last_applied {last_applied_arr}")
             return
 
@@ -792,6 +943,7 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             "cwd": cwd,
             "terminal": "Herdr",
             "event": "pane.agent_status_changed",
+            "seq": new_seq,
         }
 
         session_record.update({
@@ -806,6 +958,9 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
             "desired_state": mapped_state,
             "desired_payload": payload,
             "seq": new_seq,
+            "delivery_status": "in_flight",
+            "delivery_error": None,
+            "delivery_attempts": 0,
             "last_applied_arrival_time": arr_time,
             "last_event_at": now_wall,
         })
@@ -842,14 +997,20 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
                 log_debug(f"Lease token superseded for {session_id}, exiting drain loop")
                 break
 
-            if success or is_non_retryable:
+            if success:
                 s["delivered_state"] = transmitting_state
                 s["delivered_seq"] = transmitting_seq
-                s.pop("last_error", None)
-                if success:
-                    data["last_successful_delivery"] = time.time()
-                    data["consecutive_failures"] = 0
-                    touch_heartbeat()
+                s["delivery_status"] = "delivered"
+                s["delivery_attempts"] = 0
+                s.pop("delivery_error", None)
+                data["last_successful_delivery"] = time.time()
+                data["consecutive_failures"] = 0
+                clear_delivery_down()
+                clear_pane_failed(canonical_pane)
+                for other_s in data.get("sessions", {}).values():
+                    if other_s.get("delivery_status") == "retryable_exhausted":
+                        other_s["delivery_attempts"] = 0
+                        other_s["delivery_status"] = "in_flight"
 
                 # Active Supersession check on Ended
                 if transmitting_state == "Ended" and s.get("seq") == transmitting_seq:
@@ -857,14 +1018,27 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
                     remove_pane_marker(canonical_pane)
                     cache_mgr.save(data)
                     break
+            elif is_non_retryable:
+                s["delivery_status"] = "non_retryable_failed"
+                s["rejected_seq"] = transmitting_seq
+                s["delivery_error"] = "bridge_rejected"
+                touch_pane_failed(canonical_pane)
+                if transmitting_state == "Ended":
+                    s["orphaned_ended"] = True
             else:
-                s["last_error"] = "retryable network error"
+                s["delivery_attempts"] = s.get("delivery_attempts", 0) + 1
+                s["delivery_error"] = "retryable network error"
                 data["consecutive_failures"] = data.get("consecutive_failures", 0) + 1
                 if data["consecutive_failures"] >= 3:
-                    remove_heartbeat()
+                    touch_delivery_down()
+                if s.get("delivery_attempts", 0) >= 5:
+                    s["delivery_status"] = "retryable_exhausted"
+                    touch_pane_failed(canonical_pane)
+                    if s.get("desired_state") == "Ended":
+                        s["orphaned_ended"] = True
 
             # Drain check: if a newer state was requested while in-flight, loop and transmit it
-            if s.get("delivered_seq", 0) < s.get("seq", 0) and time_remaining() > 0.3:
+            if s.get("delivered_seq", 0) < s.get("seq", 0) and time_remaining() > 0.3 and s.get("delivery_status") not in ("non_retryable_failed", "retryable_exhausted"):
                 s["lease_deadline"] = time.time() + 2.0
                 current_payload = s.get("desired_payload")
                 transmitting_state = s.get("desired_state")
@@ -874,7 +1048,7 @@ def handle_agent_status_changed(event_data: dict, context: dict, bridge_url: str
                 s["sending_pid"] = None
                 s["lease_token"] = None
                 s["lease_deadline"] = None
-                if s.get("delivered_seq", 0) < s.get("seq", 0):
+                if s.get("delivered_seq", 0) < s.get("seq", 0) and s.get("delivery_status") != "non_retryable_failed":
                     # Process ran out of deadline budget; hand off to background helper
                     try:
                         subprocess.Popen(
@@ -934,6 +1108,9 @@ def handle_tab_closed(event_data: dict, context: dict, bridge_url: str | None = 
     tab_id = event_data.get("tab_id") or context.get("tab_id")
     if not tab_id:
         return
+    if not CONTAINER_ID_REGEX.match(str(tab_id)):
+        log_debug(f"Invalid tab_id: {tab_id}")
+        return
 
     cache_mgr = BoundedSessionCache(get_state_dir())
     target_sessions = []
@@ -968,6 +1145,9 @@ def handle_workspace_closed(event_data: dict, context: dict, bridge_url: str | N
     touch_heartbeat()
     workspace_id = event_data.get("workspace_id") or context.get("workspace_id")
     if not workspace_id:
+        return
+    if not CONTAINER_ID_REGEX.match(str(workspace_id)):
+        log_debug(f"Invalid workspace_id: {workspace_id}")
         return
 
     cache_mgr = BoundedSessionCache(get_state_dir())
@@ -1288,6 +1468,74 @@ def run_unit_tests():
         assert "herdr:macbook:wIdle" not in data["sessions"], "Idle sessions must transition to Ended and be evicted on confirmed delivery"
     print("[PASS] Waiting session exemption from 24h TTL eviction")
 
+    # 14. Waiting session expires after 48h TTL
+    with cache_mgr as data:
+        data["sessions"]["herdr:macbook:wWaitOld"] = {
+            "desired_state": "Waiting",
+            "seq": 1,
+            "delivered_seq": 1,
+            "last_event_at": time.time() - 200000,
+            "pane_id": "w1:pWaitOld",
+            "agent": "Claude (Herdr)",
+        }
+        cache_mgr.save(data)
+    touch_pane_marker("w1:pWaitOld")
+    reconcile_active_sessions(get_state_dir(), bridge_url=mock_url)
+    with cache_mgr as data:
+        assert "herdr:macbook:wWaitOld" not in data["sessions"], "Waiting sessions older than 48h must expire to Ended"
+    print("[PASS] Bounded Waiting session 48h TTL expiration")
+
+    # 15. Orphan Replay (--replay-orphans)
+    orphan_file = get_state_dir() / "test-orphans.json"
+    orphan_data = {
+        "sessions": {
+            "herdr:macbook:wOrphan": {
+                "agent": "Claude (Herdr)",
+                "pane_id": "w1:pOrphan",
+            }
+        }
+    }
+    with open(orphan_file, "w") as f:
+        json.dump(orphan_data, f)
+    touch_pane_marker("w1:pOrphan")
+    ok = run_replay_orphans(str(orphan_file), bridge_url=mock_url)
+    assert ok is True, "Orphan replay should succeed"
+    assert not orphan_file.exists(), "Orphan file should be removed after successful replay"
+    print("[PASS] Orphan replay clears sessions and cleans up file")
+
+    # 16. Spooled close events exempt from arrival drops
+    t_close_arr = time.time()
+    handle_agent_status_changed(
+        {"agent_status": "working", "pane_id": "w1:pCloseTest", "workspace_id": "w1", "agent": "claude"},
+        {},
+        bridge_url=mock_url,
+        arrival_time=t_close_arr
+    )
+    # Enqueue a pane.closed event with an older arrival timestamp
+    enqueue_spool(
+        "pane.closed",
+        {"pane_id": "w1:pCloseTest", "workspace_id": "w1"},
+        {},
+        arrival_time=t_close_arr - 10.0
+    )
+    replay_spool_dir(get_state_dir(), bridge_url=mock_url)
+    with cache_mgr as data:
+        s_closed = data["sessions"].get(f"herdr:{get_sanitized_hostname()}:w1:pCloseTest")
+        assert s_closed is None or s_closed.get("desired_state") == "Ended", "Close event must never be dropped by arrival time"
+    print("[PASS] Spooled close events exempt from arrival ordering drops")
+
+    # 17. Delivery down marker & pane failure tracking
+    touch_delivery_down()
+    assert is_delivery_down() is True, "DELIVERY_DOWN marker must be recognized"
+    touch_pane_failed("w1:pFail")
+    failed_marker = get_state_dir() / "panes" / f"{get_hex_pane_id('w1:pFail')}.failed"
+    assert failed_marker.exists(), "Pane failed marker must exist"
+    clear_delivery_down()
+    assert is_delivery_down() is False, "DELIVERY_DOWN marker must be cleared"
+    clear_pane_failed("w1:pFail")
+    assert not failed_marker.exists(), "Pane failed marker must be cleared"
+    print("[PASS] Delivery down & pane failure marker lifecycle")
+
     server.shutdown()
     print("=== ALL COMPREHENSIVE UNIT TESTS PASSED ===")
 
@@ -1378,6 +1626,16 @@ def main():
     if "--cleanup" in args:
         ok = run_cleanup()
         sys.exit(0 if ok else 1)
+
+    if "--replay-orphans" in args:
+        idx = args.index("--replay-orphans")
+        if idx + 1 < len(args):
+            orphan_file = args[idx + 1]
+            ok = run_replay_orphans(orphan_file)
+            sys.exit(0 if ok else 1)
+        else:
+            print("Usage: --replay-orphans <path-to-orphan-file>")
+            sys.exit(1)
 
     if "--sessions" in args:
         cache_mgr = BoundedSessionCache(get_state_dir())
