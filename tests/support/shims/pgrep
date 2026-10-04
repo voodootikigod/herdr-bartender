@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Test shim for pgrep. Matches ONLY the fake processes listed in
+# $HB_TEST_SANDBOX/procs.list (lines: pid|name|lstart|comm|cmdline); it never
+# inspects real processes, so tests can never see (or act on) a real herdr.
+# Supports -x (exact), -i (case-insensitive), -f (match full command line).
+exact=0; icase=0; full=0; pattern=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) shift; pattern="${1:-}"; break ;;
+    -?*)
+      flags="${1#-}"
+      i=0
+      while [ "$i" -lt "${#flags}" ]; do
+        case "${flags:$i:1}" in
+          x) exact=1 ;;
+          i) icase=1 ;;
+          f) full=1 ;;
+        esac
+        i=$((i + 1))
+      done
+      ;;
+    *) pattern="$1" ;;
+  esac
+  shift
+done
+
+procs="${HB_TEST_SANDBOX:-}/procs.list"
+if [ -z "${HB_TEST_SANDBOX:-}" ] || [ ! -f "$procs" ] || [ -z "$pattern" ]; then
+  exit 1
+fi
+if [ -f "${HB_TEST_SANDBOX}/pgrep.fail" ]; then
+  exit 2
+fi
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+status=1
+while IFS='|' read -r pid name lstart comm cmdline; do
+  [ -z "$pid" ] && continue
+  if [ "$full" -eq 1 ]; then
+    subject="${cmdline:-$name}"
+  else
+    subject="$name"
+  fi
+  pat="$pattern"
+  if [ "$icase" -eq 1 ]; then
+    subject=$(lower "$subject")
+    pat=$(lower "$pat")
+  fi
+  if [ "$exact" -eq 1 ]; then
+    [ "$subject" = "$pat" ] || continue
+  else
+    printf '%s' "$subject" | grep -Eq -- "$pat" || continue
+  fi
+  echo "$pid"
+  status=0
+done < "$procs"
+exit "$status"
