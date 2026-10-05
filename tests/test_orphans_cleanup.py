@@ -5,11 +5,12 @@ import time
 import unittest
 from unittest import mock
 
-from herdr_bartender import cache, cleanup, runtime
-from herdr_bartender.bridge import post_bartender_event
+from herdr_bartender import cache, runtime
+from herdr_bartender.bridge import DeliveryResult, post_bartender_event
+from herdr_bartender.sender import step_b
 from herdr_bartender.cleanup import run_cleanup
 from herdr_bartender.markers import touch_pane_marker
-from herdr_bartender.orphans import run_replay_orphans
+from herdr_bartender.replay import run_replay_orphans
 from herdr_bartender.paths import get_orphan_path
 from tests.support import SandboxTestCase
 from tests.support.lock_holder import hold_lock
@@ -118,8 +119,10 @@ class CleanupLockTests(SandboxTestCase):
         """Plan L619/L686 + R10: --cleanup is exempt from the 1.5s event budget; a lock held for 0.5s by another
         process delays it instead of failing it with exit 1."""
         hold_lock(self, self.cache_mgr.lock_file, seconds=0.5)
+        bounded_while_sending = []
+        self.bridge.on_post = lambda _payload: bounded_while_sending.append(runtime.deadline_bounded())
         self.assertEqual(run_cleanup(bridge_url=self.mock_url), 0)
-        self.assertFalse(runtime.deadline_bounded())
+        self.assertEqual(bounded_while_sending, [False], "the Ended is sent in the unbounded deadline mode")
         with self.cache_mgr as data:
             self.assertNotIn(self.sid_, data["sessions"])
 
@@ -130,12 +133,12 @@ class CleanupLockTests(SandboxTestCase):
 
         def post(payload, timeout=0.2, bridge_url=None):
             posted.append(payload)
-            return True, False
+            return DeliveryResult("success", None, 200)
 
         def flock(fd, timeout):
             return False if posted else real_flock(fd, timeout)
 
-        with mock.patch.object(cleanup, "post_bartender_event", side_effect=post), \
+        with mock.patch.object(step_b, "send_event", side_effect=post), \
                 mock.patch.object(cache, "_flock_within", side_effect=flock):
             self.assertEqual(run_cleanup(bridge_url=self.mock_url), 0)
         (result,) = [json.loads(p.read_text()) for p in (self.state_dir / "results").glob("*.json")]

@@ -206,9 +206,11 @@ class PaneCloseVendorTests(VendorCase):
 
 
 class ReconcilerPaneCloseDismissalTests(VendorCase):
-    # GAP reconciler/dismissal-cadence: W4's dismissal drain must adopt dismiss_vendors (R11 purge on 200, R19 agent
-    # "Herdr") and must not cancel a dismissal queued by a pane close because that close's Ended left .failed behind.
-    @unittest.expectedFailure
+    """Gap reconciler/dismissal-cadence: the reconciler's dismissal drain uses dismiss_vendors (R11 purge on 200, R19
+    agent "Herdr"). R24: a dismissal queued by a pane CLOSE is not cancelled by the pane-scoped triggers
+    (.failed / .vendor_active) - the pane and its vendor CLI are gone, so there is no fallback representation left
+    to protect, and cancelling would strand the vendor entry whenever the close's own Ended was rejected."""
+
     def test_pane_close_dismissal_left_to_the_reconciler_is_sent(self):
         """The pane's Ended is rejected (.failed touched) and the budget runs out before the inline dismissal: the
         queued dismissal is owed to the reconciler, which must send it (agent Herdr) and purge it on HTTP 200."""

@@ -229,8 +229,6 @@ class ReconcilerHookReviewTests(_IntegrityCase):
         self.assertEqual(paths[CLAUDE_HOOK].read_bytes(), VENDOR_CLAUDE)
         self.assertFalse(self.hnr.exists())
 
-    # GAP reconciler/hook-integrity-allowlist-bypass: W4 wires repair_hooks_if_allowlisted into background.py
-    @unittest.expectedFailure
     def test_p68_unknown_hook_needs_review_in_reconciler(self):
         """Plan §10.1 #68 (gap hook-integrity-allowlist-bypass): no allowlist entry -> review, never auto-patched."""
         paths = seed_vendor_hooks(self.hooks_dir)
@@ -239,8 +237,6 @@ class ReconcilerHookReviewTests(_IntegrityCase):
         self.assertTrue(self.hnr.exists() and self.alerted.exists())
         self.assertEqual(len(self.osascript_calls()), 1)
 
-    # GAP hook-guard-installer/reconciler-allowlist-fails-open: W4 must stop calling the approving install_hooks()
-    @unittest.expectedFailure
     def test_p68_reconciler_repair_keeps_flags_and_allowlist(self):
         """Plan §10.1 #68 (gap reconciler-allowlist-fails-open): reconciler repair never clears flags or rewrites SHAs."""
         paths = self.seed_installed()

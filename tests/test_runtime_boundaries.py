@@ -35,17 +35,28 @@ class RuntimeBoundaryTests(SandboxTestCase):
         self.assertEqual(hook.read_text(), original)
 
     def test_reconciler_resolves_start_time_outside_lock(self):
-        """reconcile_active_sessions() resolves our `ps` start time before taking the cache lock."""
+        """reconcile_active_sessions() resolves our `ps` start time and its whole process snapshot (Bartender,
+        Herdr, previously recorded instances) before taking the cache lock (gap lock-discipline-subprocess)."""
+        herdr_pid = process.get_herdr_pid()  # the recorded instances are probed by the snapshot (no restart here:
+        with self.cache_mgr as data:         # this class has no mock bridge, so nothing may be sent)
+            data["sessions"]["herdr:h:w1:p1"] = {"pane_id": "w1:p1", "desired_state": "Working", "seq": 1,
+                                                 "delivered_seq": 1, "delivery_status": "delivered",
+                                                 "last_event_at": time.time()}
+            data["last_herdr_pid"] = herdr_pid
+            data["last_herdr_start_time"] = process.get_process_start_time(herdr_pid)
+            self.cache_mgr.save(data)
         seen = []
+        real_run = process.subprocess.run
 
-        def fake_start_time(pid=None):
+        def run(*args, **kwargs):
             seen.append(runtime.IN_CRITICAL_SECTION)
-            return "Sat Oct  4 09:00:00 2026"
+            return real_run(*args, **kwargs)
 
         process.reset_caches()
-        with mock.patch.object(process, "get_process_start_time", side_effect=fake_start_time):
+        with mock.patch.object(process.subprocess, "run", side_effect=run):
             reconcile_active_sessions(self.state_dir)
-        self.assertEqual(seen, [False], "start time must be looked up exactly once, outside the critical section")
+        self.assertTrue(seen, "the pass probes processes")
+        self.assertNotIn(True, seen, "no ps/pgrep inside the cache critical section")
 
     def test_watchdog_handoff_goes_through_the_injected_spawner(self):
         """The SIGALRM hand-off (run outside the handler by run_bounded) spawns via the injectable handoff
@@ -57,12 +68,13 @@ class RuntimeBoundaryTests(SandboxTestCase):
 
         with mock.patch.object(handoff.subprocess, "Popen") as popen:
             self.assertEqual(watchdog.run_bounded(expire), 0)
-        self.assertEqual(self.spawner.calls, [handoff.reconciler_argv()])
+        self.assertEqual(self.spawner.calls, [handoff.loop_argv()])
         popen.assert_not_called()
 
     def test_production_spawner_is_detached_and_singleton(self):
-        """Plan §5.1 singleton: the production spawner starts `--reconcile-background` in a new session with no
-        inherited stdio, and ensure_reconciler_running() does not spawn while reconciler.lock is held."""
+        """Plan §5.1 singleton: the production spawner starts `--reconcile-background --foreground` (the loop
+        itself: the spawn already detaches) in a new session with no inherited stdio, and
+        ensure_reconciler_running() does not spawn while reconciler.lock is held."""
         handoff.set_spawner(handoff.DetachedSpawner())
         with mock.patch.object(handoff.subprocess, "Popen") as popen:
             self.assertTrue(handoff.ensure_reconciler_running())
@@ -71,7 +83,7 @@ class RuntimeBoundaryTests(SandboxTestCase):
             self.assertFalse(handoff.ensure_reconciler_running())
         again.assert_not_called()
         popen.assert_called_once()
-        self.assertEqual(popen.call_args.args[0][-1], "--reconcile-background")
+        self.assertEqual(popen.call_args.args[0][-2:], ["--reconcile-background", handoff.FOREGROUND_FLAG])
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         for stream in ("stdin", "stdout", "stderr"):
             self.assertIs(popen.call_args.kwargs[stream], subprocess.DEVNULL)

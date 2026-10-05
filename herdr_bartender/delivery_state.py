@@ -6,11 +6,16 @@ reconciler sweep) and the results-directory drain call it under the cache lock, 
 confirmation applied late from ``results/`` has exactly the effects it would have had
 in Step C.
 
-It only mutates ``data`` and touches local flag/marker files (no network, no orphan
+It only mutates ``data`` and touches local pane marker files (no network, no orphan
 file, no process spawns). Work that must happen outside the lock is returned as
 ``StagedEffects``; compensations and vendor cleanups are also persisted in
 ``data["pending_compensations"]`` / ``data["pending_vendor_cleanups"]`` (Plan §4.3
 "Persisted Side Effects Guarantee") so a crash after the save cannot lose them.
+
+The DELIVERY_DOWN flag is never touched here: its transition is staged as
+``StagedEffects.delivery_down`` and the caller applies it with ``commit_delivery_down()``
+right after ``cache_mgr.save()`` succeeds, still under the lock. A reconnection's Full Re-Sync
+that is not saved therefore never loses the flag that makes the next confirmation re-sync.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from .log import log_debug
 from .markers import (
     clear_delivery_down,
     clear_pane_failed,
+    is_delivery_down,
     remove_pane_marker,
     touch_delivery_down,
     touch_pane_failed,
@@ -37,6 +43,8 @@ STATUS_RETRYABLE = "retryable"
 RESULT_STATUSES = (STATUS_SUCCESS, STATUS_NON_RETRYABLE, STATUS_RETRYABLE)
 
 MAX_DELIVERY_ATTEMPTS = 5
+# Plan §3.3 / §5.1 item 3: attempt n+1 is due RETRY_DELAYS[n] seconds after attempt n (0, 1, 2, 4, 8s; ~15s total).
+RETRY_DELAYS = (0.0, 1.0, 2.0, 4.0, 8.0)
 DELIVERY_DOWN_THRESHOLD = 3
 LEASE_SECONDS = 1.5
 LEASE_GRACE_SECONDS = 0.5   # Plan §1 L71-79: a holder past its deadline keeps the lease 0.5s more
@@ -129,6 +137,7 @@ class StagedEffects:
     spawn_reconciler: bool = False
     evicted: bool = False
     followup: bool = False    # newer seq still undelivered and the caller kept the lease
+    delivery_down: Optional[bool] = None   # DELIVERY_DOWN owed once saved: True set, False clear, None unchanged
 
     def merge(self, other: "StagedEffects") -> "StagedEffects":
         return StagedEffects(
@@ -141,6 +150,7 @@ class StagedEffects:
             spawn_reconciler=self.spawn_reconciler or other.spawn_reconciler,
             evicted=self.evicted or other.evicted,
             followup=self.followup or other.followup,
+            delivery_down=self.delivery_down if other.delivery_down is None else other.delivery_down,
         )
 
 
@@ -329,49 +339,104 @@ def _evict(data: dict, session: dict, tx: Transmission, now_ns: int) -> None:
         }
 
 
-def _rearm_exhausted(data: dict) -> None:
+def resync_live_sessions(data: dict, exclude: Optional[str] = None) -> Tuple[str, ...]:
+    """Plan §5.1 item 4 Full Top Shelf Re-Sync: re-assert every live, non-salvaged session but ``exclude``.
+
+    Salvaged sessions stay quiescent (never transmitted as Idle); Ended ones are only re-armed.
+    """
+    resynced = []
+    for sid, record in data.get("sessions", {}).items():
+        if sid == exclude or not isinstance(record, dict):
+            continue
+        if record.get("desired_state") != "Ended" and not record.get("salvaged"):
+            force_resync_superseding_senders(record)   # in-flight senders re-sync too (resync_generation)
+            record.update({"delivery_attempts": 0, "next_retry_at": None, "delivery_error": None})
+            resynced.append(sid)
+    return tuple(resynced)
+
+
+def _reconnection_resync(data: dict, tx: Transmission, down: Optional[bool]) -> Tuple[str, ...]:
+    """A confirmed POST while DELIVERY_DOWN is set IS the bridge reconnection (Plan §1 L113, §5.1 item 4).
+
+    Whoever confirms first - event-path Step C, a drained ``results/`` envelope, the reconciler sweep or its
+    ``/health`` probe - re-syncs in the same critical section that clears the flag (after the save:
+    ``commit_delivery_down``), so the re-sync can never be lost to a race over who saw DELIVERY_DOWN or to a
+    failed save (the session just confirmed is not re-sent). ``down``: the flag as already decided earlier in
+    this critical section (a drain batch), None to read the marker.
+    """
+    if not (is_delivery_down() if down is None else down):
+        return ()
+    resynced = resync_live_sessions(data, exclude=tx.session_id)
+    log_debug(f"Bridge reconnected after DELIVERY_DOWN ({tx.session_id} confirmed); re-syncing {len(resynced)}")
+    return resynced
+
+
+def rearm_exhausted(data: dict) -> int:
+    """Plan §5.1 item 3: a healthy bridge (any confirmed POST, or /health) re-arms every exhausted session."""
+    rearmed = 0
     for other in data.get("sessions", {}).values():
-        if other.get("delivery_status") == "retryable_exhausted":
-            other["delivery_attempts"] = 0
-            other["delivery_status"] = "in_flight"
+        if isinstance(other, dict) and other.get("delivery_status") == "retryable_exhausted":
+            other.update({"delivery_attempts": 0, "delivery_status": "in_flight", "next_retry_at": None})
+            rearmed += 1
+    return rearmed
 
 
-def _apply_success(data: dict, session: dict, tx: Transmission, outcome: Outcome,
-                   now: float, now_ns: int) -> StagedEffects:
+def retry_delay(attempts: int) -> float:
+    """Seconds between attempt ``attempts`` (>= 1) and the next one on the 0/1/2/4/8s schedule."""
+    return RETRY_DELAYS[min(max(attempts, 0), MAX_DELIVERY_ATTEMPTS - 1)]
+
+
+def _pane_closed(session: dict, tx: Transmission) -> bool:
+    """R24: only a confirmed pane/tab/workspace close (``close_kind == "container"``) left no pane behind.
+
+    A TTL, Herdr dead/restart, agent-exit or --cleanup Ended leaves the pane - and possibly a vendor CLI with a
+    live fallback - in place, so its dismissal stays subject to the pane-scoped cancellation triggers (#60).
+    """
+    return tx.state == "Ended" and session.get("close_kind") == "container"
+
+
+def _apply_success(data: dict, session: dict, tx: Transmission, now: float, now_ns: int,
+                   down: Optional[bool]) -> StagedEffects:
     if int(session.get("resync_generation", 0) or 0) > tx.resync_generation:
         log_debug(f"Resync generation advanced during transmission of {tx.session_id}; forcing re-sync")
         _force_resync(session)
         return StagedEffects(RESYNC, touch_pending=True, spawn_reconciler=True)
     session.update({"delivered_state": tx.state, "delivered_seq": tx.seq, "delivery_status": "delivered",
-                    "delivery_attempts": 0, "delivery_error": None})
+                    "delivery_attempts": 0, "delivery_error": None, "next_retry_at": None})
     data["consecutive_failures"] = 0
     data["last_successful_delivery"] = now
     touch_pane_marker(tx.pane_id)
-    clear_delivery_down()
+    resynced = _reconnection_resync(data, tx, down)
     clear_pane_failed(tx.pane_id)
-    _rearm_exhausted(data)
+    rearm_exhausted(data)
     evict = tx.state == "Ended" and int(session.get("seq", 0) or 0) == tx.seq
-    cleanups = (stage_vendor_cleanup(data, tx.pane_id, tx.state == "Ended", now),) if tx.pane_id else ()
+    cleanups = (stage_vendor_cleanup(data, tx.pane_id, _pane_closed(session, tx), now),) if tx.pane_id else ()
     if evict:
         _evict(data, session, tx, now_ns)
-        return StagedEffects(EVICTED, orphans_to_remove=(tx.session_id,), vendor_cleanups=cleanups, evicted=True)
-    return StagedEffects(DELIVERED, vendor_cleanups=cleanups)
+        effects = StagedEffects(EVICTED, orphans_to_remove=(tx.session_id,), vendor_cleanups=cleanups, evicted=True,
+                                delivery_down=False)
+    else:
+        effects = StagedEffects(DELIVERED, vendor_cleanups=cleanups, delivery_down=False)
+    return replace(effects, touch_pending=True, spawn_reconciler=True) if resynced else effects
 
 
-def _orphan_if_ended(session: dict, tx: Transmission, desired: bool) -> Tuple[Tuple[str, dict], ...]:
+def _orphan_if_ended(session: dict, tx: Transmission, desired: bool, now: float) -> Tuple[Tuple[str, dict], ...]:
+    """Mark an unconfirmable Ended ``orphaned_ended`` (stamping ``orphaned_at`` once: the R12 12h horizon origin)."""
     state = session.get("desired_state") if desired else tx.state
     if state != "Ended":
         return ()
     session["orphaned_ended"] = True
+    if not isinstance(session.get("orphaned_at"), (int, float)) or isinstance(session.get("orphaned_at"), bool):
+        session["orphaned_at"] = now
     return ((tx.session_id, dict(session)),)
 
 
 def _apply_non_retryable(data: dict, session: dict, tx: Transmission, outcome: Outcome,
                          now: float, now_ns: int) -> StagedEffects:
     session.update({"delivery_status": "non_retryable_failed", "rejected_seq": tx.seq,
-                    "delivery_error": outcome.error or DEFAULT_NON_RETRYABLE_ERROR})
+                    "delivery_error": outcome.error or DEFAULT_NON_RETRYABLE_ERROR, "next_retry_at": None})
     touch_pane_failed(tx.pane_id)
-    return StagedEffects(REJECTED, orphans_to_export=_orphan_if_ended(session, tx, desired=False))
+    return StagedEffects(REJECTED, orphans_to_export=_orphan_if_ended(session, tx, desired=False, now=now))
 
 
 def _apply_retryable(data: dict, session: dict, tx: Transmission, outcome: Outcome,
@@ -380,20 +445,28 @@ def _apply_retryable(data: dict, session: dict, tx: Transmission, outcome: Outco
     session["delivery_error"] = outcome.error or DEFAULT_RETRYABLE_ERROR
     touch_pane_failed(tx.pane_id)
     data["consecutive_failures"] = int(data.get("consecutive_failures", 0) or 0) + 1
-    if data["consecutive_failures"] >= DELIVERY_DOWN_THRESHOLD:
-        touch_delivery_down()
+    down = True if data["consecutive_failures"] >= DELIVERY_DOWN_THRESHOLD else None
     if session["delivery_attempts"] < MAX_DELIVERY_ATTEMPTS:
-        return StagedEffects(RETRY, spawn_reconciler=True)
-    session["delivery_status"] = "retryable_exhausted"
-    return StagedEffects(EXHAUSTED, orphans_to_export=_orphan_if_ended(session, tx, desired=True),
-                         spawn_reconciler=True)
+        # The lease is released by _finalize; the reconciler re-claims it once this time has passed.
+        session["next_retry_at"] = now + retry_delay(session["delivery_attempts"])
+        return StagedEffects(RETRY, spawn_reconciler=True, delivery_down=down)
+    session.update({"delivery_status": "retryable_exhausted", "next_retry_at": None})
+    return StagedEffects(EXHAUSTED, orphans_to_export=_orphan_if_ended(session, tx, desired=True, now=now),
+                         spawn_reconciler=True, delivery_down=down)
 
 
-_BRANCHES: Dict[str, Callable[..., StagedEffects]] = {
-    STATUS_SUCCESS: _apply_success,
+_FAILURE_BRANCHES: Dict[str, Callable[..., StagedEffects]] = {
     STATUS_NON_RETRYABLE: _apply_non_retryable,
     STATUS_RETRYABLE: _apply_retryable,
 }
+
+
+def _apply_outcome(data: dict, session: dict, tx: Transmission, outcome: Outcome, now: float, now_ns: int,
+                   down: Optional[bool]) -> StagedEffects:
+    """The §3.3 response matrix branch for ``outcome``."""
+    if outcome.success:
+        return _apply_success(data, session, tx, now, now_ns, down)
+    return _FAILURE_BRANCHES[outcome.status](data, session, tx, outcome, now, now_ns)
 
 
 def _finalize(session: dict, tx: Transmission, effects: StagedEffects, retain_lease: bool,
@@ -414,7 +487,8 @@ def _finalize(session: dict, tx: Transmission, effects: StagedEffects, retain_le
 
 
 def apply_delivery_result(data: dict, tx: Transmission, outcome: Outcome, *, retain_lease: bool = False,
-                          now: Optional[float] = None, now_ns: Optional[int] = None) -> StagedEffects:
+                          now: Optional[float] = None, now_ns: Optional[int] = None,
+                          delivery_down: Optional[bool] = None) -> StagedEffects:
     """Apply one delivery outcome to ``data`` under the cache lock (Plan §3.3 + §4.3 Step C).
 
     Order: missing session -> compensation; tombstoned non-Ended -> compensation /
@@ -427,8 +501,13 @@ def apply_delivery_result(data: dict, tx: Transmission, outcome: Outcome, *, ret
     retryable branch. Unless ``retain_lease`` (caller sends the newer seq right
     away), the caller's own lease is cleared and any remaining undelivered seq is
     flagged for the reconciler (``touch_pending`` / ``spawn_reconciler``).
+
+    The DELIVERY_DOWN transition is returned (``effects.delivery_down``), never applied: the
+    caller runs ``commit_delivery_down(effects)`` once ``data`` is saved. A caller applying
+    several results in one critical section passes the merged transition so far as
+    ``delivery_down`` (None: read the marker).
     """
-    if outcome.status not in _BRANCHES:
+    if outcome.status not in RESULT_STATUSES:
         raise ValueError(f"unknown delivery status {outcome.status!r}")
     now = clock.time() if now is None else now
     now_ns = clock.time_ns() if now_ns is None else now_ns
@@ -443,10 +522,23 @@ def apply_delivery_result(data: dict, tx: Transmission, outcome: Outcome, *, ret
         return StagedEffects(STALE)
     if tx.lease_token is not None and session.get("lease_token") != tx.lease_token:
         return _superseded(session, tx)
-    effects = _BRANCHES[outcome.status](data, session, tx, outcome, now, now_ns)
+    effects = _apply_outcome(data, session, tx, outcome, now, now_ns, delivery_down)
     if effects.evicted:
         return effects
     return _finalize(session, tx, effects, retain_lease, outcome, now)
+
+
+def commit_delivery_down(effects: StagedEffects) -> None:
+    """Apply the staged DELIVERY_DOWN transition; call it right after ``cache_mgr.save`` succeeded, under the lock.
+
+    A reconnection clears the flag only once its Full Re-Sync is saved: when the save fails the flag stays, so the
+    confirmation applied again (results drain, retried replay) or the reconciler's ``/health`` recovery still
+    re-syncs every other live session.
+    """
+    if effects.delivery_down is True:
+        touch_delivery_down()
+    elif effects.delivery_down is False:
+        clear_delivery_down()
 
 
 def run_orphan_effects(effects: StagedEffects, blocking: bool = False) -> None:
@@ -471,7 +563,7 @@ def merge_all(effects: List[StagedEffects]) -> StagedEffects:
 
 __all__ = [
     "Outcome", "StagedEffects", "Transmission", "apply_delivery_result", "clear_pending_compensation",
-    "clear_pending_vendor_cleanup", "empty_effects", "force_resync_superseding_senders", "foreign_lease_open",
-    "merge_all", "record_tombstone", "run_orphan_effects",
+    "clear_pending_vendor_cleanup", "commit_delivery_down", "empty_effects", "force_resync_superseding_senders",
+    "foreign_lease_open", "merge_all", "rearm_exhausted", "record_tombstone", "resync_live_sessions", "retry_delay", "run_orphan_effects",
     "stage_compensation", "stage_vendor_cleanup",
 ]

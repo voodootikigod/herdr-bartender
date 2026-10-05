@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import json
 import os
 import sys
@@ -22,7 +23,7 @@ from .hooks import install_hooks, uninstall_hooks, verify_vendor_hooks_intact
 from .live_test import run_live_test
 from .log import log_debug
 from .markers import is_disabled, touch_heartbeat
-from .orphans import run_replay_orphans
+from .replay import run_replay_orphans
 from .paths import get_state_dir, repo_root
 from .watchdog import arm_watchdog, run_bounded
 
@@ -65,7 +66,7 @@ def run_event(argv, stdin_bytes: bytes, env) -> int:
     return 0
 
 
-FOREGROUND_FLAG = "--foreground"  # internal: the detached child that actually runs the reconciler loop
+FOREGROUND_FLAG = handoff.FOREGROUND_FLAG  # internal: the detached child that actually runs the reconciler loop
 
 
 def _spawn_detached_reconciler() -> int:
@@ -73,7 +74,7 @@ def _spawn_detached_reconciler() -> int:
 
     The process is created by the injectable ``handoff`` spawner (production: a detached ``Popen``).
     """
-    if not handoff.get_spawner().spawn(handoff.reconciler_argv(FOREGROUND_FLAG)):
+    if not handoff.get_spawner().spawn(handoff.loop_argv()):
         log_debug("Failed to spawn detached reconciler")
         return 1
     return 0
@@ -91,8 +92,15 @@ def run_reconcile_command(args) -> int:
     return _spawn_detached_reconciler()
 
 
+UNIT_TEST_HANG_SECONDS = 900.0   # the suite runs in about 70s: a run this long is hung
+
+
 def run_unit_tests() -> int:
-    """Run the stdlib unittest suite under <repo>/tests; returns a process exit code."""
+    """Run the stdlib unittest suite under <repo>/tests; returns a process exit code.
+
+    A faulthandler watchdog turns a hung run into a failure that names the culprit: after
+    ``UNIT_TEST_HANG_SECONDS`` every thread's stack is dumped to stderr and the process exits 1.
+    """
     import unittest
 
     root = repo_root()
@@ -103,7 +111,11 @@ def run_unit_tests() -> int:
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
     suite = unittest.defaultTestLoader.discover(str(tests_dir), top_level_dir=str(root))
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    faulthandler.dump_traceback_later(UNIT_TEST_HANG_SECONDS, exit=True)
+    try:
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+    finally:
+        faulthandler.cancel_dump_traceback_later()
     return 0 if result.wasSuccessful() else 1
 
 

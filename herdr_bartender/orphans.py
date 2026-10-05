@@ -1,4 +1,14 @@
-"""Orphan export file ($HOME/.herdr-bartender-orphans.json) and replay."""
+"""Orphan export file ($HOME/.herdr-bartender-orphans.json): lock, atomic writes, contention journal.
+
+One parser (``parse_orphan_records``) serves the writer and the reader: the canonical
+``{"version": 1, "sessions": {...}}``, a bare ``{sid: record}`` mapping and the old
+monolith's list form are understood (and normalised on the next write); a file that cannot
+be understood raises ``OrphanFileError`` and is never rewritten - the operation waits in the
+journal instead. Every rename is made durable (file and parent directory fsynced) before an
+export is reported done, so a caller may evict the cached record right after it.
+
+Replay (``--replay-orphans`` and the reconciler's automatic replay) lives in ``replay``.
+"""
 
 from __future__ import annotations
 
@@ -7,19 +17,16 @@ import itertools
 import json
 import os
 from pathlib import Path
-from typing import FrozenSet, Iterable, List, Optional, Tuple
+from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple
 
-from . import clock, runtime
-from .bridge import post_bartender_event
-from .cache import BoundedSessionCache
-from .config import SESSION_ID_REGEX
+from . import clock
 from .log import log_debug
-from .markers import remove_pane_marker
-from .paths import PRIVATE_FILE_MODE, ensure_private_dir, get_orphan_path, get_state_dir
-from .handoff import touch_reconciler_pending
+from .paths import PRIVATE_FILE_MODE, ensure_private_dir, get_orphan_path
+from .handoff import in_reconciler_loop, touch_reconciler_pending
 
 
 ORPHAN_LOCK_DEADLINE_SECONDS = 0.05   # R10 / Plan §6.1: event-path orphan lock budget
+ORPHAN_BLOCKING_DEADLINE_SECONDS = 5.0  # R10: --replay-orphans/--cleanup/reconciler wait, bounded
 ORPHAN_LOCK_RETRY_INTERVAL = 0.005
 ORPHAN_CAPACITY = 256
 
@@ -28,32 +35,39 @@ def _lock_path(orphan_path: Path) -> Path:
     return orphan_path.with_name(orphan_path.name + ".lock")
 
 
-def acquire_orphan_lock(orphan_path: Path, blocking: bool = False,
-                        deadline: float = ORPHAN_LOCK_DEADLINE_SECONDS) -> Optional[int]:
-    """Open and flock the orphan lock file; returns the fd, or None when contended past ``deadline``.
+def _flock_until(fd: int, deadline: float) -> bool:
+    """Retry ``LOCK_EX | LOCK_NB`` on the injectable clock until it succeeds or ``deadline`` seconds pass."""
+    give_up_at = clock.monotonic() + deadline
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if clock.monotonic() >= give_up_at:
+                return False
+            clock.sleep(ORPHAN_LOCK_RETRY_INTERVAL)
 
-    R10: the event/plugin path uses LOCK_NB retried for ``deadline`` seconds (50ms) and
+
+def acquire_orphan_lock(orphan_path: Path, blocking: bool = False,
+                        deadline: Optional[float] = None) -> Optional[int]:
+    """Open and flock the orphan lock file; returns the fd, or None when contended past the deadline.
+
+    R10: the event/plugin path retries LOCK_NB for ``ORPHAN_LOCK_DEADLINE_SECONDS`` (50ms) and
     leaves the work to the reconciler on contention. ``blocking=True`` (--replay-orphans,
-    --cleanup, reconciler) waits for the lock.
+    --cleanup, reconciler) waits longer, but never unboundedly: at most
+    ``ORPHAN_BLOCKING_DEADLINE_SECONDS`` (every holder keeps the lock for local file I/O only).
     """
+    if deadline is None:
+        deadline = ORPHAN_BLOCKING_DEADLINE_SECONDS if blocking else ORPHAN_LOCK_DEADLINE_SECONDS
     fd = os.open(str(_lock_path(orphan_path)), os.O_CREAT | os.O_RDWR, PRIVATE_FILE_MODE)
     try:
-        if blocking:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+        if _flock_until(fd, deadline):
             return fd
-        give_up_at = clock.monotonic() + deadline
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return fd
-            except BlockingIOError:
-                if clock.monotonic() >= give_up_at:
-                    break
-                clock.sleep(ORPHAN_LOCK_RETRY_INTERVAL)
     except BaseException:
         os.close(fd)
         raise
     os.close(fd)
+    log_debug(f"Orphan lock {orphan_path.name}.lock still contended after {deadline:.2f}s")
     return None
 
 
@@ -68,21 +82,58 @@ def release_orphan_lock(fd: Optional[int]) -> None:
         os.close(fd)
 
 
-def _read_orphan_sessions(orphan_path: Path) -> dict:
-    if not orphan_path.exists():
-        return {}
+class OrphanFileError(Exception):
+    """The orphan file could not be locked, read or understood (it is then left untouched)."""
+
+
+def parse_orphan_records(raw: object) -> Dict[str, object]:
+    """``{"version": 1, "sessions": {...}}``, a bare ``{sid: record}`` mapping, or a list of records.
+
+    Raises OrphanFileError for any other shape: a file that cannot be understood is never rewritten or removed.
+    """
+    if isinstance(raw, dict) and "sessions" in raw:
+        if isinstance(raw["sessions"], dict):
+            return dict(raw["sessions"])
+        raise OrphanFileError("orphan file 'sessions' is not an object")
+    if isinstance(raw, list):
+        return {(r.get("session_id") if isinstance(r, dict) else None) or f"orphan_{i}": r
+                for i, r in enumerate(raw)}
+    if isinstance(raw, dict):
+        return dict(raw)
+    raise OrphanFileError("orphan file is neither an object nor a list")
+
+
+def read_orphan_records(orphan_path: Path) -> Dict[str, object]:
+    """The records of ``orphan_path`` ({} when it does not exist); raises OrphanFileError when unreadable."""
     try:
-        with open(orphan_path, "r", encoding="utf-8") as of:
-            data = json.load(of)
-    except (OSError, ValueError) as e:
-        log_debug(f"Unreadable orphan file {orphan_path}: {e}")
+        raw = json.loads(orphan_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return {}
-    sessions = data.get("sessions", {}) if isinstance(data, dict) else {}
-    return sessions if isinstance(sessions, dict) else {}
+    except (OSError, ValueError) as exc:
+        raise OrphanFileError(f"could not read {orphan_path}: {exc}") from exc
+    return parse_orphan_records(raw)
+
+
+_read_orphan_sessions = read_orphan_records   # writer-side name (one parser for writer and reader)
+
+
+def fsync_directory(directory: Path) -> None:
+    """Make a rename inside ``directory`` durable (a filesystem refusing a directory fsync is logged, not fatal)."""
+    try:
+        fd = os.open(str(directory), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as exc:
+        log_debug(f"Could not open {directory} to fsync it: {exc}")
+        return
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        log_debug(f"Directory fsync of {directory} not supported: {exc}")
+    finally:
+        os.close(fd)
 
 
 def write_orphan_sessions(orphan_path: Path, sessions: dict) -> None:
-    """Atomically replace the orphan file (mode 0600, Plan §8) with ``sessions``."""
+    """Atomically and durably replace the orphan file (mode 0600, Plan §8) with ``sessions``."""
     tmp_orphan = orphan_path.with_name(f"{orphan_path.name}.tmp.{os.getpid()}")
     fd = os.open(str(tmp_orphan), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
     try:
@@ -98,6 +149,7 @@ def write_orphan_sessions(orphan_path: Path, sessions: dict) -> None:
             os.close(fd)
         tmp_orphan.unlink(missing_ok=True)
         raise
+    fsync_directory(orphan_path.parent)
 
 
 # -- contention journal (R10) -------------------------------------------------------
@@ -135,7 +187,9 @@ def _journal_op(orphan_path: Path, op: dict) -> bool:
             os.close(fd)
         tmp_path.unlink(missing_ok=True)
         raise
-    touch_reconciler_pending()
+    fsync_directory(pending)
+    if not in_reconciler_loop():   # the reconciler folds the journal every pass: no wake-up for its own entries
+        touch_reconciler_pending()
     return True
 
 
@@ -167,6 +221,12 @@ def _load_journal(orphan_path: Path) -> Tuple[List[Path], List[dict]]:
     return entries, ops
 
 
+def journaled_export_sids(orphan_file: Optional[Path] = None) -> FrozenSet[str]:
+    """Session ids with an export waiting in the journal (durable, not yet folded into the file)."""
+    _, ops = _load_journal(orphan_file or get_orphan_path())
+    return frozenset(op["sid"] for op in ops if op.get("op") == OP_EXPORT)
+
+
 def _apply_op(sessions: dict, op: dict) -> dict:
     """Pure: ``sessions`` with ``op`` applied (exports keep the newest ORPHAN_CAPACITY)."""
     sid = op["sid"]
@@ -179,7 +239,10 @@ def _apply_op(sessions: dict, op: dict) -> dict:
 
 
 def _commit_locked(orphan_path: Path, ops: List[dict]) -> None:
-    """Under the orphan lock: replay the journal, apply ``ops``, write once, drop the journal."""
+    """Under the orphan lock: replay the journal, apply ``ops``, write once, drop the journal.
+
+    Raises OrphanFileError, leaving the file AND the journal untouched, when the file cannot be understood.
+    """
     entries, journaled = _load_journal(orphan_path)
     before = _read_orphan_sessions(orphan_path)
     after = before
@@ -259,6 +322,11 @@ def run_orphan_io(exports: Iterable[Tuple[str, dict]], removals: Iterable[str], 
         remove_orphan_record(sid, blocking=blocking)
 
 
+def journal_waiting(orphan_path: Path) -> bool:
+    """Journaled orphan operations wait to be folded into ``orphan_path``."""
+    return _journal_waiting(orphan_path)
+
+
 def _journal_waiting(orphan_path: Path) -> bool:
     """Journal entries are queued (an unlistable journal counts as waiting, so the flush reports the error)."""
     pending = pending_dir_for(orphan_path)
@@ -267,6 +335,22 @@ def _journal_waiting(orphan_path: Path) -> bool:
     except OSError as e:
         log_debug(f"Could not list orphan journal {pending}: {e}")
         return True
+
+
+def fold_journal_locked(orphan_path: Path) -> None:
+    """Under the orphan lock: fold queued journal operations into the file (a no-op without a journal).
+
+    Without journal entries the file is left exactly as it is (a hand-written orphan file in a
+    legacy shape is never rewritten or removed by a fold).
+    """
+    if _journal_waiting(orphan_path):
+        _commit_locked(orphan_path, [])
+
+
+def orphan_work_waiting(orphan_path: Optional[Path] = None) -> bool:
+    """The orphan file exists or journaled operations wait to be folded into it (reconciler work)."""
+    orphan_path = orphan_path or get_orphan_path()
+    return orphan_path.exists() or _journal_waiting(orphan_path)
 
 
 def flush_pending_orphan_ops(orphan_file: Optional[Path] = None, blocking: bool = True) -> bool:
@@ -316,115 +400,10 @@ def orphan_pane_ids(orphan_file: Optional[Path] = None) -> Optional[FrozenSet[st
     try:
         sessions = _read_orphan_sessions(orphan_path)
         _, ops = _load_journal(orphan_path)
+    except OrphanFileError as e:
+        log_debug(f"Orphan panes unknown ({e}); prune deferred")
+        return None
     finally:
         release_orphan_lock(lock_fd)
     exported = [op["session"] for op in ops if op.get("op") == OP_EXPORT]
     return _pane_ids(list(sessions.values()) + exported)
-
-
-def run_replay_orphans(orphan_path_str: str, bridge_url: str | None = None) -> bool:
-    orphan_path = Path(orphan_path_str).expanduser()
-    if not orphan_path.exists():
-        print(f"[-] Orphan file not found: {orphan_path}")
-        return False
-
-    # Plan L619/L686: replay is exempt from the 1.5s event-path watchdog.
-    runtime.set_deadline_mode(runtime.DEADLINE_UNBOUNDED)
-    lock_fd = None
-    try:
-        # R10: --replay-orphans may block on the orphan lock (bounded by its own budget).
-        lock_fd = acquire_orphan_lock(orphan_path, blocking=True)
-        try:
-            _commit_locked(orphan_path, [])  # fold in exports journaled under contention
-        except Exception as e:
-            log_debug(f"Failed to fold orphan journal into {orphan_path}: {e}")
-
-        try:
-            with open(orphan_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            print(f"[-] Failed to read orphan file: {e}")
-            return False
-
-        sessions = data.get("sessions", {}) if isinstance(data, dict) else {}
-        if not sessions and isinstance(data, list):
-            sessions = {s.get("session_id", f"orphan_{i}"): s for i, s in enumerate(data)}
-        elif not sessions and isinstance(data, dict):
-            sessions = data
-
-        cache_mgr = BoundedSessionCache(get_state_dir())
-        with cache_mgr as cdata:
-            active_sessions = cdata.get("sessions", {})
-            pane_gens = cdata.get("pane_generations", {})
-
-        print(f"[*] Replaying {len(sessions)} orphaned session(s) from {orphan_path}...")
-        all_success = True
-        for sid, s in list(sessions.items()):
-            if not isinstance(sid, str) or not SESSION_ID_REGEX.match(sid):
-                print(f"    [-] Skipping orphan with invalid session_id: {sid}")
-                sessions.pop(sid, None)
-                continue
-
-            orphan_gen = s.get("generation", 0) if isinstance(s, dict) else 0
-            pane_id = s.get("pane_id") if isinstance(s, dict) else None
-            if not pane_id and ":" in sid:
-                parts = sid.split(":")
-                pane_id = ":".join(parts[2:]) if len(parts) >= 3 else parts[-1]
-
-            curr_gen = pane_gens.get(pane_id, 0)
-            active_s = active_sessions.get(sid)
-            if not active_s and pane_id:
-                for asid, ainfo in active_sessions.items():
-                    if ainfo.get("pane_id") == pane_id:
-                        active_s = ainfo
-                        break
-            # Single normative boolean predicate:
-            # Skip orphan iff an active, live (non-salvaged) session exists on the pane with desired_state != 'Ended'
-            if active_s and not active_s.get("salvaged", False) and active_s.get("desired_state") != "Ended":
-                print(f"    [*] Skipping orphan {sid}: pane currently has active non-Ended session {active_s.get('desired_state')}")
-                sessions.pop(sid, None)
-                continue
-
-            agent_name = s.get("agent") if isinstance(s, dict) else "Herdr"
-            payload = {
-                "state": "Ended",
-                "agent": agent_name or "Herdr",
-                "session_id": sid,
-            }
-            success, is_non_retryable = post_bartender_event(payload, timeout=0.2, bridge_url=bridge_url)
-            if success:
-                print(f"    [+] Cleared {sid}")
-                sessions.pop(sid, None)
-                if pane_id:
-                    remove_pane_marker(pane_id)
-                with cache_mgr as cdata:
-                    active_s = cdata.get("sessions", {}).get(sid)
-                    if not active_s and pane_id:
-                        for asid, ainfo in cdata.get("sessions", {}).items():
-                            if ainfo.get("pane_id") == pane_id:
-                                active_s = ainfo
-                                break
-                    if active_s and active_s.get("desired_state") != "Ended":
-                        active_s["delivered_seq"] = 0
-                        active_s["delivery_status"] = "in_flight"
-                        touch_reconciler_pending()
-                        cdata["consecutive_failures"] = 0
-                        cache_mgr.save(cdata)
-            else:
-                print(f"    [-] Failed to deliver Ended for {sid}")
-                all_success = False
-
-        if all_success and not sessions:
-            try:
-                orphan_path.unlink()
-                print(f"[+] Successfully cleared all orphaned sessions; removed {orphan_path}")
-            except Exception:
-                pass
-        elif not all_success:
-            try:
-                write_orphan_sessions(orphan_path, sessions)
-            except Exception as e:
-                log_debug(f"Failed to rewrite remaining orphans to {orphan_path}: {e}")
-        return all_success
-    finally:
-        release_orphan_lock(lock_fd)

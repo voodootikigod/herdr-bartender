@@ -79,7 +79,7 @@ class HandlerTests(SandboxTestCase):
                 watchdog.honor_pending_exit()  # a cache release inside the section must not exit early
                 self.assertEqual(self.spawner.calls, [])
         self.assertEqual(cm.exception.code, 0)
-        self.assertEqual(self.spawner.calls, [handoff.reconciler_argv()])
+        self.assertEqual(self.spawner.calls, [handoff.loop_argv()])
         self.assertTrue((self.state_dir / "reconciler.pending").exists())
         self.assertFalse(runtime.IN_DEFER_SECTION)
 
@@ -99,7 +99,7 @@ class HandlerTests(SandboxTestCase):
             raise WatchdogExpired()
 
         self.assertEqual(watchdog.run_bounded(expire), 0)
-        self.assertEqual(self.spawner.calls, [handoff.reconciler_argv()])
+        self.assertEqual(self.spawner.calls, [handoff.loop_argv()])
         self.assertTrue((self.state_dir / "reconciler.pending").exists())
 
     def test_watchdog_armed_at_1p5s_from_process_start(self):

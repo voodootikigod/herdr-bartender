@@ -25,6 +25,7 @@ from .delivery_state import (
     StagedEffects,
     Transmission,
     apply_delivery_result,
+    commit_delivery_down,
     empty_effects,
     run_orphan_effects,
 )
@@ -157,9 +158,10 @@ def drain_results_dir(state_dir: Path, max_batch: int = RESULTS_BATCH,
     cache_mgr = cache_mgr or BoundedSessionCache(state_dir)
     merged = empty_effects()
     with cache_mgr as data:
-        for _, tx, outcome in batch.entries:
-            merged = merged.merge(apply_delivery_result(data, tx, outcome))
+        for _, tx, outcome in batch.entries:   # one critical section: later results see earlier DELIVERY_DOWN changes
+            merged = merged.merge(apply_delivery_result(data, tx, outcome, delivery_down=merged.delivery_down))
         cache_mgr.save(data)
+        commit_delivery_down(merged)   # only once saved: an unsaved reconnection keeps DELIVERY_DOWN for the retry
         unlink_files([path for path, _, _ in batch.entries])  # under the lock: no other drainer can re-apply them
     run_orphan_effects(merged)
     if merged.touch_pending or batch.backlog:  # backlog: drain the rest on the next pass, not after an idle sleep

@@ -14,7 +14,15 @@ A dismissal is always STAGED before it is SENT (critic vendor-dismissal-send-bef
 2. Outside the lock (budget-gated by the caller), ``post_dismissal()`` sends
    ``{"state": "Ended", "agent": "Herdr", "session_id": <uuid>}`` (R19).
 3. Under the lock again, ``record_dismissal_attempt()`` purges the entry on HTTP 200
-   (R11) or records the attempt for the reconciler's 2s retry cadence.
+   or after its 5th attempt (R11), else records the attempt for the reconciler's 2s
+   retry cadence (``dismissals.sweep_dismissals``).
+
+A dismissal queued by a pane/tab/workspace close carries ``pane_closed: true``: the pane
+and the vendor CLI that ran in it are gone, so the reconciler's pane-scoped cancellation
+triggers (``.vendor_active``, ``.failed``) do not apply to it (R24, see ``dismissals``).
+Other confirmed Endeds (TTL, agent exit, Herdr dead/restart, --cleanup) do not set it.
+The queue holds at most ``DISMISSED_VENDOR_CAP`` (64) entries; staging a new one
+prunes the oldest.
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ from typing import Optional, Sequence, Tuple
 from . import clock, runtime
 from .bridge import DEFAULT_EVENT_TIMEOUT, DeliveryResult, send_event
 from .cache import BoundedSessionCache, CacheError, IntegrationDisabled
+from .cache_schema import DISMISSED_VENDOR_CAP
 from .config import VENDOR_UUID_REGEX
 from .delivery_state import clear_pending_vendor_cleanup
 from .log import log_debug, log_warning
@@ -37,6 +46,7 @@ from .sanitize import get_hex_pane_id
 VENDOR_ACTIVE_SUFFIX = ".vendor_active"
 CLAIM_INFIX = ".claim-"              # <hex>.vendor_active.claim-<pid>-<ns>: being retired (leftovers swept)
 DISMISSAL_AGENT = "Herdr"            # R19
+DISMISSAL_MAX_ATTEMPTS = 5           # R11: sends at t=0, 2, 4, 6, 8
 NETWORK_RESERVE_SECONDS = 0.3
 
 
@@ -162,16 +172,50 @@ def pending_vendor_panes(data: dict) -> Tuple[str, ...]:
     return tuple(dict.fromkeys(pane for pane in panes if isinstance(pane, str) and pane))
 
 
-def stage_dismissal(data: dict, uuid: str, pane_id: str, now: float) -> dict:
-    """Queue ``uuid`` in ``dismissed_vendor_uuids`` before anything is sent (attempts 0)."""
-    entry = {"timestamp": now, "pane_hex": get_hex_pane_id(pane_id), "attempts": 0, "last_attempt": 0.0}
-    data.setdefault("dismissed_vendor_uuids", {})[uuid] = entry
+def _stamp(entry: object) -> float:
+    value = entry.get("timestamp") if isinstance(entry, dict) else None
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+
+
+def cap_dismissals(queue: dict, keep: Optional[str] = None) -> dict:
+    """At most DISMISSED_VENDOR_CAP entries, the oldest pruned first (``keep`` is never pruned)."""
+    if len(queue) <= DISMISSED_VENDOR_CAP:
+        return queue
+    candidates = sorted((uuid for uuid in queue if uuid != keep), key=lambda uuid: _stamp(queue[uuid]))
+    dropped = set(candidates[:len(queue) - DISMISSED_VENDOR_CAP])
+    log_debug(f"dismissed_vendor_uuids over its {DISMISSED_VENDOR_CAP}-entry cap; pruning {len(dropped)} oldest")
+    return {uuid: entry for uuid, entry in queue.items() if uuid not in dropped}
+
+
+def stage_dismissal_hex(data: dict, uuid: str, pane_hex: str, now: float, pane_closed: bool = False) -> dict:
+    """Queue ``uuid`` in ``dismissed_vendor_uuids`` before anything is sent (attempts 0), within the 64 cap."""
+    entry = {"timestamp": now, "pane_hex": pane_hex, "attempts": 0, "last_attempt": 0.0,
+             "pane_closed": bool(pane_closed)}
+    queue = dict(data.get("dismissed_vendor_uuids") or {})
+    queue[uuid] = entry
+    data["dismissed_vendor_uuids"] = cap_dismissals(queue, keep=uuid)
     return entry
 
 
-def resolve_vendor_cleanups(data: dict, panes: Sequence[str], now: float) -> VendorResolution:
-    """Under the cache lock: queue each pane's vendor dismissal and clear its pending cleanup entry."""
+def stage_dismissal(data: dict, uuid: str, pane_id: str, now: float, pane_closed: bool = False) -> dict:
+    return stage_dismissal_hex(data, uuid, get_hex_pane_id(pane_id), now, pane_closed)
+
+
+def _closed_panes(data: dict) -> frozenset:
+    """Panes whose persisted ``pending_vendor_cleanups`` entry comes from a pane close."""
+    entries = data.get("pending_vendor_cleanups", [])
+    return frozenset(e.get("pane_id") for e in entries if isinstance(e, dict) and e.get("is_pane_closed"))
+
+
+def resolve_vendor_cleanups(data: dict, panes: Sequence[str], now: float,
+                            closed_panes: Sequence[str] = ()) -> VendorResolution:
+    """Under the cache lock: queue each pane's vendor dismissal and clear its pending cleanup entry.
+
+    A pane closed by this request (``closed_panes``, or a persisted ``is_pane_closed`` entry) marks its
+    queued dismissal ``pane_closed``.
+    """
     dismissals, unlink, resolved = [], [], []
+    closed = _closed_panes(data) | frozenset(closed_panes)
     for pane in dict.fromkeys(p for p in panes if p):
         if pane in pending_vendor_panes(data):
             clear_pending_vendor_cleanup(data, pane)
@@ -181,7 +225,7 @@ def resolve_vendor_cleanups(data: dict, panes: Sequence[str], now: float) -> Ven
             continue
         uuid = parse_vendor_uuid(record)
         if uuid:
-            stage_dismissal(data, uuid, pane, now)
+            stage_dismissal(data, uuid, pane, now, pane_closed=pane in closed)
             dismissals.append(uuid)
         unlink.append(record)
     return VendorResolution(tuple(dict.fromkeys(dismissals)), tuple(unlink), tuple(resolved))
@@ -197,16 +241,24 @@ def post_dismissal(uuid: str, timeout: float = DEFAULT_EVENT_TIMEOUT,
     return send_event(dismissal_payload(uuid), timeout=timeout, bridge_url=bridge_url)
 
 
+def _attempts(entry: dict) -> int:
+    value = entry.get("attempts", 0)
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
 def record_dismissal_attempt(data: dict, uuid: str, result: DeliveryResult, now: float) -> None:
-    """Under the lock: purge on HTTP 200 (R11), else count the attempt for the reconciler's retries."""
+    """Under the lock: purge on HTTP 200 or at the 5th attempt (R11), else count the attempt for the retries."""
     queue = data.setdefault("dismissed_vendor_uuids", {})
     entry = queue.get(uuid)
     if not isinstance(entry, dict):
         return
-    if result.success:
+    attempts = _attempts(entry) + 1
+    if result.success or attempts >= DISMISSAL_MAX_ATTEMPTS:
+        if not result.success:
+            log_debug(f"Vendor dismissal of {uuid} unconfirmed after {attempts} attempts; purged (R11)")
         queue.pop(uuid, None)
         return
-    queue[uuid] = {**entry, "attempts": int(entry.get("attempts", 0) or 0) + 1, "last_attempt": now}
+    queue[uuid] = {**entry, "attempts": attempts, "last_attempt": now}
 
 
 def record_dismissal_attempts(cache_mgr: BoundedSessionCache, sent: Sequence[Tuple[str, DeliveryResult]]) -> bool:
@@ -229,15 +281,16 @@ def cleanup_vendor_active(pane_id: str, raw_pane_id: Optional[str] = None, is_pa
                           bridge_url: Optional[str] = None) -> None:
     """Stage, send and record one pane's vendor dismissal with its own lock holds (reconciler / --cleanup).
 
-    ``raw_pane_id`` and ``is_pane_closed`` are accepted for compatibility: a bare touch is unlinked on
-    confirmed delivery and on pane close alike (Plan §1 L57).
+    ``raw_pane_id`` is accepted for compatibility. A bare touch is unlinked on confirmed delivery and on
+    pane close alike (Plan §1 L57); ``is_pane_closed`` marks the queued dismissal ``pane_closed``.
     """
     if not pane_id:
         return
     cache_mgr = BoundedSessionCache(get_state_dir(), check_disabled=True)
     try:
         with cache_mgr as data:
-            resolution = resolve_vendor_cleanups(data, (pane_id,), clock.time())
+            resolution = resolve_vendor_cleanups(data, (pane_id,), clock.time(),
+                                                 closed_panes=(pane_id,) if is_pane_closed else ())
             cache_mgr.save(data)
             resolution.commit()
     except IntegrationDisabled:

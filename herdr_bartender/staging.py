@@ -43,6 +43,8 @@ SOURCE_STALENESS_TOLERANCE = 0.1   # Plan §4.3 L425: drop only when older than 
 
 STAGED = "staged"
 CLOSE_ORIGIN_FIELDS = ("close_kind", "closed_at_ns", "closed_source_ts", "exit_at_ns", "exit_source_ts")
+# Lifecycle stamps of the previous turn's Ended (TTL expiry, orphan horizon, R12): a new turn starts without them.
+PREVIOUS_TURN_FIELDS = CLOSE_ORIGIN_FIELDS + ("ttl_expired_at", "expiry_reason", "orphaned_ended", "orphaned_at")
 # A salvaged record stamps these with the salvage time, which is not a real arrival or admission (Plan §6.3).
 SALVAGE_STAMPED_FIELDS = ("admitted_at_ns", "last_arrival_ns", "last_event_ns", "last_applied_arrival_time")
 
@@ -216,7 +218,7 @@ def _commit_status(data: dict, sid: str, identity: Identity, event_data: Mapping
         data["next_generation"] = gen
         data.setdefault("pane_generations", {})[pane] = gen
         record.update({"generation": gen, "admitted_at_ns": plan["arr_ns"]})
-        for stale in CLOSE_ORIGIN_FIELDS:  # a new turn starts without the previous turn's close origin
+        for stale in PREVIOUS_TURN_FIELDS:  # a new turn starts without the previous turn's close origin
             record.pop(stale, None)
     record["salvaged"] = False
     seq = int(record.get("seq", 0) or 0) + 1
@@ -227,7 +229,8 @@ def _commit_status(data: dict, sid: str, identity: Identity, event_data: Mapping
         "pane_id": pane, "workspace_id": fields.workspace_id, "tab_id": fields.tab_id, "host": plan["host"],
         "agent": plan["agent_name"], "raw_agent": plan["raw_agent"], "title": fields.title, "cwd": fields.cwd,
         "desired_state": mapped, "desired_payload": payload, "seq": seq, "delivery_status": "in_flight",
-        "delivery_error": None, "delivery_attempts": 0, "last_applied_arrival_time": plan["arr_time"],
+        "delivery_error": None, "delivery_attempts": 0, "next_retry_at": None,
+        "last_applied_arrival_time": plan["arr_time"],
         "last_arrival_ns": arr_ns, "last_event_ns": event_ns, "last_event_at": plan["now_wall"],
     })
     if mapped == "Ended":
@@ -347,7 +350,7 @@ def _close_session(record: dict, sid: str, event_name: str, event_data: Mapping,
                          _num(record.get("last_source_timestamp")) or 0.0, float(arr_ns) / 1e9)
         record.update({"closed_at_ns": arr_ns, "closed_source_ts": closed_src, "close_kind": "container"})
     record.update({"desired_state": "Ended", "seq": seq, "delivery_status": "in_flight", "delivery_error": None,
-                   "delivery_attempts": 0})
+                   "delivery_attempts": 0, "next_retry_at": None})
     payload = build_close_payload(sid, record, event_name, seq)
     record["desired_payload"] = payload
     return CloseTarget(sid, record.get("pane_id"), record, payload, seq)

@@ -8,7 +8,8 @@ single copy.
 from __future__ import annotations
 
 import signal
-from typing import Optional, Tuple
+from contextlib import contextmanager
+from typing import Iterator, Optional, Tuple
 
 from . import clock, paths
 
@@ -74,6 +75,22 @@ def set_deadline_mode(mode: Optional[str]) -> None:
     if mode not in _DEADLINE_MODES:
         raise ValueError(f"unknown deadline mode: {mode!r}")
     DEADLINE_MODE = mode
+
+
+@contextmanager
+def deadline_mode(mode: Optional[str]) -> Iterator[None]:
+    """Run a block in ``mode`` and restore the previous mode afterwards.
+
+    The reconciler, ``--cleanup`` and ``--replay-orphans`` run their whole body in
+    DEADLINE_UNBOUNDED (Plan L619/L686): they never inherit the 1.5s event-path
+    formulas, whichever process they run in.
+    """
+    previous = DEADLINE_MODE
+    set_deadline_mode(mode)
+    try:
+        yield
+    finally:
+        set_deadline_mode(previous)
 
 
 def _watchdog_armed() -> bool:

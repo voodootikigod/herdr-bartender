@@ -2,9 +2,14 @@
 
 * ``touch_reconciler_pending()`` flags work for the reconciler loop (it re-runs a pass
   instead of sleeping).
-* ``ensure_reconciler_running()`` starts ``bin/herdr-bartender --reconcile-background``
-  detached (own session, no inherited stdio) unless one already holds
-  ``reconciler.lock`` (the singleton) or the integration is DISABLED.
+* ``reconciler_loop()`` marks this process as the running reconciler loop: work the loop
+  does at every pass anyway (folding the orphan journal) needs no wake-up from it, so its
+  own journal entries never make it re-run without sleeping.
+* ``ensure_reconciler_running()`` starts ``bin/herdr-bartender --reconcile-background
+  --foreground`` detached (own session, no inherited stdio) unless one already holds
+  ``reconciler.lock`` (the singleton) or the integration is DISABLED. The spawner already
+  detaches, so the child runs the loop itself (``--foreground``) instead of detaching a
+  second time (R21: a plain ``--reconcile-background`` is the startup hook's detach step).
 
 Process creation goes through an injectable ``Spawner`` (``set_spawner``). Production
 uses ``DetachedSpawner``; the test sandbox installs a recording spawner, so no code
@@ -20,8 +25,9 @@ import fcntl
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Iterator, List, Optional, Sequence
 
 from .log import log_debug
 from .paths import PRIVATE_FILE_MODE, get_state_dir, launcher_path
@@ -29,6 +35,7 @@ from .paths import PRIVATE_FILE_MODE, get_state_dir, launcher_path
 PENDING_FILE_NAME = "reconciler.pending"
 RECONCILER_LOCK_NAME = "reconciler.lock"
 RECONCILE_FLAG = "--reconcile-background"
+FOREGROUND_FLAG = "--foreground"  # the detached child that actually runs the reconciler loop
 
 
 class Spawner:
@@ -75,8 +82,31 @@ def reconciler_argv(*extra: str) -> List[str]:
     return [sys.executable, str(launcher_path()), RECONCILE_FLAG, *extra]
 
 
+def loop_argv() -> List[str]:
+    """argv of the detached process that runs the reconciler loop (already detached by the spawner)."""
+    return reconciler_argv(FOREGROUND_FLAG)
+
+
 def _state_dir(state_dir: Optional[Path]) -> Path:
     return Path(state_dir) if state_dir is not None else get_state_dir()
+
+
+_IN_RECONCILER_LOOP = False
+
+
+@contextmanager
+def reconciler_loop() -> Iterator[None]:
+    """Scope of the reconciler loop in this process (see the module docstring)."""
+    global _IN_RECONCILER_LOOP
+    previous, _IN_RECONCILER_LOOP = _IN_RECONCILER_LOOP, True
+    try:
+        yield
+    finally:
+        _IN_RECONCILER_LOOP = previous
+
+
+def in_reconciler_loop() -> bool:
+    return _IN_RECONCILER_LOOP
 
 
 def touch_reconciler_pending(state_dir: Optional[Path] = None) -> None:
@@ -113,7 +143,7 @@ def ensure_reconciler_running(state_dir: Optional[Path] = None) -> bool:
         return False
     if reconciler_running(directory):
         return False
-    return get_spawner().spawn(reconciler_argv())
+    return get_spawner().spawn(loop_argv())
 
 
 def hand_off_to_reconciler(state_dir: Optional[Path] = None) -> None:

@@ -8,6 +8,9 @@ staleness guard; a STALE verdict still releases the claimant's own lease. The le
 never kept for a follow-up send (R5): a newer seq that arrived during the send releases
 the lease and hands off to the reconciler.
 
+The outcome's DELIVERY_DOWN transition is committed only after the Step C save succeeds, so
+a reconnection whose re-sync is written to ``results/`` instead keeps the flag for the drain.
+
 Before the lock is released, every side effect owed outside it is persisted
 (``pending_compensations`` with target generation and ``admitted_at_ns``; vendor
 dismissals queued in ``dismissed_vendor_uuids``). A Step C that cannot lock or save writes
@@ -22,7 +25,7 @@ from typing import Optional, Tuple
 
 from .. import clock
 from ..cache import BoundedSessionCache, CacheError, IntegrationDisabled
-from ..delivery_state import MISSING, STALE, Outcome, StagedEffects, apply_delivery_result
+from ..delivery_state import MISSING, STALE, Outcome, StagedEffects, apply_delivery_result, commit_delivery_down
 from ..log import log_debug, log_warning
 from ..orphans import run_orphan_io
 from ..results import ResultWriteError, write_result_envelope
@@ -96,6 +99,7 @@ def _settle_locked(cache_mgr: BoundedSessionCache, claim: Claim, sent: Sent
         live = has_live_sessions(data)
         if changed or vendor.changed:
             cache_mgr.save(data)
+            commit_delivery_down(effects)   # a reconnection clears DELIVERY_DOWN only once its re-sync is saved
         vendor.commit()
     post = PostLock(effects.compensations, vendor.dismissals, effects.touch_pending or effects.spawn_reconciler,
                     live)

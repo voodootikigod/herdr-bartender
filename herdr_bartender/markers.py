@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from . import clock
 from .log import log_debug
 from .paths import ensure_private_dir, get_state_dir
@@ -100,6 +102,31 @@ def touch_pane_marker(pane_id: str):
             failed_path.unlink()
     except OSError as exc:
         log_debug(f"touch_pane_marker failed for {pane_id!r}: {exc}")
+
+
+def refresh_pane_marker(pane_id: str) -> bool:
+    """Reconciler heartbeat (Plan §5.1 item 5): refresh an EXISTING ``panes/<hex>``'s mtime; True when refreshed.
+
+    Unlike ``touch_pane_marker`` it never clears ``<hex>.failed``, does nothing while that
+    flag exists and never creates a marker (only a confirmed delivery does), so it is safe
+    outside the cache lock: a delivery failure racing the heartbeat still leaves ``.failed``
+    in place, and a marker removed by a concurrent confirmed Ended stays removed.
+    """
+    if not pane_id or is_disabled():
+        return False
+    try:
+        panes_dir = get_state_dir() / "panes"
+        hex_id = get_hex_pane_id(pane_id)
+        if (panes_dir / f"{hex_id}.failed").exists():
+            return False
+        try:
+            os.utime(panes_dir / hex_id, None)
+        except FileNotFoundError:
+            return False
+        return True
+    except OSError as exc:
+        log_debug(f"Heartbeat could not refresh the marker of {pane_id!r}: {exc}")
+        return False
 
 
 def remove_pane_marker(pane_id: str):

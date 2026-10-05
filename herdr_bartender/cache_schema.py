@@ -18,6 +18,7 @@ SCALAR_DEFAULTS = {
     "herdr_instance_id": None,
     "last_herdr_pid": None,
     "last_bartender_pid": None,
+    "herdr_dead_since": None,     # Plan §5.1 item 7: wall time Herdr was first confirmed dead (reconciler)
     "last_updated": 0.0,
     "consecutive_failures": 0,
     "last_successful_delivery": 0.0,

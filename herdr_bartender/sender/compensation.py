@@ -16,14 +16,16 @@ re-verification lock, right BEFORE each POST:
 The reconciler loop treats owed entries as outstanding work and sleeps until the next
 one is due, so an unconfirmed entry never re-flags ``reconciler.pending`` (no busy loop).
 
-Pure functions only: no I/O, no lock.
+Pure functions only: no I/O, no lock (the schedule constant comes from ``delivery_state``).
 """
 
 from __future__ import annotations
 
 from typing import Iterable, Mapping, Optional
 
-COMPENSATION_RETRY_DELAYS = (0.0, 1.0, 2.0, 4.0, 8.0)
+from ..delivery_state import RETRY_DELAYS
+
+COMPENSATION_RETRY_DELAYS = RETRY_DELAYS   # the Plan §3.3 schedule shared with session retries
 MAX_COMPENSATION_ATTEMPTS = len(COMPENSATION_RETRY_DELAYS)
 BOOKKEEPING_FIELDS = ("attempts", "last_attempt", "posted")
 

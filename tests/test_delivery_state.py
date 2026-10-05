@@ -8,9 +8,10 @@ from herdr_bartender.delivery_state import (
     Outcome,
     Transmission,
     apply_delivery_result,
+    commit_delivery_down,
     stage_vendor_cleanup,
 )
-from herdr_bartender.markers import is_delivery_down, touch_delivery_down, touch_pane_failed
+from herdr_bartender.markers import is_delivery_down, touch_pane_failed
 from herdr_bartender.sanitize import get_hex_pane_id
 from tests.support import SandboxTestCase
 
@@ -48,9 +49,9 @@ class ApplyDeliveryResultTests(SandboxTestCase):
     # -- success -------------------------------------------------------------------
     def test_success_applies_delivery_and_side_effects(self):
         """§3.3 row 200 ok:true: delivered fields, counters reset, marker touched, flags cleared, vendor
-        dismissal staged, exhausted sessions re-armed, lease cleared."""
+        dismissal staged, exhausted sessions re-armed, lease cleared. (A success after DELIVERY_DOWN is the bridge
+        reconnection and also re-syncs: tests/test_reconnect_resync.py.)"""
         touch_pane_failed(PANE)
-        touch_delivery_down()
         self.data["consecutive_failures"] = 2
         self.data["sessions"]["other"] = {"delivery_status": "retryable_exhausted", "delivery_attempts": 5}
         effects = apply_delivery_result(self.data, self.tx(), Outcome("success"))
@@ -95,6 +96,7 @@ class ApplyDeliveryResultTests(SandboxTestCase):
         self.assertTrue(effects.evicted)
         self.assertEqual(self.data["agent_exits"][PANE], {"exit_at_ns": 777, "exit_source_ts": 12.5})
         self.assertNotIn(PANE, self.data["tombstones"])
+        self.assertIs(effects.vendor_cleanups[0]["is_pane_closed"], False, "an agent exit leaves the pane open (R24)")
 
     def test_success_ended_superseded_by_newer_turn_is_not_evicted(self):
         """§4.3 Active Supersession: a newer seq arrived; do not evict, hand the newer state on."""
@@ -224,7 +226,8 @@ class ApplyDeliveryResultTests(SandboxTestCase):
         self.assertEqual([sid for sid, _ in effects.orphans_to_export], [self.sid_])
 
     def test_retryable_failure_counts_and_delivery_down(self):
-        """§3.3 rows 5xx/network: attempts++, error code, .failed on first failure, DELIVERY_DOWN at 3 consecutive."""
+        """§3.3 rows 5xx/network: attempts++, error code, .failed on first failure, DELIVERY_DOWN at 3 consecutive
+        (staged, set by the caller once the failure count is saved)."""
         self.data["consecutive_failures"] = 2
         effects = apply_delivery_result(self.data, self.tx(), Outcome("retryable", "5xx_server_error"))
         s = self.session()
@@ -232,6 +235,8 @@ class ApplyDeliveryResultTests(SandboxTestCase):
         self.assertEqual((s["delivery_attempts"], s["delivery_error"]), (1, "5xx_server_error"))
         self.assertTrue((self.panes / f"{self.hex}.failed").exists())
         self.assertEqual(self.data["consecutive_failures"], 3)
+        self.assertIs(effects.delivery_down, True)
+        commit_delivery_down(effects)
         self.assertTrue(is_delivery_down())
         self.assertTrue(effects.spawn_reconciler)
         self.assertIsNone(s["lease_token"])

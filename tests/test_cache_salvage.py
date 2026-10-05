@@ -10,7 +10,7 @@ from unittest import mock
 from herdr_bartender import cache as cache_mod
 from herdr_bartender import runtime, watchdog
 from herdr_bartender.cache_schema import SALVAGE_EPOCH_FLOOR
-from herdr_bartender.orphans import run_replay_orphans
+from herdr_bartender.replay import run_replay_orphans
 from herdr_bartender.reconciler import reconcile_active_sessions
 from herdr_bartender.salvage import QUARANTINE_RETENTION_SECONDS, parse_pane_generations, prune_corrupt_quarantine
 from herdr_bartender.sanitize import get_hex_pane_id

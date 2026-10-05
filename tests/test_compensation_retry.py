@@ -32,9 +32,6 @@ class OwedCompensationCase(SandboxTestCase):
         self.clock = self.use_fake_clock()
         self.session_id = self.sid(PANE)
         self.bridge.probe = lambda: {"at": clock.time()}
-        hooks = mock.patch.object(background, "verify_vendor_hooks_intact", return_value=(True, []))
-        hooks.start()
-        self.addCleanup(hooks.stop)
 
     def seed(self, **bookkeeping):
         entry = {"session_id": self.session_id, "pane_id": PANE, "agent": "Claude (Herdr)", "generation": 2,
@@ -53,7 +50,11 @@ class OwedCompensationCase(SandboxTestCase):
                 if r["method"] == "POST" and (r["body"] or {}).get("session_id") == self.session_id]
 
     def run_loop(self):
-        """run_reconcile_background with a guard: a busy loop fails the test instead of hanging it."""
+        """run_reconcile_background with a guard: a busy loop fails the test instead of hanging it.
+
+        The loop keeps running while a session or an orphan export waits on an unhealthy bridge, so the run is
+        ended (DISABLED) after the first pass that starts with the owed compensation settled one way or the other.
+        """
         passes = []
         real_pass = background._sweep_pass
 
@@ -61,7 +62,11 @@ class OwedCompensationCase(SandboxTestCase):
             passes.append(clock.monotonic())
             if len(passes) > PASS_GUARD:
                 raise AssertionError(f"reconciler spin: {len(passes)} sweep passes")
-            return real_pass(*args)
+            settled = not self.owed()
+            result = real_pass(*args)
+            if settled:
+                (self.state_dir / "DISABLED").touch()
+            return result
 
         with mock.patch.object(background, "_sweep_pass", side_effect=guarded):
             background.run_reconcile_background(bridge_url=self.mock_url)

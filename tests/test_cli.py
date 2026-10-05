@@ -41,7 +41,9 @@ def _load_manifest(path):
 
 
 class LauncherTests(SandboxTestCase):
-    start_bridge = False
+    # A mock bridge even though nothing is asserted about it: the event subprocesses below register a fake
+    # Bartender, so without NOTCHBAR_AGENTS_PORT pointing at the mock they would POST to the real 127.0.0.1:7823.
+    start_bridge = True
 
     def test_launcher_is_executable(self):
         """The launcher stays an executable python3 script."""
@@ -111,7 +113,7 @@ class LauncherTests(SandboxTestCase):
         """R20 (gap event-input-contract): a known argv event without payload calls ensure_reconciler_running()."""
         with mock.patch.object(cli, "dispatch_event") as dispatch:
             self.assertEqual(cli.run_event(["tab.closed"], b"", {}), 0)
-            self.assertEqual(self.spawner.calls, [handoff.reconciler_argv()])
+            self.assertEqual(self.spawner.calls, [handoff.loop_argv()])
             dispatch.assert_not_called()
             self.spawner.reset()
             cli.run_event(["not.an.event"], b"", {})
@@ -251,6 +253,24 @@ class ReconcileCommandTests(SandboxTestCase):
             code = cli.run_reconcile_command(["--reconcile-background"])
         self.assertEqual(code, 1)
         self.assertTrue(any("no fork" in str(c.args[0]) for c in log.call_args_list))
+
+
+class UnitTestRunnerTests(unittest.TestCase):
+    """--unit-test arms a faulthandler watchdog: a hung run dumps every thread's stack and exits non-zero."""
+
+    def test_hang_watchdog_is_armed_for_the_run_and_cancelled_after(self):
+        events = []
+        runner = mock.Mock()
+        runner.return_value.run.side_effect = lambda _suite: events.append("run") or mock.Mock(
+            wasSuccessful=lambda: True)
+        with mock.patch.object(cli.faulthandler, "dump_traceback_later",
+                               side_effect=lambda timeout, exit: events.append(("armed", timeout, exit))), \
+                mock.patch.object(cli.faulthandler, "cancel_dump_traceback_later",
+                                  side_effect=lambda: events.append("cancelled")), \
+                mock.patch("unittest.defaultTestLoader.discover", return_value=unittest.TestSuite()), \
+                mock.patch("unittest.TextTestRunner", runner):
+            self.assertEqual(cli.run_unit_tests(), 0)
+        self.assertEqual(events, [("armed", cli.UNIT_TEST_HANG_SECONDS, True), "run", "cancelled"])
 
 
 if __name__ == "__main__":

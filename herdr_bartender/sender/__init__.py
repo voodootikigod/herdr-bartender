@@ -33,7 +33,7 @@ from .lease import (
     release_lease,
     warm_step_a_probes,
 )
-from .policy import BACKGROUND_POLICY, EVENT_POLICY, SendPolicy
+from .policy import BACKGROUND_POLICY, EVENT_POLICY, SendPolicy, cleanup_budget, cleanup_policy
 from .step_a import (
     ClaimPlan,
     Stage,
@@ -78,7 +78,8 @@ def finish(policy: SendPolicy, *, hand_off: bool, live_remaining: bool) -> None:
 __all__ = [
     "BACKGROUND_POLICY", "Claim", "ClaimPlan", "CriticalSectionViolation", "DeliveryReport", "EVENT_POLICY",
     "LEASE_GRACE_SECONDS", "LEASE_SECONDS", "PostLock", "SendPolicy", "Sent", "Stage", "Staged", "StepAResult", "Target",
-    "claim_lease", "claim_targets", "compensate", "deliver_claim", "dismiss_vendors",
+    "claim_lease", "claim_targets", "cleanup_budget", "cleanup_policy", "compensate", "deliver_claim",
+    "dismiss_vendors",
     "ensure_outside_critical_section", "finish", "has_live_sessions", "lease_active_elsewhere", "release_lease",
     "run_post_lock", "run_step_a", "settle", "transmit", "warm_step_a_probes",
 ]
