@@ -5,6 +5,7 @@ import os
 import unittest
 
 from tests.support import run_guard
+from tests.support.guard_harness import make_shim, path_with
 from tests.test_hooks_guard import _GuardCase
 
 SID = "c91f0443-1e47-54f7-9c13-2c064cbee24f"
@@ -47,6 +48,24 @@ class GuardVendorActiveHardeningTests(_GuardCase):
         va.mkdir()
         self.run_event(pane, json.dumps({"session_id": SID, "hook_event_name": "UserPromptSubmit"}))
         self.assertEqual(list(va.iterdir()), [], "nothing is moved into a directory planted at the path")
+
+
+class GuardSingleBoundedReadTests(_GuardCase):
+    def test_vendor_active_is_read_once_bounded_without_wc(self):
+        """R75: the size check and the UUID check use ONE bounded no-follow read (perl/python3), never a whole-file
+        `wc -c` scan followed by a second, separately raced `grep` of the path."""
+        self.set_herdr_dead()
+        script = self.script("guard-va-read.sh", 'echo "PASSTHROUGH"')
+        log = self.tmp / "wc.log"
+        make_shim(self.shim_bin, "wc", f'printf "%s\\n" "$*" >> "{log}"\nexec /usr/bin/env -i PATH=/usr/bin:/bin wc "$@"')
+        pane = "w1:pVaOnce"
+        _, va = self.paths(pane)
+        va.write_text(json.dumps({"vendor_session_id": SID}))
+        res = run_guard(script, "Working", env_extra={"HERDR_PANE_ID": pane, "PATH": path_with(self.shim_bin)})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("PASSTHROUGH", res.stdout)
+        self.assertFalse(log.exists() and log.read_text().strip(), "no wc scan of .vendor_active")
+        self.assertEqual(json.loads(va.read_text()), {"vendor_session_id": SID}, "the UUID record is still honoured")
 
 
 if __name__ == "__main__":

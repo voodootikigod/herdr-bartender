@@ -301,26 +301,62 @@ while True:
         _HB_CAPTURE_ERR=1
       fi
 
-      # R74: a genuine .vendor_active is only ever a small regular file written by mktemp + mv. A symlink, a
-      # non-regular entry or anything over 4 KiB is removed (rm never follows); an entry rm cannot remove (a
-      # directory) blocks every .vendor_active write and simply passes through.
+      # R74/R75: a genuine .vendor_active is only ever a small regular file written by mktemp + mv. It is read ONCE,
+      # without following symlinks or blocking, and at most 4097 bytes (exit 0 read, 1 missing, 3 unusable: a
+      # symlink, non-regular or over 4 KiB). An unusable entry is removed (rm never follows); one rm cannot remove
+      # (a directory) blocks every .vendor_active write and simply passes through. Decisions use the bytes read.
       _HB_VA_BLOCKED=0
-      if [ -L "$_HB_VENDOR_ACTIVE" ] || { [ -e "$_HB_VENDOR_ACTIVE" ] && [ ! -f "$_HB_VENDOR_ACTIVE" ]; }; then
-        rm -f "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
-      elif [ -f "$_HB_VENDOR_ACTIVE" ]; then
-        _HB_VA_SIZE=$(wc -c < "$_HB_VENDOR_ACTIVE" 2>/dev/null | tr -d ' \t') || _HB_VA_SIZE=""
-        case "$_HB_VA_SIZE" in ''|*[!0-9]*) _HB_VA_SIZE=99999 ;; esac
-        if [ "$_HB_VA_SIZE" -gt 4096 ]; then
-          rm -f "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
+      _HB_VA_CONTENT=""
+      if [ "$_HB_HAS_PERL" -eq 1 ]; then
+        if _HB_VA_CONTENT=$(perl -e 'use Fcntl; my $p = shift;
+            sysopen(my $f, $p, O_RDONLY|O_NONBLOCK|O_NOFOLLOW) or exit($!{ENOENT} ? 1 : 3);
+            stat($f); -f _ or exit 3; my $n = sysread($f, my $b, 4097);
+            exit 3 if !defined $n || $n > 4096; print $b; exit 0' "$_HB_VENDOR_ACTIVE" 2>/dev/null); then
+          _HB_VA_STATE=0
+        else
+          _HB_VA_STATE=$?
         fi
+      elif command -v python3 >/dev/null 2>&1; then
+        if _HB_VA_CONTENT=$(python3 -c 'import os, stat, sys
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+except FileNotFoundError:
+    sys.exit(1)
+except OSError:
+    sys.exit(3)
+if not stat.S_ISREG(os.fstat(fd).st_mode):
+    sys.exit(3)
+b = os.read(fd, 4097)
+if len(b) > 4096:
+    sys.exit(3)
+sys.stdout.buffer.write(b)' "$_HB_VENDOR_ACTIVE" 2>/dev/null); then
+          _HB_VA_STATE=0
+        else
+          _HB_VA_STATE=$?
+        fi
+      elif [ -L "$_HB_VENDOR_ACTIVE" ] || { [ -e "$_HB_VENDOR_ACTIVE" ] && [ ! -f "$_HB_VENDOR_ACTIVE" ]; }; then
+        _HB_VA_STATE=3
+      elif [ ! -e "$_HB_VENDOR_ACTIVE" ]; then
+        _HB_VA_STATE=1
+      else
+        _HB_VA_CONTENT=$(head -c 4097 "$_HB_VENDOR_ACTIVE" 2>/dev/null) || _HB_VA_CONTENT=""
+        _HB_VA_STATE=0
+        if [ "${#_HB_VA_CONTENT}" -gt 4096 ]; then _HB_VA_STATE=3; fi
       fi
-      if [ -L "$_HB_VENDOR_ACTIVE" ] || { [ -e "$_HB_VENDOR_ACTIVE" ] && [ ! -f "$_HB_VENDOR_ACTIVE" ]; }; then
-        _HB_VA_BLOCKED=1
-      fi
+      case "$_HB_VA_STATE" in
+        0|1) ;;
+        *)
+          _HB_VA_CONTENT=""
+          rm -f "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
+          if [ -L "$_HB_VENDOR_ACTIVE" ] || [ -e "$_HB_VENDOR_ACTIVE" ]; then
+            _HB_VA_BLOCKED=1
+          fi
+          ;;
+      esac
 
       _HB_VA_HAS_UUID=0
-      if [ "$_HB_VA_BLOCKED" -eq 0 ] && [ -s "$_HB_VENDOR_ACTIVE" ] \
-         && grep -m1 -Eq '\{"vendor_session_id":' "$_HB_VENDOR_ACTIVE" 2>/dev/null; then
+      if [ "$_HB_VA_BLOCKED" -eq 0 ] && [ -n "$_HB_VA_CONTENT" ] \
+         && printf '%s' "$_HB_VA_CONTENT" | grep -m1 -Eq '\{"vendor_session_id":' 2>/dev/null; then
         _HB_VA_HAS_UUID=1
       fi
 
@@ -428,7 +464,7 @@ while True:
             _HB_HERDR_HEALTHY _HB_MARKER_MTIME _HB_MARKER_AGE _HB_NOW_TIME _HB_OLD_UMASK _HB_FIRST_LINE \
             _HB_READ_STATUS _HB_RAW_SID _HB_VA_TMP _HB_CAPTURE_ERR _HB_GUARD_TMP _HB_SPLICE_FIFO \
             _HB_ARGV_IS_JSON _HB_ARGV_SID _HB_AWK _HB_CLASS _HB_CLASSIFY_ERR _HB_HAS_PERL _HB_DEADLINE \
-            _HB_VA_SIZE _HB_VA_BLOCKED
+            _HB_VA_BLOCKED _HB_VA_CONTENT _HB_VA_STATE
     fi
   fi
 fi
