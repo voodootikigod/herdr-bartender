@@ -243,9 +243,9 @@ class WatchdogDuringDeferralTests(SandboxTestCase):
         """Finding (watchdog vs contention spool): SIGALRM in the middle of writing the envelope lets the atomic
         write finish (no lost close, no stray tmp file)."""
         hold_lock(self, self.cache_mgr.lock_file)
-        real = envelopes.write_json_atomic
-        with mock.patch("herdr_bartender.envelopes.write_json_atomic",
-                        side_effect=lambda path, obj: self._alarm_then(real, path, obj)):
+        real = envelopes.write_bytes_atomic
+        with mock.patch("herdr_bartender.envelopes.write_bytes_atomic",
+                        side_effect=lambda path, data: self._alarm_then(real, path, data)):
             self._run_expecting_deadline_exit(handle_pane_closed, {"pane_id": "w1:pCont"}, {}, self.mock_url, 222)
         self.assertEqual([e["event_name"] for e in self._spooled()], ["pane.closed"])
         self.assertEqual(list(self.spool_dir.glob("*.tmp")), [])

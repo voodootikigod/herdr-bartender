@@ -15,6 +15,7 @@ import tempfile
 from pathlib import Path
 from typing import Dict, Tuple
 
+from .boundedio import SMALL_STATE_MAX_BYTES, read_regular_file
 from . import jsonsafe
 from .log import log_warning
 
@@ -106,7 +107,7 @@ def unlink_flags(state_dir: Path, names) -> None:
 def load_sha_allowlist(path: Path) -> Dict[str, str]:
     """Known-clean hook SHAs; a missing, corrupt or invalid file yields {} (fail closed)."""
     try:
-        raw = jsonsafe.loads(path.read_text(encoding="utf-8"))
+        raw = jsonsafe.loads(read_regular_file(path, SMALL_STATE_MAX_BYTES))
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as e:

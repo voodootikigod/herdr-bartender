@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+from ..boundedio import CACHE_MAX_BYTES, read_regular_file
 from .. import jsonsafe, runtime
 from ..cache import CACHE_FILE_NAME
 from ..delivery_state import LEASE_GRACE_SECONDS, LEASE_SECONDS, Transmission
@@ -111,7 +112,7 @@ def peek_cache(state_dir: Path) -> dict:
     taken from it.
     """
     try:
-        data = jsonsafe.loads((Path(state_dir) / CACHE_FILE_NAME).read_bytes())
+        data = jsonsafe.loads(read_regular_file(Path(state_dir) / CACHE_FILE_NAME, CACHE_MAX_BYTES))
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as e:

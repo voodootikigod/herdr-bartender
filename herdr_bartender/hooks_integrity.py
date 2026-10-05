@@ -23,6 +23,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
+from .boundedio import HOOK_SCRIPT_MAX_BYTES, read_regular_file, read_regular_prefix
 from . import hooks_fs
 from .hooks_install import (
     HOOK_NEEDS_REVIEW,
@@ -112,7 +113,7 @@ def approved_clean(content: bytes, known_sha: Optional[str]) -> Tuple[bytes, str
 def _check_one(hook: Path, known: dict, template: Optional[bytes]) -> HookCheck:
     known_sha = known.get(hook.name)
     try:
-        content = hook.read_bytes()
+        content = read_regular_file(hook, HOOK_SCRIPT_MAX_BYTES, follow_symlinks=True)
         block = guard_block(content)
         _, clean_sha = approved_clean(content, known_sha)
         legacy = is_legacy_layout(content)
@@ -188,7 +189,7 @@ def _repair_one(hook: Path, expected_sha: str, template: bytes) -> bool:
     The current guard goes over exactly the approved guard-free bytes (R37: a legacy layout is re-laid out).
     """
     try:
-        content = hook.read_bytes()
+        content = read_regular_file(hook, HOOK_SCRIPT_MAX_BYTES, follow_symlinks=True)
         clean, clean_sha = approved_clean(content, expected_sha)
         if clean_sha != expected_sha:
             log_warning(f"{hook.name} changed since the integrity check; repair refused")
@@ -221,7 +222,7 @@ def review_reasons(result: IntegrityResult) -> str:
 def recorded_review_reasons(state_dir: Path) -> str:
     """The causes HOOK_NEEDS_REVIEW records ("" when missing, unreadable or a bare touch)."""
     try:
-        raw = (state_dir / HOOK_NEEDS_REVIEW).read_bytes()[:_REASONS_MAX_BYTES]
+        raw = read_regular_prefix(state_dir / HOOK_NEEDS_REVIEW, _REASONS_MAX_BYTES)
     except OSError:
         return ""
     return raw.decode("utf-8", "replace").strip()

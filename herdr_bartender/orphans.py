@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 from typing import Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Tuple
 
+from .boundedio import JOURNAL_ENTRY_MAX_BYTES, ORPHAN_FILE_MAX_BYTES, UnusableFile, read_regular_file
 from . import clock, jsonsafe
 from .envelopes import quarantine
 from .log import log_debug
@@ -107,7 +108,7 @@ def parse_orphan_records(raw: object) -> Dict[str, object]:
 def read_orphan_records(orphan_path: Path) -> Dict[str, object]:
     """The records of ``orphan_path`` ({} when it does not exist); raises OrphanFileError when unreadable."""
     try:
-        raw = jsonsafe.loads(orphan_path.read_text(encoding="utf-8"))
+        raw = jsonsafe.loads(read_regular_file(orphan_path, ORPHAN_FILE_MAX_BYTES))   # R65: bounded
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as exc:
@@ -230,7 +231,11 @@ def _load_journal(orphan_path: Path) -> _Journal:
     journal = _Journal([], [], [])
     for entry in sorted(pending.glob("*.json")):
         try:
-            op = jsonsafe.loads(entry.read_text(encoding="utf-8"))
+            op = jsonsafe.loads(read_regular_file(entry, JOURNAL_ENTRY_MAX_BYTES))
+        except UnusableFile as e:   # R65: oversized / not a regular file - never retried forever
+            log_debug(f"Orphan journal entry {entry.name} unusable ({e}); quarantining it")
+            journal.poison.append(entry)
+            continue
         except OSError as e:
             log_debug(f"Orphan journal entry {entry.name} unreadable now ({e}); kept for the next lock holder")
             continue

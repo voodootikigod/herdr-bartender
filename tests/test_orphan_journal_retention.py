@@ -39,14 +39,14 @@ class JournalRetentionTests(SandboxTestCase):
         return set(json.loads(self.path.read_text())["sessions"]) if self.path.exists() else set()
 
     def unreadable(self, *names):
-        real = Path.read_text
+        real = orphans.read_regular_file
 
-        def read_text(path, *args, **kwargs):
-            if path.name in names:
+        def read(path, *args, **kwargs):
+            if Path(path).name in names:
                 raise OSError(5, "Input/output error")
             return real(path, *args, **kwargs)
 
-        return mock.patch.object(Path, "read_text", autospec=True, side_effect=read_text)
+        return mock.patch.object(orphans, "read_regular_file", side_effect=read)
 
     def test_unreadable_entry_survives_another_commit_and_is_applied_later(self):
         stuck = journal_entry(self.pending, "00000000000000000001-1-000000-aa.json", SID_A)

@@ -25,26 +25,53 @@ LOCK_RETRY_INTERVAL = 0.005
 _READ_FLAGS = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
 
 
-class OversizedFile(ValueError):
+# R65: per-file read bounds for every state file read on the plugin's paths.
+CACHE_MAX_BYTES = 16 * 1024 * 1024        # 256 sessions with their payloads fit with a wide margin
+ORPHAN_FILE_MAX_BYTES = 8 * 1024 * 1024   # at most 256 exported records
+JOURNAL_ENTRY_MAX_BYTES = 256 * 1024      # one orphan op (one record)
+SMALL_STATE_MAX_BYTES = 64 * 1024         # SHA allowlist, reconciler stamp, HOOK_NEEDS_REVIEW
+HOOK_SCRIPT_MAX_BYTES = 1024 * 1024       # vendor hook scripts are a few KiB
+
+
+class UnusableFile(OSError, ValueError):
+    """Not a usable state file (too large, or not a regular file); both an OSError and a ValueError, so every
+    existing ``except OSError`` / ``except ValueError`` handler treats it as unreadable / corrupt."""
+
+
+class OversizedFile(UnusableFile):
     """The file is larger than the caller's bound."""
+
+
+class NotRegularFile(UnusableFile):
+    """A FIFO, device, directory or symlink where a regular state file was expected."""
 
 
 class DirectoryFull(OSError):
     """The capped directory is at its ceiling (or its lock could not be taken in time)."""
 
 
-def read_regular_file(path: Path, max_bytes: int) -> bytes:
-    """At most ``max_bytes`` of a regular file; raises OSError (incl. not-regular / symlink) or OversizedFile."""
-    return read_regular_file_stat(path, max_bytes)[0]
+def read_regular_file(path: Path, max_bytes: int, follow_symlinks: bool = False) -> bytes:
+    """At most ``max_bytes`` of a regular file; raises OSError (incl. not-regular / symlink) or OversizedFile.
+
+    ``follow_symlinks`` is only for files outside the state dir that users may legitimately symlink (vendor hooks).
+    """
+    return read_regular_file_stat(path, max_bytes, follow_symlinks)[0]
 
 
-def read_regular_file_stat(path: Path, max_bytes: int) -> Tuple[bytes, os.stat_result]:
+def read_regular_file_stat(path: Path, max_bytes: int,
+                           follow_symlinks: bool = False) -> Tuple[bytes, os.stat_result]:
     """``read_regular_file`` plus the opened file's ``fstat`` (its identity, for compare-and-retire)."""
-    fd = os.open(str(path), _READ_FLAGS)
+    flags = _READ_FLAGS if not follow_symlinks else os.O_RDONLY | os.O_NONBLOCK
+    try:
+        fd = os.open(str(path), flags)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:   # O_NOFOLLOW refused a symlink
+            raise NotRegularFile(errno.ELOOP, "is a symlink", str(path)) from exc
+        raise
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            raise OSError(errno.EINVAL, "not a regular file", str(path))
+            raise NotRegularFile(errno.EINVAL, "not a regular file", str(path))
         chunks, remaining = [], max_bytes + 1
         while remaining > 0:
             chunk = os.read(fd, min(remaining, 65536))
@@ -56,8 +83,27 @@ def read_regular_file_stat(path: Path, max_bytes: int) -> Tuple[bytes, os.stat_r
         os.close(fd)
     data = b"".join(chunks)
     if len(data) > max_bytes:
-        raise OversizedFile(f"{path.name} is larger than {max_bytes} bytes")
+        raise OversizedFile(errno.EFBIG, f"larger than {max_bytes} bytes", str(path))
     return data, st
+
+
+def read_regular_prefix(path: Path, max_bytes: int) -> bytes:
+    """The first ``max_bytes`` of a regular file (never raises OversizedFile): salvage of an oversized cache."""
+    try:
+        return read_regular_file(path, max_bytes)
+    except OversizedFile:
+        fd = os.open(str(path), _READ_FLAGS)
+        try:
+            chunks, remaining = [], max_bytes
+            while remaining > 0:
+                chunk = os.read(fd, min(remaining, 65536))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
 
 
 def capped_lock_timeout() -> float:

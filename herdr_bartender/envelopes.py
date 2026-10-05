@@ -82,11 +82,16 @@ def write_json_capped(directory: Path, path: Path, obj: object, cap: int, lock_t
 
     Raises DirectoryFull (OSError) at the ceiling or when the lock is busy, ValueError when too large.
     """
-    size = len(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
-    if size > max_bytes:
-        raise ValueError(f"envelope too large ({size} bytes > {max_bytes})")
+    data = serialize_json(obj)   # R65: the size checked is exactly the size written
+    if len(data) > max_bytes:
+        raise ValueError(f"envelope too large ({len(data)} bytes > {max_bytes})")
     with capped_directory(directory, cap, lock_timeout):
-        write_json_atomic(path, obj)
+        write_bytes_atomic(path, data)
+
+
+def serialize_json(obj: object) -> bytes:
+    """The exact bytes every envelope writer persists (compact JSON, UTF-8)."""
+    return json.dumps(obj, separators=(",", ":")).encode("utf-8")
 
 
 def write_json_atomic(path: Path, obj: object) -> None:
@@ -94,12 +99,17 @@ def write_json_atomic(path: Path, obj: object) -> None:
 
     Raises OSError/TypeError/ValueError on failure, after unlinking the tmp file.
     """
+    write_bytes_atomic(path, serialize_json(obj))
+
+
+def write_bytes_atomic(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` via ``<path>.tmp`` + fsync + replace (0600); unlinks the tmp file on failure."""
     tmp = path.with_name(f"{path.name}.tmp")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "wb") as f:
             fd = -1
-            json.dump(obj, f)
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)

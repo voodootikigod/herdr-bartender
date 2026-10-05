@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 from typing import FrozenSet, List, Optional
 
+from .boundedio import CACHE_MAX_BYTES, OversizedFile, read_regular_file, read_regular_prefix
 from . import clock, jsonsafe, runtime, watchdog
 from .cache_schema import CorruptCache, new_cache, normalize_cache
 from .config import get_sanitized_hostname
@@ -279,9 +280,12 @@ class BoundedSessionCache:
     # -- load / save ------------------------------------------------------------
     def _load(self) -> dict:
         try:
-            raw = self.cache_file.read_bytes()
+            raw = read_regular_file(self.cache_file, CACHE_MAX_BYTES)
         except FileNotFoundError:
             return new_cache(get_sanitized_hostname())
+        except OversizedFile as e:   # R65: never parsed whole; quarantined and salvaged from its prefix
+            log_warning(f"Quarantining oversized cache: {e}")
+            return self._salvage(read_regular_prefix(self.cache_file, CACHE_MAX_BYTES))
         except OSError as e:
             raise CacheReadError(f"could not read {self.cache_file.name}: {e}") from e
         try:

@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
+from .boundedio import SMALL_STATE_MAX_BYTES, read_regular_file
 from . import clock, jsonsafe
 from .handoff import RECONCILER_LOCK_NAME, reconciler_running
 from .log import log_debug
@@ -81,7 +82,7 @@ def clear_stamp(state_dir: Optional[Path] = None) -> None:
     """Remove our own stamp (before releasing the lock); a newer holder's stamp is left alone."""
     path = _stamp_path(state_dir)
     try:
-        record = jsonsafe.loads(path.read_text(encoding="utf-8"))
+        record = jsonsafe.loads(read_regular_file(path, SMALL_STATE_MAX_BYTES))
         if isinstance(record, dict) and record.get("pid") == os.getpid():
             path.unlink()
     except (OSError, ValueError) as exc:
@@ -90,7 +91,7 @@ def clear_stamp(state_dir: Optional[Path] = None) -> None:
 
 def _stamp_problem(state_dir: Optional[Path]) -> Optional[str]:
     try:
-        record = jsonsafe.loads(_stamp_path(state_dir).read_text(encoding="utf-8"))
+        record = jsonsafe.loads(read_regular_file(_stamp_path(state_dir), SMALL_STATE_MAX_BYTES))
     except FileNotFoundError:
         return "it wrote no version stamp"
     except (OSError, ValueError):
