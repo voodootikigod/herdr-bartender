@@ -68,7 +68,10 @@ removable_state_dir() {
   [ -n "$dir" ] && [ -d "$dir" ] && [ ! -L "$dir" ] && [ "${dir##*/}" = "herdr-bartender" ] || return 1
   # R59: no symlink anywhere on the path - its physical spelling must equal the configured one, so `rm -rf`
   # can never be redirected through an intermediate symlinked directory.
-  [ "$(physical_dir "$dir")" = "$dir" ]
+  [ "$(physical_dir "$dir")" = "$dir" ] || return 1
+  # R72: an overridden (HERDR_PLUGIN_STATE_DIR) directory is removed only if the plugin created it - it then holds
+  # the ownership marker. A custom or shared directory that already existed is never claimed, so it is kept.
+  [ -z "${HERDR_PLUGIN_STATE_DIR:-}" ] || { [ -f "$dir/.herdr-bartender-owned" ] && [ ! -L "$dir/.herdr-bartender-owned" ]; }
 }
 
 if unsafe_state_dir "$STATE_DIR"; then

@@ -174,10 +174,10 @@ scripts/rollback.sh
 It runs these steps, in order (Plan §9.1):
 1. Touches `DISABLED`.
 2. Removes the plugin symlinks, both `~/.config/herdr/plugins/herdr-bartender` and `.../plugins/local/herdr-bartender`. If `herdr` is on PATH, it runs `herdr plugin unlink` and checks that `herdr plugin list` no longer shows the plugin.
-3. Waits up to 3s for event handlers that were already running when `DISABLED` appeared (each is bounded by the 1.5s event deadline; if one is still running, the state dir is kept), then kills this user's reconcilers.
+3. Waits up to 3s for event handlers that were already running when `DISABLED` appeared (each is bounded by the 1.5s event deadline). If one is still running, it stops there with exit 1 and keeps everything, so re-run it later (R68). Otherwise it kills this user's reconcilers.
 4. Runs `--cleanup`.
 5. Runs `--uninstall-hooks`. If the launcher is unusable, it falls back to a byte-exact strip.
-6. Deletes the state dir, but only if every step succeeded, and only if it is a real directory (not a symlink) named `herdr-bartender`. A `HERDR_PLUGIN_STATE_DIR` override that names anything else, such as `/tmp` or a shared directory, is kept, and the script exits 1 so you can check it and remove it by hand (R53).
+6. Deletes the state dir, but only if every step succeeded and the directory is the plugin's own: a real directory named `herdr-bartender`, with no symlink anywhere on its path (R53, R59). With a `HERDR_PLUGIN_STATE_DIR` override it must also be one the plugin created itself, which carries `.herdr-bartender-owned` (R72). Anything else, such as `/tmp` or a pre-existing shared directory, is kept, and the script exits 1 so you can check it and remove it by hand.
 
 It exits 0 when everything was removed. Otherwise it exits 1, keeps `DISABLED`, and prints the `--replay-orphans` command if an orphan file exists. Set `HERDR_BARTENDER_BIN` to use a different launcher. The script honours `HERDR_PLUGIN_STATE_DIR`, `XDG_STATE_HOME` and `HERDR_BARTENDER_VENDOR_HOOKS_DIR`.
 

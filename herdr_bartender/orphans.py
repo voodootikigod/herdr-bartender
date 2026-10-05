@@ -398,7 +398,8 @@ def orphan_work_waiting(orphan_path: Optional[Path] = None) -> bool:
     return orphan_path.exists() or _journal_waiting(orphan_path)
 
 
-def flush_pending_orphan_ops(orphan_file: Optional[Path] = None, blocking: bool = True) -> bool:
+def flush_pending_orphan_ops(orphan_file: Optional[Path] = None, blocking: bool = True,
+                             deadline: Optional[float] = None) -> bool:
     """Replay journaled orphan ops into the orphan file (the reconciler calls this each pass).
 
     True when the journal is empty afterwards; False when the lock was unavailable or I/O failed.
@@ -408,7 +409,7 @@ def flush_pending_orphan_ops(orphan_file: Optional[Path] = None, blocking: bool 
     if not _journal_waiting(orphan_path):
         return True
     try:
-        lock_fd = acquire_orphan_lock(orphan_path, blocking=blocking)
+        lock_fd = acquire_orphan_lock(orphan_path, blocking=blocking, deadline=deadline)
         if lock_fd is None:
             return False
         try:

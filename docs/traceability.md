@@ -190,3 +190,4 @@ Status at the W5 gate:
 | R69 | Cleanup budget covers lock waits; bounded hook rereads | `tests.test_gate_round21.*` (2 tests) |
 | R70 | Safe state writes; closed-pane vendor cleanup survives a Herdr outage | `tests.test_gate_round22.*` (4 tests) |
 | R71 | Total deadline per bridge exchange; atomic-swap hook repair | `tests.test_gate_round23.*` (2 tests) |
+| R72 | Ownership marker gates rollback of overridden state dirs; cleanup journal flushes inside the budget | `tests.test_gate_round24.*` (4 tests) |

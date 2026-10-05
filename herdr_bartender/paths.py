@@ -10,6 +10,7 @@ ORPHAN_FILE_NAME = ".herdr-bartender-orphans.json"
 PRIVATE_UMASK = 0o077
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+OWNERSHIP_MARKER = ".herdr-bartender-owned"   # R72: written only into a state dir this plugin created
 
 
 def apply_private_umask() -> int:
@@ -49,7 +50,23 @@ def get_state_dir() -> Path:
             p = Path(xdg_state) / "herdr" / "plugins" / "herdr-bartender"
         else:
             p = Path.home() / ".local" / "state" / "herdr" / "plugins" / "herdr-bartender"
-    return ensure_private_dir(p)
+    existed = os.path.lexists(p)
+    ensure_private_dir(p)
+    if not existed:
+        _mark_owned(p)
+    return p
+
+
+def _mark_owned(state_dir: Path) -> None:
+    """R72: record that this plugin created ``state_dir`` (rollback removes an overridden dir only if marked).
+
+    A directory that already existed (a custom or shared HERDR_PLUGIN_STATE_DIR) is never claimed.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        os.close(os.open(str(state_dir / OWNERSHIP_MARKER), flags, PRIVATE_FILE_MODE))
+    except OSError:
+        pass   # already marked, or not writable: the rollback then keeps the directory (the safe side)
 
 
 def get_orphan_path() -> Path:

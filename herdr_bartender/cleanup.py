@@ -200,13 +200,18 @@ def _leftovers(cache_mgr: BoundedSessionCache, progress: _Progress) -> _Leftover
         return _sort_leftovers(peek_cache(cache_mgr.state_dir).get("sessions") or {}, progress, None)
 
 
+def _orphan_wait(deadline: float) -> float:
+    """R72: an orphan-lock wait never outlasts the cleanup budget (0: a single non-blocking try)."""
+    return max(0.0, min(ORPHAN_BLOCKING_DEADLINE_SECONDS, deadline - clock.monotonic()))
+
+
 def _export(leftovers: Tuple[Tuple[str, dict], ...], deadline: float) -> None:
     for sid, record in leftovers:
         # R10/R69: block on the orphan lock only while the budget lasts; past it, a contended export is journaled
         # (durable) for the next lock holder instead of waiting.
         blocking = deadline - clock.monotonic() > ORPHAN_BLOCKING_DEADLINE_SECONDS
         export_orphan_record(sid, record, blocking=blocking)
-    if not flush_pending_orphan_ops(blocking=True):
+    if not flush_pending_orphan_ops(blocking=True, deadline=_orphan_wait(deadline)):
         log_warning("Orphan journal not fully flushed by --cleanup; the next lock holder folds it in")
 
 
@@ -243,7 +248,7 @@ def _cleanup(bridge_url: Optional[str]) -> int:
     state_dir = get_state_dir()
     # R69: one budget for the whole run (sized lock-free), covering the journal flush, staging and every lock wait.
     deadline = clock.monotonic() + cleanup_budget(len(peek_cache(state_dir).get("sessions") or {}))
-    flush_pending_orphan_ops(blocking=True)
+    flush_pending_orphan_ops(blocking=True, deadline=_orphan_wait(deadline))
     # DISABLED is never consulted: --cleanup runs after the rollback set it (Plan §5.2).
     cache_mgr = _DeadlineCache(state_dir, deadline)
     try:

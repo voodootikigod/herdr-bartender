@@ -57,6 +57,7 @@ class DisabledFlagEventPathTests(SandboxTestCase):
             shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         (self.state_dir / "DISABLED").touch()
+        self.state_before = _tree(self.state_dir)   # DISABLED (+ the R72 ownership marker the sandbox created)
         self.home_before = _tree(self.home)
         self.xdg_before = _tree(self.xdg_state)
 
@@ -69,8 +70,9 @@ class DisabledFlagEventPathTests(SandboxTestCase):
 
     def _assert_no_side_effects(self, res, elapsed):
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertEqual(_tree(self.state_dir), ["DISABLED"],
+        self.assertEqual(_tree(self.state_dir), self.state_before,
                          "a DISABLED event run must not create a lock, heartbeat, log, spool or marker")
+        self.assertIn("DISABLED", self.state_before)
         self.assertEqual(_tree(self.home), self.home_before)
         self.assertEqual(_tree(self.xdg_state), self.xdg_before)
         self.assertEqual(self.bridge.requests, [])
