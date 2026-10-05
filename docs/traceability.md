@@ -182,3 +182,4 @@ Status at the W5 gate:
 | R61 | Current guard over modified/unlisted vendor code needs review | `tests.test_hooks_integrity.CheckHookIntegrityTests.test_current_guard_over_modified_vendor_code_needs_review`, `...test_current_guard_without_allowlist_entry_needs_review` |
 | R62 | Spool hard ceiling and per-envelope size bound | `tests.test_gate_round15.SpoolHardCapTests.*` (2 tests) |
 | R63 | Bounded `.vendor_active` read | `tests.test_gate_round15.VendorReadBoundTests.*` (2 tests) |
+| R64 | Strict capped spool/results directories; non-blocking bounded reads | `tests.test_gate_round16.*` (5 tests: concurrent writers stop at the cap, FIFO envelope, results cap, FIFO and symlinked `.vendor_active`) |

@@ -244,7 +244,7 @@ class WatchdogDuringDeferralTests(SandboxTestCase):
         write finish (no lost close, no stray tmp file)."""
         hold_lock(self, self.cache_mgr.lock_file)
         real = envelopes.write_json_atomic
-        with mock.patch("herdr_bartender.spool.write_json_atomic",
+        with mock.patch("herdr_bartender.envelopes.write_json_atomic",
                         side_effect=lambda path, obj: self._alarm_then(real, path, obj)):
             self._run_expecting_deadline_exit(handle_pane_closed, {"pane_id": "w1:pCont"}, {}, self.mock_url, 222)
         self.assertEqual([e["event_name"] for e in self._spooled()], ["pane.closed"])

@@ -15,7 +15,10 @@ from typing import List, Optional
 from . import jsonsafe
 from .intake import EVENT_NAMES, PANE_CLOSED, TAB_CLOSED, WORKSPACE_CLOSED, is_agent_exit_signal
 from .log import log_debug
+from .boundedio import capped_directory, read_regular_file
 from .paths import PRIVATE_FILE_MODE, ensure_private_dir
+
+MAX_ENVELOPE_BYTES = 256 * 1024   # R62/R64: spool and results envelopes are refused / unread past this
 
 CLOSE_EVENTS = frozenset({PANE_CLOSED, TAB_CLOSED, WORKSPACE_CLOSED})
 BAD_DIR_CAP = 20          # Plan §4.3 L396: spool/bad holds at most 20 files
@@ -68,10 +71,22 @@ def is_close_envelope(env: object) -> bool:
     return data.get("state") == "Ended" or is_agent_exit_signal(data)
 
 
-def read_json(path: Path) -> object:
-    """Decode a JSON file; raises OSError or ValueError."""
-    with open(path, "rb") as f:
-        return jsonsafe.loads(f.read())
+def read_json(path: Path, max_bytes: int = MAX_ENVELOPE_BYTES) -> object:
+    """Decode a bounded regular JSON file (R64); raises OSError or ValueError (incl. OversizedFile)."""
+    return jsonsafe.loads(read_regular_file(path, max_bytes))
+
+
+def write_json_capped(directory: Path, path: Path, obj: object, cap: int, lock_timeout: float,
+                      max_bytes: int = MAX_ENVELOPE_BYTES) -> None:
+    """R62/R64: ``write_json_atomic`` under the directory lock, refused at ``cap`` files or past ``max_bytes``.
+
+    Raises DirectoryFull (OSError) at the ceiling or when the lock is busy, ValueError when too large.
+    """
+    size = len(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+    if size > max_bytes:
+        raise ValueError(f"envelope too large ({size} bytes > {max_bytes})")
+    with capped_directory(directory, cap, lock_timeout):
+        write_json_atomic(path, obj)
 
 
 def write_json_atomic(path: Path, obj: object) -> None:

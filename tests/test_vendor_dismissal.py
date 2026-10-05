@@ -149,14 +149,7 @@ class PaneCloseVendorTests(VendorCase):
         """Gate finding (review round 11): a ``.vendor_active`` that could not be read was retired with no rewrite
         check, so a valid UUID record the guard wrote after the failed read was deleted undismissed."""
         self._write_uuid()
-        real_open = open
-
-        def flaky_open(path, *args, **kwargs):
-            if str(path) == str(self.vendor_file):
-                raise PermissionError(13, "Permission denied")
-            return real_open(path, *args, **kwargs)
-
-        with mock.patch("builtins.open", side_effect=flaky_open):
+        with mock.patch.object(vendor, "read_regular_file_stat", side_effect=PermissionError(13, "Permission denied")):
             record = vendor.read_vendor_file(self.vendor_file)
         self.assertIsNone(record.content, "control: the read failed")
         self._write_uuid("vendor-session-uuid-0002")   # the guard rewrites it meanwhile

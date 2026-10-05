@@ -30,13 +30,15 @@ from .delivery_state import (
     journal_owed_exports,
     run_orphan_effects,
 )
-from .envelopes import quarantine, read_json, unlink_files, write_json_atomic
+from .boundedio import capped_lock_timeout
+from .envelopes import quarantine, read_json, unlink_files, write_json_capped
 from .log import log_debug, log_warning
 from .paths import ensure_private_dir, get_state_dir
 from .handoff import ensure_reconciler_running, touch_reconciler_pending
 
 RESULTS_VERSION = 1
 RESULTS_BATCH = 32
+RESULTS_HARD_CAP = 1000   # R64: a strict ceiling; past it Step C outcomes are lost (the reconciler re-sends)
 
 
 class ResultWriteError(Exception):
@@ -88,7 +90,8 @@ def write_result_envelope(tx: Transmission, outcome: Outcome, state_dir: Optiona
         directory = results_dir(state_dir)
         pid = os.getpid()
         path, stamp = _unique_path(directory, clock.time_ns(), pid, tx.seq)
-        write_json_atomic(path, build_result_envelope(tx, outcome, stamp, pid))
+        write_json_capped(directory, path, build_result_envelope(tx, outcome, stamp, pid), RESULTS_HARD_CAP,
+                          capped_lock_timeout())
         return path
     except (OSError, TypeError, ValueError) as e:
         raise ResultWriteError(f"could not write result for {tx.session_id} seq {tx.seq}: {e}") from e

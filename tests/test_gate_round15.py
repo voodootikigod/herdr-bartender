@@ -2,7 +2,7 @@
 
 import unittest
 
-from herdr_bartender import spool, vendor
+from herdr_bartender import envelopes, spool, vendor
 from herdr_bartender.spool import SpoolWriteError, enqueue_spool
 from herdr_bartender.vendor import read_vendor_file
 from tests.support import SandboxTestCase
@@ -24,7 +24,7 @@ class SpoolHardCapTests(SandboxTestCase):
         self.assertEqual(len(files), spool.SPOOL_HARD_CAP, "existing close envelopes are kept, none pruned")
 
     def test_oversized_envelope_is_refused(self):
-        huge = {**close_event(1), "title": "x" * (spool.MAX_ENVELOPE_BYTES + 1)}
+        huge = {**close_event(1), "title": "x" * (envelopes.MAX_ENVELOPE_BYTES + 1)}
         with self.assertRaises(SpoolWriteError):
             enqueue_spool("pane.agent_status_changed", huge, {})
         self.assertEqual(list((self.state_dir / "spool").glob("*.json")), [])

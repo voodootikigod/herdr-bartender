@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest import mock
 
-from herdr_bartender import results, runtime
+from herdr_bartender import envelopes, results, runtime
 from herdr_bartender.cache import CacheWriteError
 from herdr_bartender.delivery_state import Outcome, Transmission
 from herdr_bartender.envelopes import read_json
@@ -99,7 +99,7 @@ class ResultsTests(SandboxTestCase):
 
     def test_defer_result_write_failure_still_hands_off(self):
         """Plan §4.3 L483: even when the envelope cannot be written the reconciler is flagged and started."""
-        with mock.patch.object(results, "write_json_atomic", side_effect=OSError(28, "ENOSPC")), \
+        with mock.patch.object(envelopes, "write_json_atomic", side_effect=OSError(28, "ENOSPC")), \
                 mock.patch.object(results, "ensure_reconciler_running") as spawn:
             self.assertIsNone(results.defer_result(self._tx(), Outcome("success"), "lock contended"))
         self.assertTrue((self.state_dir / "reconciler.pending").exists())

@@ -42,6 +42,7 @@ from .cache import BoundedSessionCache, CacheError, IntegrationDisabled
 from .cache_schema import DISMISSED_VENDOR_CAP
 from .config import VENDOR_UUID_REGEX
 from .delivery_state import clear_pending_vendor_cleanup
+from .boundedio import OversizedFile, read_regular_file_stat
 from .log import log_debug, log_warning
 from .paths import get_state_dir
 from .process import is_herdr_alive, memoised_herdr_alive
@@ -92,20 +93,19 @@ def vendor_active_path(pane_id: str) -> Path:
 
 
 def read_vendor_file(path: Path) -> Optional[VendorFile]:
-    """The file, the bytes read now and their identity; None when it does not exist."""
+    """The file, the bytes read now and their identity; None when it does not exist.
+
+    R63/R64: read non-blocking without following symlinks, regular files only, at most 4 KiB - anything else is
+    unreadable (a bare touch that is never retired), so a planted FIFO or huge file cannot stall the lock holder.
+    """
     try:
-        with open(path, "rb") as handle:
-            stat = os.fstat(handle.fileno())
-            content = handle.read(VENDOR_FILE_MAX_BYTES + 1)
+        content, st = read_regular_file_stat(path, VENDOR_FILE_MAX_BYTES)
     except FileNotFoundError:
         return None
-    except OSError as exc:
-        log_debug(f"Unreadable {path.name} ({exc}); treating it as a bare touch, but never retiring it")
+    except (OSError, OversizedFile) as exc:
+        log_warning(f"Unusable {path.name} ({exc}); treating it as a bare touch, but never retiring it")
         return VendorFile(path, None)
-    if len(content) > VENDOR_FILE_MAX_BYTES:
-        log_warning(f"Oversized {path.name} (> {VENDOR_FILE_MAX_BYTES} bytes); treating it as unreadable")
-        return VendorFile(path, None)
-    return VendorFile(path, content, (stat.st_ino, stat.st_mtime_ns))
+    return VendorFile(path, content, (st.st_ino, st.st_mtime_ns))
 
 
 def parse_vendor_uuid(record: VendorFile) -> Optional[str]:
