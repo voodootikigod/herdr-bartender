@@ -2,7 +2,7 @@
 
 * ``defer_event()``: the event path could not take (or save) the cache lock. It
   writes an R6 envelope to ``spool/<enqueued_ns:020d>_<pid>_<monotonic_ns>.json``
-  (atomic rename; at most 100 files, close envelopes never pruned), flags the
+  (atomic rename; at most 100 files, close envelopes never pruned; R62: new envelopes refused past 500 files or 256 KiB), flags the
   reconciler and returns, so the caller exits 0 without touching the cache.
 * ``replay_spool_locked(data)``: Step A, while the caller holds the cache lock.
   Up to 16 envelopes in filename (FIFO) order are staged into ``data`` with the
@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time  # real monotonic_ns keeps spool filenames unique under a fake clock
 from dataclasses import dataclass
@@ -40,6 +41,8 @@ from .markers import remove_pane_marker
 from .staging import stage_container_close, stage_pane_close_result, stage_status
 
 SPOOL_CAP = 100
+SPOOL_HARD_CAP = 500           # R62: close envelopes are never pruned, so new ones stop here instead
+MAX_ENVELOPE_BYTES = 256 * 1024  # R62: per-envelope size bound
 REPLAY_BATCH = 16
 WORKSPACE_ENV = "HERDR_WORKSPACE_ID"
 
@@ -99,15 +102,26 @@ def _make_room(directory: Path) -> None:
         excess -= 1
 
 
+def _require_room(directory: Path) -> None:
+    """R62: past the hard ceiling (only unprunable close envelopes left) a new envelope is refused, not written."""
+    count = sum(1 for p in directory.glob("*.json") if p.is_file())
+    if count >= SPOOL_HARD_CAP:
+        raise SpoolWriteError(f"spool full ({count} envelopes awaiting replay)")
+
+
 def enqueue_spool(event_name: str, event_data: dict, context: dict, arrival_ns: Optional[int] = None,
                   state_dir: Optional[Path] = None) -> Path:
     """Write one R6 envelope atomically; raises SpoolWriteError."""
     try:
         directory = spool_dir(state_dir)
         _make_room(directory)
+        _require_room(directory)
         enqueued_ns = clock.time_ns()
         env = build_envelope(event_name, _with_env_workspace(event_data if isinstance(event_data, dict) else {}),
                              context, arrival_ns or enqueued_ns, enqueued_ns)
+        size = len(json.dumps(env, separators=(",", ":")).encode("utf-8"))
+        if size > MAX_ENVELOPE_BYTES:
+            raise SpoolWriteError(f"envelope too large ({size} bytes > {MAX_ENVELOPE_BYTES})")
         path = directory / f"{enqueued_ns:020d}_{os.getpid()}_{time.monotonic_ns()}.json"
         write_json_atomic(path, env)
         return path

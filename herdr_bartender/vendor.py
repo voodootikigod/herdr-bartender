@@ -48,6 +48,7 @@ from .process import is_herdr_alive, memoised_herdr_alive
 from .sanitize import get_hex_pane_id
 
 VENDOR_ACTIVE_SUFFIX = ".vendor_active"
+VENDOR_FILE_MAX_BYTES = 4096   # R63: a real record is ~100 bytes; larger is unusable and never read whole
 CLAIM_INFIX = ".claim-"              # <hex>.vendor_active.claim-<pid>-<ns>: being retired (leftovers swept)
 DISMISSAL_AGENT = "Herdr"            # R19
 DISMISSAL_MAX_ATTEMPTS = 5           # R11: sends at t=0, 2, 4, 6, 8
@@ -95,12 +96,16 @@ def read_vendor_file(path: Path) -> Optional[VendorFile]:
     try:
         with open(path, "rb") as handle:
             stat = os.fstat(handle.fileno())
-            return VendorFile(path, handle.read(), (stat.st_ino, stat.st_mtime_ns))
+            content = handle.read(VENDOR_FILE_MAX_BYTES + 1)
     except FileNotFoundError:
         return None
     except OSError as exc:
         log_debug(f"Unreadable {path.name} ({exc}); treating it as a bare touch, but never retiring it")
         return VendorFile(path, None)
+    if len(content) > VENDOR_FILE_MAX_BYTES:
+        log_warning(f"Oversized {path.name} (> {VENDOR_FILE_MAX_BYTES} bytes); treating it as unreadable")
+        return VendorFile(path, None)
+    return VendorFile(path, content, (stat.st_ino, stat.st_mtime_ns))
 
 
 def parse_vendor_uuid(record: VendorFile) -> Optional[str]:

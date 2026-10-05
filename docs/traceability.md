@@ -180,3 +180,5 @@ Status at the W5 gate:
 | R59 | Rollback refuses a state dir reached through a symlinked parent | `tests.test_gate_round13.RollbackIntermediateSymlinkTests.test_symlinked_parent_is_never_removed` |
 | R60 | `.failed` write failure still removes the healthy marker | `tests.test_gate_round13.FailedFlagFailOpenTests.test_unwritable_failed_flag_still_removes_the_healthy_marker` |
 | R61 | Current guard over modified/unlisted vendor code needs review | `tests.test_hooks_integrity.CheckHookIntegrityTests.test_current_guard_over_modified_vendor_code_needs_review`, `...test_current_guard_without_allowlist_entry_needs_review` |
+| R62 | Spool hard ceiling and per-envelope size bound | `tests.test_gate_round15.SpoolHardCapTests.*` (2 tests) |
+| R63 | Bounded `.vendor_active` read | `tests.test_gate_round15.VendorReadBoundTests.*` (2 tests) |
