@@ -73,11 +73,48 @@ def atomic_replace_hook(hook: Path, new_content: bytes, mode: int, expected: byt
         _unlink_quietly(tmp_path)
 
 
+def _claim_and_link(tmp_path: Path, hook: Path, expected: bytes) -> None:
+    """R86: without an atomic exchange, never overwrite: claim the current hook by rename (whatever is there at
+    that instant), verify it is the content checked, then hard-link the new hook into place - ``link`` fails if a
+    vendor update appeared at the path meanwhile, and that update is kept. The hook path is briefly absent."""
+    claim = hook.with_name(f".{hook.name}.claim.{os.getpid()}")
+    os.rename(hook, claim)
+    try:
+        claimed = read_regular_file(claim, HOOK_SCRIPT_MAX_BYTES, follow_symlinks=True)
+    except OSError:
+        claimed = None
+    if claimed != expected:
+        _put_back(claim, hook)
+        raise HookWriteError(f"Aborting patch for {hook.name}: vendor updated it during the patch; kept theirs")
+    try:
+        os.link(tmp_path, hook)
+    except FileExistsError:
+        _unlink_quietly(claim)   # a vendor update landed at the path while it was claimed: theirs wins
+        raise HookWriteError(f"Aborting patch for {hook.name}: vendor updated it during the patch; kept theirs")
+    except OSError:
+        _put_back(claim, hook)
+        raise
+    _unlink_quietly(claim)
+
+
+def _put_back(claim: Path, hook: Path) -> None:
+    """Restore a claimed hook unless something newer already occupies the path (then the claim is dropped)."""
+    try:
+        try:
+            os.link(claim, hook, follow_symlinks=False)   # a claimed symlink goes back as itself
+        except NotImplementedError:
+            os.link(claim, hook)
+    except FileExistsError:
+        pass
+    finally:
+        _unlink_quietly(claim)
+
+
 def _swap_in(tmp_path: Path, hook: Path, expected: bytes) -> None:
     """R71: atomically swap the new hook in, then check what was displaced; a vendor update that landed after
     the check is swapped back (theirs wins). Without an atomic exchange, fall back to ``os.replace``."""
     if not exchange(tmp_path, hook):
-        os.replace(tmp_path, hook)   # no exchange on this platform/filesystem: compare-then-replace
+        _claim_and_link(tmp_path, hook, expected)   # R86: no exchange here - never an unconditional overwrite
         return
     try:
         displaced = read_regular_file(tmp_path, HOOK_SCRIPT_MAX_BYTES, follow_symlinks=True)
