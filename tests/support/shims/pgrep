@@ -2,8 +2,15 @@
 # Test shim for pgrep. Matches ONLY the fake processes listed in
 # $HB_TEST_SANDBOX/procs.list (lines: pid|name|lstart|comm|cmdline); it never
 # inspects real processes, so tests can never see (or act on) a real herdr.
-# Supports -x (exact), -i (case-insensitive), -f (match full command line).
-exact=0; icase=0; full=0; pattern=""
+# Supports -x (exact), -i (case-insensitive), -f (match full command line) and -a.
+#
+# Ancestry follows macOS (BSD) pgrep: the calling process and ALL of its ancestors are
+# excluded from the match list unless -a is given. PIDs listed in
+# $HB_TEST_SANDBOX/ancestors.list stand for the caller's ancestors (Herdr is the
+# ancestor of every vendor hook and plugin process it spawns). With
+# $HB_TEST_SANDBOX/pgrep.procps present the shim answers like Linux procps instead:
+# nothing is excluded, and -a (--list-full) prints "<pid> <full command line>".
+exact=0; icase=0; full=0; ancestors=0; pattern=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --) shift; pattern="${1:-}"; break ;;
@@ -15,6 +22,7 @@ while [ $# -gt 0 ]; do
           x) exact=1 ;;
           i) icase=1 ;;
           f) full=1 ;;
+          a) ancestors=1 ;;
         esac
         i=$((i + 1))
       done
@@ -34,9 +42,17 @@ fi
 
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
+procps=0
+[ -f "${HB_TEST_SANDBOX}/pgrep.procps" ] && procps=1
+ancestry="${HB_TEST_SANDBOX}/ancestors.list"
+is_ancestor() { [ -f "$ancestry" ] && grep -qx -- "$1" "$ancestry"; }
+
 status=1
 while IFS='|' read -r pid name lstart comm cmdline; do
   [ -z "$pid" ] && continue
+  if [ "$procps" -eq 0 ] && [ "$ancestors" -eq 0 ] && is_ancestor "$pid"; then
+    continue   # BSD pgrep: an ancestor of the caller is never matched without -a
+  fi
   if [ "$full" -eq 1 ]; then
     subject="${cmdline:-$name}"
   else
@@ -52,7 +68,11 @@ while IFS='|' read -r pid name lstart comm cmdline; do
   else
     printf '%s' "$subject" | grep -Eq -- "$pat" || continue
   fi
-  echo "$pid"
+  if [ "$procps" -eq 1 ] && [ "$ancestors" -eq 1 ]; then
+    echo "$pid ${cmdline:-$name}"
+  else
+    echo "$pid"
+  fi
   status=0
 done < "$procs"
 exit "$status"

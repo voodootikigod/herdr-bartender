@@ -56,6 +56,7 @@ from .markers import clear_delivery_down, is_delivery_down, is_disabled, refresh
 from .orphans import flush_pending_orphan_ops, journal_waiting
 from .paths import get_orphan_path, get_state_dir
 from .reconciler import evict_exported_sessions, reconcile_active_sessions
+from .reconciler_stamp import clear_stamp, code_version, write_stamp
 from .replay import auto_replay_due, run_replay_orphans
 from .results import drain_results_dir
 from .schedule import (
@@ -277,9 +278,33 @@ def _work_waiting(state_dir: Path, outcome: PassOutcome, stuck: Envelopes = froz
                 or _orphan_work(outcome) or (state_dir / PENDING_FILE_NAME).exists())
 
 
+def _bridge_settled(outcome: PassOutcome) -> bool:
+    """A healthy bridge, or (R40) Bartender confirmed not running: with nothing cached, owed or queued there is
+    nothing to deliver or re-sync when it starts, and any new event starts a reconciler again."""
+    return outcome.bridge_healthy is True or outcome.snapshot.bartender.absent
+
+
 def _idle_now(state_dir: Path, outcome: PassOutcome, stuck: Envelopes = frozenset()) -> bool:
-    """Plan §5.1 item 11: 0 sessions, nothing owed or queued, and a healthy bridge."""
-    return outcome.bridge_healthy is True and not is_delivery_down() and not _work_waiting(state_dir, outcome, stuck)
+    """Plan §5.1 item 11 (R40): 0 sessions, nothing owed or queued, and a healthy (or absent) bridge."""
+    return _bridge_settled(outcome) and not is_delivery_down() and not _work_waiting(state_dir, outcome, stuck)
+
+
+def _cache_has_work(cache_mgr: BoundedSessionCache) -> bool:
+    """A session or owed side effect in the cache right now (re-read: the pass's view may be stale).
+
+    An event that admits and delivers a session needs no hand-off (its ``ensure_watchdog()`` only probes
+    ``reconciler.lock``), so a reconciler that is idling out must look at the cache itself. An unreadable
+    cache counts as work: a needless successor idles out again, a stranded session would lose its heartbeat.
+    """
+    try:
+        with cache_mgr as data:
+            view = cache_view(data, clock.time(), True)
+    except IntegrationDisabled:
+        return False
+    except CacheError as exc:
+        log_warning(f"Idle-exit cache check failed ({exc}); assuming work is waiting")
+        return True
+    return bool(view.sessions or view.owed)
 
 
 @dataclass(frozen=True)
@@ -359,8 +384,11 @@ def _one_iteration(state_dir: Path, cache_mgr: BoundedSessionCache, bridge_url: 
         _export_undelivered(cache_mgr)
         return "stop"
     if idle_expired(run.state, now):
-        log_debug("Idle for 60s with no sessions and a healthy bridge; reconciler exiting")
-        return "idle"
+        if not _cache_has_work(cache_mgr):
+            log_debug("Idle for 60s with no sessions and a healthy bridge; reconciler exiting")
+            return "idle"
+        log_debug("A session was admitted after this pass read the cache; not idle")
+        run.state = track_idle(run.state, False, now)
     run.reruns = _pause(state_dir, run.state, run.stuck, run.reruns)
     return None
 
@@ -378,16 +406,25 @@ def _run_loop(state_dir: Path, bridge_url: Optional[str], loop_once: bool) -> bo
     return False
 
 
-def _start_successor_if_flagged(pending_file: Path) -> None:
+def _start_successor_if_needed(state_dir: Path) -> None:
     """Lost wake-up guard for an idle exit, called once ``reconciler.lock`` is released.
 
-    An event that flagged ``reconciler.pending`` after the loop's final check (while the
-    lock was still held) found the singleton busy and spawned nothing; hand its work to a
-    successor now instead of stranding it until the next event.
+    An event that ran after the loop's final check (while the lock was still held) found the
+    singleton busy and spawned nothing: one that flagged ``reconciler.pending``, and one that
+    admitted and delivered a session (its ``ensure_watchdog()`` only probes the lock). Hand
+    that work to a successor now instead of stranding it until the next event. Re-reading the
+    cache AFTER the release closes the window: an event whose lock probe came before the
+    release saved its session before that probe.
     """
-    if pending_file.exists() and not is_disabled():
+    if is_disabled():
+        return
+    if (state_dir / PENDING_FILE_NAME).exists():
         log_debug("reconciler.pending was set while the reconciler exited; starting a successor")
-        ensure_reconciler_running()
+    elif _cache_has_work(BACKGROUND_POLICY.cache(state_dir)):
+        log_debug("A session was admitted while the reconciler exited; starting a successor")
+    else:
+        return
+    ensure_reconciler_running()
 
 
 def _acquire_singleton(state_dir: Path) -> Optional[int]:
@@ -419,18 +456,22 @@ def run_reconcile_background(bridge_url: Optional[str] = None, loop_once: bool =
     if is_disabled():
         return
     state_dir = get_state_dir()
+    code_version()   # R38: digest the code this process loaded before an upgrade can change it on disk
     lock_fd = _acquire_singleton(state_dir)
     if lock_fd is None:
         return
     idle_exit = False
     try:
         with runtime.deadline_mode(runtime.DEADLINE_UNBOUNDED), reconciler_loop():
+            write_stamp(state_dir)   # R38: who holds reconciler.lock (an upgrade can leave an older holder)
             idle_exit = _run_loop(state_dir, bridge_url, loop_once)
     except Exception as exc:  # recorded for the operator; reconciler.pending keeps the work for the next spawn
         log_warning(f"Reconciler crashed: {exc!r}\n{traceback.format_exc()}")
         touch_reconciler_pending(state_dir)
         raise
     finally:
+        clear_stamp(state_dir)
         _release_singleton(lock_fd)
     if idle_exit:
-        _start_successor_if_flagged(state_dir / PENDING_FILE_NAME)
+        with runtime.deadline_mode(runtime.DEADLINE_UNBOUNDED):
+            _start_successor_if_needed(state_dir)

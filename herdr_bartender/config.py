@@ -14,7 +14,7 @@ DEFAULT_PORT = 7823
 PORT_ENV = "NOTCHBAR_AGENTS_PORT"
 MIN_PORT = 1024
 MAX_PORT = 65535
-_PORT_REGEX = re.compile(r'^[0-9]{1,5}$')
+_PORT_REGEX = re.compile(r'^[0-9]{1,5}\Z')
 
 AGENT_NAME_OVERRIDES = {
     "claude": "Claude",
@@ -34,11 +34,11 @@ STATUS_MAP = {
     "idle": "Idle",         # Idle at prompt
 }
 
-PANE_ID_REGEX = re.compile(r'^[a-zA-Z0-9_:-]{1,48}$')
-CONTAINER_ID_REGEX = re.compile(r'^[a-zA-Z0-9_:-]{1,48}$')
-SESSION_ID_REGEX = re.compile(r'^herdr:[a-zA-Z0-9_-]{1,32}:[a-zA-Z0-9_:-]{1,48}$')
+PANE_ID_REGEX = re.compile(r'^[a-zA-Z0-9_:-]{1,48}\Z')
+CONTAINER_ID_REGEX = re.compile(r'^[a-zA-Z0-9_:-]{1,48}\Z')
+SESSION_ID_REGEX = re.compile(r'^herdr:[a-zA-Z0-9_-]{1,32}:[a-zA-Z0-9_:-]{1,48}\Z')
 # Plan §1 L38: the hook guard records only vendor session UUIDs matching this pattern.
-VENDOR_UUID_REGEX = re.compile(r'^[a-zA-Z0-9_-]{16,64}$')
+VENDOR_UUID_REGEX = re.compile(r'^[a-zA-Z0-9_-]{16,64}\Z')
 
 
 HOST_MAX_LEN = 32

@@ -6,7 +6,7 @@ import time
 import unittest
 from unittest import mock
 
-from herdr_bartender import cache, envelopes, orphans, runtime, spool, watchdog
+from herdr_bartender import cache, envelopes, handoff, orphans, runtime, spool, watchdog
 from herdr_bartender.bridge import DeliveryResult
 from herdr_bartender.cache import CacheWriteError
 from herdr_bartender.handlers import (
@@ -61,6 +61,19 @@ class ContentionTests(SandboxTestCase):
         self.assertFalse(self.cache_mgr.cache_file.exists(), "nothing may be written without the lock")
         self.assertEqual(self.bridge.requests, [])
         self.assertTrue((self.state_dir / "reconciler.pending").exists())
+        # Round-2 finding (tests): defer_event is the only hand-off on this path (run_event returns before
+        # finish()/policy.hand_off()); with no reconciler running every spooled event must start one.
+        self.assertEqual(self.spawner.calls, [handoff.loop_argv()] * len(cases),
+                         "each deferred event ensures a reconciler is running")
+
+    def test_step_a_contention_does_not_spawn_over_a_running_reconciler(self):
+        """The singleton rule on the contention path: a live reconciler (lock held) is flagged, never doubled."""
+        hold_lock(self, self.state_dir / handoff.RECONCILER_LOCK_NAME)
+        hold_lock(self, self.cache_mgr.lock_file)
+        handle_pane_closed({"pane_id": "w1:pCont"}, {}, bridge_url=self.mock_url, arrival_ns=222)
+        self.assertEqual(len(self._spooled()), 1)
+        self.assertTrue((self.state_dir / "reconciler.pending").exists())
+        self.assertEqual(self.spawner.calls, [])
 
     def test_cli_contention_exits_zero_and_spools(self):
         """Plan §4.3 L391 at process level: bin/herdr-bartender under contention exits 0 within the budget."""
@@ -74,6 +87,9 @@ class ContentionTests(SandboxTestCase):
         self.assertEqual((spooled["event_name"], spooled["event_data"]["pane_id"]), (STATUS, "w1:pCont"))
         self.assertFalse(self.cache_mgr.cache_file.exists())
         self.assertEqual(self.bridge.requests, [])
+        self.assertTrue((self.state_dir / "reconciler.pending").exists())
+        self.assertEqual(self.subprocess_spawns(), [handoff.loop_argv()],
+                         "the spooled event's process must start the reconciler")
 
     def test_read_only_cli_commands_report_contention(self):
         """Gap lock-best-effort: --status/--sessions never read the cache unlocked; under contention they fail
@@ -290,6 +306,10 @@ class WatchdogDuringDeferralTests(SandboxTestCase):
         self.assertEqual((result["transmitting_state"], result["status"]), ("Working", "success"))
 
 
+class _Crash(BaseException):
+    """Simulated process death (not an Exception: no handler on the path may swallow it)."""
+
+
 class WatchdogAfterStepCTests(SandboxTestCase):
     """Plan §4.3 Persisted Side Effects Guarantee under R23: a deadline that passes while Step C (or the compensation
     re-verify) holds the lock must not drop the orphan export or the owed compensating Ended."""
@@ -358,6 +378,55 @@ class WatchdogAfterStepCTests(SandboxTestCase):
         with self.cache_mgr as data:
             self.assertIs(data["sessions"][sid]["orphaned_ended"], True)
         self.assertTrue(self._orphaned(sid), "orphaned_ended was saved but never exported")
+
+    def _crash_after_orphaning_save(self):
+        """The process dies right after the save that first persists an ``orphaned_ended`` record (lock released)."""
+        real_save = cache.BoundedSessionCache.save
+
+        def save(mgr, data):
+            real_save(mgr, data)
+            if any(isinstance(r, dict) and r.get("orphaned_ended") for r in data.get("sessions", {}).values()):
+                raise _Crash("process killed after the save")
+
+        return mock.patch.object(cache.BoundedSessionCache, "save", autospec=True, side_effect=save)
+
+    def test_crash_between_step_c_save_and_export_keeps_the_owed_ended(self):
+        """Round-2 low finding (delivery_state:423): Step C saved ``orphaned_ended`` before the orphan export. That flag
+        makes the record evictable at the 256 cap without another export, so a crash in between (then the cap) lost
+        the Ended. The export is now journaled (fsynced) under the lock BEFORE that save."""
+        handle_agent_status_changed(WORKING, {}, bridge_url=self.mock_url)
+        sid = self.sid("w1:pCont")
+
+        def reject(payload, bridge_url=None, timeout=0.2):
+            return DeliveryResult("non_retryable", "4xx_client_error", 400)
+
+        with mock.patch.object(step_b, "send_event", side_effect=reject), self._crash_after_orphaning_save():
+            with self.assertRaises(_Crash):
+                handle_pane_closed({"pane_id": "w1:pCont"}, {}, bridge_url=self.mock_url)
+        with self.cache_mgr as data:
+            self.assertIs(data["sessions"][sid]["orphaned_ended"], True)
+            self.assertTrue(cache.safe_to_evict(data["sessions"][sid]), "the cap may now prune it without exporting")
+        self.assertTrue(self._orphaned(sid), "orphaned_ended was saved but its export was not durable")
+
+    def test_crash_between_results_drain_save_and_export_keeps_the_owed_ended(self):
+        """The results drain applies the same outcome (shared apply_delivery_result): same durability rule."""
+        handle_agent_status_changed(WORKING, {}, bridge_url=self.mock_url)
+        sid = self.sid("w1:pCont")
+        holders = []
+
+        def reject_then_contend(payload, bridge_url=None, timeout=0.2):
+            if not holders:
+                holders.append(hold_lock(self, self.cache_mgr.lock_file))
+            return DeliveryResult("non_retryable", "4xx_client_error", 400)
+
+        with mock.patch.object(step_b, "send_event", side_effect=reject_then_contend):
+            handle_pane_closed({"pane_id": "w1:pCont"}, {}, bridge_url=self.mock_url)
+        holders[0].release()
+        self.assertEqual(len(list((self.state_dir / "results").glob("*.json"))), 1)
+        self.assertFalse(self._orphaned(sid), "Step C deferred the outcome to results/")
+        with self._crash_after_orphaning_save(), self.assertRaises(_Crash):
+            drain_results_dir(self.state_dir)
+        self.assertTrue(self._orphaned(sid), "orphaned_ended was saved but its export was not durable")
 
     def _evict_during_send(self, sent, outcome="success"):
         """deliver_event stand-in: a concurrent close confirms and evicts the session while the Working is in flight."""

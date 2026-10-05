@@ -25,7 +25,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from . import process, runtime
+from . import jsonsafe, process, runtime
 from .config import DEFAULT_HOST, get_bridge_url
 from .log import log_debug
 
@@ -80,7 +80,7 @@ class DeliveryResult:
 # -- classification (pure) -------------------------------------------------------
 def _classify_ok_body(body: Optional[bytes]) -> DeliveryResult:
     try:
-        parsed = json.loads((body or b"").decode("utf-8"))
+        parsed = jsonsafe.loads((body or b"").decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         return DeliveryResult(OUTCOME_RETRYABLE, ERR_INVALID_RESPONSE, 200)
     if not isinstance(parsed, dict):
@@ -267,18 +267,39 @@ def post_bartender_event(payload: dict, timeout: float = DEFAULT_EVENT_TIMEOUT,
     return deliver_event(payload, timeout=timeout, bridge_url=bridge_url).as_tuple()
 
 
-def check_bridge_health(timeout: float = DEFAULT_HEALTH_TIMEOUT, bridge_url: Optional[str] = None) -> Optional[dict]:
-    """GET /health; the parsed JSON object on HTTP 200, else None (gated like every request)."""
+HEALTH_UNREACHABLE = "unreachable"
+
+
+def _health(timeout: float, bridge_url: Optional[str]) -> Tuple[Optional[dict], str]:
+    """(the parsed /health object or None, why there is none)."""
     url, refusal = _prepare("/health", bridge_url)
     if refusal is not None:
-        return None
+        if refusal.error == ERR_BARTENDER_NOT_RUNNING and not process.probe_bartender().known:
+            return None, HEALTH_UNREACHABLE   # the probe failed: Bartender's presence is unknown, not absent
+        return None, refusal.error or HEALTH_UNREACHABLE
     status, body, error = _perform(urllib.request.Request(url, method="GET"), socket_timeout(timeout))
     if status != 200:
         log_debug(f"Health check failed for {url}: status={status} error={error!r}")
-        return None
+        return None, HEALTH_UNREACHABLE
     try:
-        parsed = json.loads((body or b"").decode("utf-8"))
+        parsed = jsonsafe.loads((body or b"").decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as e:
         log_debug(f"Health check for {url} returned invalid JSON: {e}")
-        return None
-    return parsed if isinstance(parsed, dict) else None
+        return None, HEALTH_UNREACHABLE
+    return (parsed, "") if isinstance(parsed, dict) else (None, HEALTH_UNREACHABLE)
+
+
+def health_report(timeout: float = DEFAULT_HEALTH_TIMEOUT, bridge_url: Optional[str] = None) -> dict:
+    """GET /health for ``--health``: the parsed JSON object on HTTP 200, else ``{"error": <reason>}``.
+
+    The reason tells an operator why: ``bartender_not_running`` (the process probe found no Bartender,
+    so nothing was sent), ``invalid_bridge_url`` (a non-loopback target was refused), or ``unreachable``
+    (the request failed, the answer was not a JSON object, or the probe itself failed).
+    """
+    parsed, reason = _health(timeout, bridge_url)
+    return parsed if parsed is not None else {"error": reason}
+
+
+def check_bridge_health(timeout: float = DEFAULT_HEALTH_TIMEOUT, bridge_url: Optional[str] = None) -> Optional[dict]:
+    """GET /health; the parsed JSON object on HTTP 200, else None (gated like every request)."""
+    return _health(timeout, bridge_url)[0]

@@ -74,6 +74,21 @@ While `DISABLED` exists, every event and the reconciler do nothing. `--cleanup` 
 4. Optional: install the dedup guard (next section).
 5. Check the setup with `./bin/herdr-bartender --health`. To exercise Top Shelf end to end, run `./bin/herdr-bartender --live-test`.
 
+### Upgrading in place
+
+A `git pull` does not reach a reconciler that is already running: it keeps its old code in memory and keeps
+`reconciler.lock` while any session is live, so the new reconciler cannot start (R38). After pulling, stop it:
+
+```bash
+pkill -u "$(id -u)" -f '^[^ ]*[Pp]ython[^ /]* .*/herdr-bartender --reconcile-background( --[a-z-]+)*$'
+```
+
+The next Herdr event starts a reconciler with the new code. `--status` and the startup hook warn while an older
+reconciler (one without the current `reconciler.stamp`) still holds the lock. The stamp's version is a digest of the
+package sources, so this also fires after any later `git pull` that changed the code (R43). Hooks patched by the pre-package
+monolith (a blank line before the guard) are recognised: the reconciler re-lays them out with the current guard
+without asking for a review, and uninstall restores the original bytes (R37).
+
 ## Vendor hook dedup guard
 
 Bartender ships its own hooks for Claude Code (`claude-event-hook.sh`) and Codex (`codex-notify-hook.sh`). Without the guard, an agent running in a Herdr pane shows up twice: once from Herdr and once from the vendor hook.
@@ -84,6 +99,7 @@ The guard suppresses a vendor notification only while Herdr demonstrably owns th
 - The pane has a `.failed` delivery.
 - `DISABLED` or `DELIVERY_DOWN` is set.
 - The event is session-terminal.
+- The event cannot be classified (awk missing, failing, or not done within its 1s deadline; R41).
 
 ```bash
 ./bin/herdr-bartender --install-hooks     # patch both hooks; records their clean SHA-256 (approval)
@@ -106,20 +122,21 @@ The guard suppresses a vendor notification only while Herdr demonstrably owns th
 
 **Hooks changed upstream (`HOOK_NEEDS_REVIEW`)**
 - The reconciler re-patches a hook automatically only when its guard-free content still matches its recorded SHA.
-- On any mismatch, it patches nothing and touches `HOOK_NEEDS_REVIEW`. It also shows a single macOS notification, gated on `.hook_review_alerted`.
-- `--status` then prints `[WARNING] Vendor hook modified upstream (SHA mismatch). Run 'herdr-bartender --install-hooks' to re-verify and approve changes.`
+- On any mismatch, it patches nothing and writes the per-hook causes to `HOOK_NEEDS_REVIEW`. It also shows a single macOS notification, gated on `.hook_review_alerted`. The log warning is written once per change of causes, not on every pass.
+- `--status` then prints `[WARNING] Vendor hook modified upstream (SHA mismatch). Run 'herdr-bartender --install-hooks' to re-verify and approve changes.`, followed by a `Review needed:` line naming each hook's cause.
+- If you never ran `--install-hooks` (no `vendor-hook-sha.json` and no guard in any hook), the guard is simply not installed (R42): nothing is flagged, alerted or logged.
 - Until you approve the change by re-running `--install-hooks`, the vendor hooks run unguarded, so you may see duplicate entries.
 
 ## CLI reference
 
-All flags are handled in [`herdr_bartender/cli.py`](herdr_bartender/cli.py). Anything else is treated as an event invocation.
+All flags are handled in [`herdr_bartender/cli.py`](herdr_bartender/cli.py). A first argument that is not an option is treated as an event invocation. `--help` (or `-h`) prints usage; any other unknown option (a typo such as `--install-hook`) prints usage to stderr and exits 2 without touching anything (R51).
 
 | Command | Purpose | Exit code |
 | :--- | :--- | :--- |
 | `herdr-bartender <event>` (stdin envelope) | Herdr event path, bounded to 1.5s. The event name comes from the envelope, then from argv, then from the legacy `HERDR_PLUGIN_EVENT*` variables (R20). | 0 |
 | `--reconcile-background` | Startup hook: spawns the singleton reconciler detached (`--foreground` is the internal child flag). | 0, or 1 if the spawn failed |
-| `--health` | Prints bridge `/health` JSON plus `hooks_guard_intact`. Prints `{"error": "unreachable"}` when the bridge is down. | 0 |
-| `--status` | Prints the active session count and each session's state and delivery status, plus the `HOOK_NEEDS_REVIEW` warning. | 0, or 1 if the cache is unavailable |
+| `--health` | Prints bridge `/health` JSON plus `hooks_guard_intact` (false for a missing, stale or legacy-layout guard). On failure it prints `{"error": <reason>}`: `bartender_not_running` (no Bartender process found, nothing sent), `invalid_bridge_url`, or `unreachable` (the request failed, or the process probe failed) (R51). | 0 |
+| `--status` | Prints the active session count and each session's state and delivery status, plus the `HOOK_NEEDS_REVIEW` and outdated-reconciler (R38) warnings. | 0, or 1 if the cache is unavailable |
 | `--sessions` | Dumps the session cache as JSON. | 0, or 1 if the cache is unavailable |
 | `--install-hooks` / `--uninstall-hooks` | See above. | 0 on success, 1 otherwise |
 | `--cleanup` | Ends every tracked session on Top Shelf (see below). | 0, 2 or 1 |
@@ -157,10 +174,10 @@ scripts/rollback.sh
 It runs these steps, in order (Plan §9.1):
 1. Touches `DISABLED`.
 2. Removes the plugin symlinks, both `~/.config/herdr/plugins/herdr-bartender` and `.../plugins/local/herdr-bartender`. If `herdr` is on PATH, it runs `herdr plugin unlink` and checks that `herdr plugin list` no longer shows the plugin.
-3. Kills this user's reconcilers.
+3. Waits up to 3s for event handlers that were already running when `DISABLED` appeared (each is bounded by the 1.5s event deadline; if one is still running, the state dir is kept), then kills this user's reconcilers.
 4. Runs `--cleanup`.
 5. Runs `--uninstall-hooks`. If the launcher is unusable, it falls back to a byte-exact strip.
-6. Deletes the state dir, but only if every step succeeded.
+6. Deletes the state dir, but only if every step succeeded, and only if it is a real directory (not a symlink) named `herdr-bartender`. A `HERDR_PLUGIN_STATE_DIR` override that names anything else, such as `/tmp` or a shared directory, is kept, and the script exits 1 so you can check it and remove it by hand (R53).
 
 It exits 0 when everything was removed. Otherwise it exits 1, keeps `DISABLED`, and prints the `--replay-orphans` command if an orphan file exists. Set `HERDR_BARTENDER_BIN` to use a different launcher. The script honours `HERDR_PLUGIN_STATE_DIR`, `XDG_STATE_HOME` and `HERDR_BARTENDER_VENDOR_HOOKS_DIR`.
 

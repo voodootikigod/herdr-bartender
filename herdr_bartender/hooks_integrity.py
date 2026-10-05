@@ -7,10 +7,16 @@ A missing or corrupt allowlist, a hook without an entry, a mismatch, malformed
 markers or an unreadable hook all mean HOOK_NEEDS_REVIEW, and then *no* hook
 is patched. This module never writes the allowlist and never clears the
 review flags; only the explicit ``install_hooks`` does.
+
+R42: the guard is optional. With no allowlist file and no guard in any hook the
+user never opted in (``STATUS_NOT_INSTALLED``): nothing is patched, flagged,
+alerted or logged. The review warning is logged once per change of its causes,
+which HOOK_NEEDS_REVIEW records for ``--status``.
 """
 
 from __future__ import annotations
 
+import os
 import stat
 import subprocess
 from dataclasses import asdict, dataclass
@@ -27,7 +33,7 @@ from .hooks_install import (
     patched_content,
     present_hooks,
 )
-from .hooks_text import GuardTextError, guard_block, strip_guard
+from .hooks_text import GuardTextError, guard_block, is_legacy_layout, legacy_clean_variants, strip_guard
 from .log import log_debug, log_warning
 from .paths import get_state_dir, get_vendor_hooks_dir
 
@@ -37,6 +43,7 @@ STATUS_NEEDS_REVIEW = "needs_review"
 STATUS_NO_HOOKS = "no_hooks"
 STATUS_DISABLED = "disabled"
 STATUS_ABSENT = "absent"  # no vendor hooks installed on this host: nothing to protect
+STATUS_NOT_INSTALLED = "not_installed"  # R42: dedup never opted into (no allowlist file, no guard in any hook)
 
 HOOK_INTACT = "intact"
 HOOK_STALE_GUARD = "stale_guard"
@@ -46,6 +53,7 @@ HOOK_UNREADABLE = "unreadable"
 _PATCHABLE = (HOOK_STALE_GUARD, HOOK_MISSING_GUARD)
 
 ALERT_TIMEOUT_SECONDS = 2.0
+_REASONS_MAX_BYTES = 4096
 ALERT_SCRIPT = (
     'display notification "Vendor hook updated. Run \\"herdr-bartender --install-hooks\\" '
     'to re-enable dedup." with title "Herdr Bartender Bridge"'
@@ -87,28 +95,45 @@ class RepairResult:
     alert_sent: bool = False
 
 
+def approved_clean(content: bytes, known_sha: Optional[str]) -> Tuple[bytes, str]:
+    """(guard-free bytes, their SHA): the variant the allowlist approved, else ``strip_guard``'s.
+
+    R37: a legacy (monolith) layout may have been approved with blank lines at our insertion point
+    (``hooks_text.legacy_clean_variants``); only whitespace there differs, never vendor content.
+    """
+    stripped = strip_guard(content)
+    for clean in (stripped, *legacy_clean_variants(content)):
+        sha = hooks_fs.sha256_bytes(clean)
+        if known_sha is not None and sha == known_sha:
+            return clean, sha
+    return stripped, hooks_fs.sha256_bytes(stripped)
+
+
 def _check_one(hook: Path, known: dict, template: Optional[bytes]) -> HookCheck:
     known_sha = known.get(hook.name)
     try:
         content = hook.read_bytes()
         block = guard_block(content)
-        clean_sha = hooks_fs.sha256_bytes(strip_guard(content))
+        _, clean_sha = approved_clean(content, known_sha)
+        legacy = is_legacy_layout(content)
     except GuardTextError as e:
         return HookCheck(hook.name, HOOK_MALFORMED, known_sha=known_sha, detail=str(e))
     except OSError as e:
         return HookCheck(hook.name, HOOK_UNREADABLE, known_sha=known_sha, detail=str(e))
     if block is None:
         status = HOOK_MISSING_GUARD
-    elif template is not None and block != template:
-        status = HOOK_STALE_GUARD
+    elif legacy or (template is not None and block != template):
+        status = HOOK_STALE_GUARD   # R37: a legacy layout is re-laid out even when its block is current
     else:
         status = HOOK_INTACT
     return HookCheck(hook.name, status, clean_sha, known_sha)
 
 
-def _overall(checks: Tuple[HookCheck, ...]) -> str:
+def _overall(checks: Tuple[HookCheck, ...], opted_in: bool) -> str:
     if not checks:
         return STATUS_ABSENT
+    if not opted_in and all(c.status == HOOK_MISSING_GUARD for c in checks):
+        return STATUS_NOT_INSTALLED
     if any(c.status in (HOOK_MALFORMED, HOOK_UNREADABLE) for c in checks):
         return STATUS_NEEDS_REVIEW
     if any(c.needs_patch and not c.allowlisted for c in checks):
@@ -133,30 +158,40 @@ def check_hook_integrity(state_dir: Optional[Path] = None, hooks_dir: Optional[P
     if (state_dir / NO_HOOKS).exists():
         return IntegrityResult(STATUS_NO_HOOKS)
     hook_files = present_hooks(hooks_dir) if hooks_dir.is_dir() else []
-    known = hooks_fs.load_sha_allowlist(state_dir / SHA_FILE_NAME)
+    sha_file = state_dir / SHA_FILE_NAME
+    known = hooks_fs.load_sha_allowlist(sha_file)
     template = _optional_template() if hook_files else None
     checks = tuple(_check_one(h, known, template) for h in hook_files)
-    return IntegrityResult(_overall(checks), checks)
+    return IntegrityResult(_overall(checks, opted_in=os.path.lexists(sha_file)), checks)
 
 
 def verify_vendor_hooks_intact(hooks_dir: Optional[Path] = None) -> Tuple[bool, list]:
-    """(all present hooks carry one well-formed guard, names lacking one). (False, []) without a hooks dir."""
+    """(all present hooks carry the CURRENT guard, names that do not). (False, []) without a hooks dir.
+
+    A stale or legacy-layout guard is not intact (``--health``); an unreadable template skips that comparison.
+    """
     hooks_dir = hooks_dir or get_vendor_hooks_dir()
     if not hooks_dir.is_dir():
         return False, []
-    checks = tuple(_check_one(h, {}, None) for h in present_hooks(hooks_dir))
+    hook_files = present_hooks(hooks_dir)
+    template = _optional_template() if hook_files else None
+    checks = tuple(_check_one(h, {}, template) for h in hook_files)
     missing = [c.name for c in checks if c.status != HOOK_INTACT]
     return not missing, missing
 
 
 def _repair_one(hook: Path, expected_sha: str, template: bytes) -> bool:
-    """Re-patch one hook iff its *current* clean bytes still hash to ``expected_sha``."""
+    """Re-patch one hook iff its *current* clean bytes still hash to ``expected_sha``.
+
+    The current guard goes over exactly the approved guard-free bytes (R37: a legacy layout is re-laid out).
+    """
     try:
         content = hook.read_bytes()
-        if hooks_fs.sha256_bytes(strip_guard(content)) != expected_sha:
+        clean, clean_sha = approved_clean(content, expected_sha)
+        if clean_sha != expected_sha:
             log_warning(f"{hook.name} changed since the integrity check; repair refused")
             return False
-        new_content = patched_content(content, template)
+        new_content = patched_content(content, template, clean)
         mode = stat.S_IMODE(hook.stat().st_mode) | 0o100
         hooks_fs.atomic_replace_hook(hook, new_content, mode, expected=content)
         log_debug(f"Re-patched allowlisted vendor hook {hook.name}")
@@ -176,12 +211,34 @@ def _send_review_alert() -> bool:
         return False
 
 
-def flag_hook_review(state_dir: Path, result: IntegrityResult) -> Tuple[bool, bool]:
-    """Touch HOOK_NEEDS_REVIEW, log a warning, and alert once (gated on .hook_review_alerted)."""
-    reasons = ", ".join(f"{c.name}={c.status}{'' if c.allowlisted else '/unknown-sha'}" for c in result.hooks)
-    log_warning(f"vendor hook needs review ({reasons}); automatic re-patching skipped")
+def review_reasons(result: IntegrityResult) -> str:
+    """One line naming each hook's status, e.g. ``claude-event-hook.sh=missing_guard/unknown-sha``."""
+    return ", ".join(f"{c.name}={c.status}{'' if c.allowlisted else '/unknown-sha'}" for c in result.hooks)
+
+
+def recorded_review_reasons(state_dir: Path) -> str:
+    """The causes HOOK_NEEDS_REVIEW records ("" when missing, unreadable or a bare touch)."""
     try:
-        hooks_fs.touch_private(state_dir / HOOK_NEEDS_REVIEW)
+        raw = (state_dir / HOOK_NEEDS_REVIEW).read_bytes()[:_REASONS_MAX_BYTES]
+    except OSError:
+        return ""
+    return raw.decode("utf-8", "replace").strip()
+
+
+def flag_hook_review(state_dir: Path, result: IntegrityResult) -> Tuple[bool, bool]:
+    """Record the causes in HOOK_NEEDS_REVIEW, warn once per change of causes, alert once (.hook_review_alerted).
+
+    Every reconciler pass (20s) re-checks; an unchanged review is not logged again (R42).
+    """
+    reasons = review_reasons(result)
+    flag = state_dir / HOOK_NEEDS_REVIEW
+    changed = not flag.exists() or recorded_review_reasons(state_dir) != reasons
+    if changed:
+        log_warning(f"vendor hook needs review ({reasons}); automatic re-patching skipped")
+    try:
+        hooks_fs.touch_private(flag)
+        if changed:
+            hooks_fs.write_private_atomic(flag, reasons.encode("utf-8") + b"\n", 0o600)
     except OSError as e:
         log_warning(f"could not create {HOOK_NEEDS_REVIEW}: {e}")
         return False, False

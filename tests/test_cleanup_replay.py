@@ -9,7 +9,7 @@ import os
 import unittest
 from unittest import mock
 
-from herdr_bartender import cleanup
+from herdr_bartender import cache, cleanup
 from herdr_bartender.cleanup import EXIT_FATAL, EXIT_OK, EXIT_UNCONFIRMED, run_cleanup
 from herdr_bartender.markers import touch_pane_marker
 from herdr_bartender.orphans import _lock_path, export_orphan_record
@@ -269,6 +269,40 @@ class ReplayTests(ReplayCase):
         self.assertTrue((self.state_dir / "reconciler.pending").exists())
         self.assertTrue(self.spawner.calls, "the reconciler is ensured to re-assert the live state")
 
+    def test_unsaved_post_send_resync_keeps_the_record_until_it_is_saved(self):
+        """Plan §9.2 item 4a (gate finding, review round 2): the Ended landed but the re-sync of a session admitted
+        while it was in flight could not be saved (CacheError). Dropping the orphan lost that re-sync for good (the
+        live record still reads delivered, so nothing re-sends it). The record is kept, stamped ``resync_owed``; the
+        next replay re-runs only the re-sync check (no second Ended to the live session) and then drops it."""
+        sid = self.sid("w1:pRace")
+        self.write({sid: {"agent": "Herdr", "pane_id": "w1:pRace"}})
+        admitted = []
+
+        def admit(_payload):
+            seed(self.cache_mgr, {sid: session("w1:pRace", now=1.0)})
+            admitted.append(True)
+
+        real_save = cache.BoundedSessionCache.save
+
+        def save(mgr, data, *args, **kwargs):
+            if admitted:
+                raise cache.CacheWriteError("simulated: disk full")
+            return real_save(mgr, data, *args, **kwargs)
+
+        self.bridge.on_post = admit
+        with mock.patch.object(cache.BoundedSessionCache, "save", autospec=True, side_effect=save):
+            self.assertIs(self.replay(), False, "the re-sync is not saved yet: the replay is not done")
+        self.assertIs(self.remaining()[sid].get("resync_owed"), True)
+        record = read_cache(self.cache_mgr)["sessions"][sid]
+        self.assertEqual(record["delivered_seq"], record["seq"], "control: the re-sync really was not saved")
+        self.bridge.on_post = None
+        self.assertIs(self.replay(), True)
+        record = read_cache(self.cache_mgr)["sessions"][sid]
+        self.assertEqual((record["delivered_seq"], record["delivery_status"], record["resync_generation"]),
+                         (0, "in_flight", 1))
+        self.assertEqual(self.remaining(), {})
+        self.assertEqual(len(self.bridge.posts()), 1, "the live session is never sent a second Ended")
+
     def test_cached_ended_is_confirmed_and_evicted(self):
         sid = self.sid("w1:pEnded")
         seed(self.cache_mgr, {sid: session("w1:pEnded", "Ended", seq=3, delivered=False, now=1.0,
@@ -308,6 +342,48 @@ class ReplayTests(ReplayCase):
         self.use_fake_clock()   # the bounded 5s wait elapses on the fake clock
         self.assertIs(self.replay(), False)
         self.assertEqual(self.bridge.history, [])
+
+
+class ReplayMarkerTests(ReplayCase):
+    """Round-2 low finding (replay.py:221): after a confirmed orphan Ended the pane marker is removed exactly when no
+    live (non-Ended, non-salvaged) session remains on that pane (``_live_on_pane``); other panes are untouched."""
+
+    def _replay(self, pane, cached=None, on_post=None):
+        sid = self.sid(pane)
+        if cached:
+            seed(self.cache_mgr, cached)
+        touch_pane_marker(pane)
+        self.write({sid: {"agent": "Herdr", "pane_id": pane}})
+        self.bridge.on_post = on_post
+        self.assertIs(self.replay(), True)
+        return pane_file(self.state_dir, pane).exists()
+
+    def test_marker_removed_when_nothing_live_remains_on_the_pane(self):
+        other = "w1:pOtherLive"
+        cases = {
+            "nothing-cached": lambda pane: None,
+            "cached-orphaned-ended": lambda pane: {self.sid(pane): session(
+                pane, "Ended", seq=3, delivered=False, now=1.0, orphaned_ended=True,
+                delivery_status="non_retryable_failed")},
+            "salvaged-on-the-pane": lambda pane: {f"{self.sid(pane)}-old": salvaged(pane, now=1.0)},
+            "ended-on-the-pane": lambda pane: {f"{self.sid(pane)}-old": session(pane, "Ended", now=1.0)},
+            "live-on-another-pane": lambda pane: {self.sid(other): session(other, now=1.0)},
+        }
+        for label, cached in cases.items():
+            with self.subTest(case=label):
+                pane = f"w1:pMark{label.replace('-', '')}"
+                touch_pane_marker(other)
+                self.assertFalse(self._replay(pane, cached(pane)), f"{label}: the marker must be removed")
+                self.assertTrue(pane_file(self.state_dir, other).exists(), "another pane's marker is untouched")
+
+    def test_marker_kept_for_a_session_admitted_while_the_ended_was_in_flight(self):
+        pane = "w1:pMarkReadmit"
+
+        def admit(_payload):
+            seed(self.cache_mgr, {self.sid(pane): session(pane, now=1.0)})
+
+        self.assertTrue(self._replay(pane, on_post=admit), "the re-admitted live session keeps its marker")
+        self.assertEqual(read_cache(self.cache_mgr)["sessions"][self.sid(pane)]["delivery_status"], "in_flight")
 
 
 class CliContractTests(ReplayCase):

@@ -12,7 +12,6 @@ fallback), R2 (canonical prefix is authoritative), R3 (focus test) and R20
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import select
@@ -20,6 +19,7 @@ import time
 from collections import Counter
 from typing import Callable, Iterable, Mapping, NamedTuple, Optional, Sequence, Tuple
 
+from . import jsonsafe
 from .config import CONTAINER_ID_REGEX, PANE_ID_REGEX, SESSION_ID_REGEX, STATUS_MAP
 from .sanitize import (
     normalize_pane_id,
@@ -42,9 +42,9 @@ LEGACY_CONTEXT_JSON_ENV = "HERDR_PLUGIN_CONTEXT_JSON"
 
 STDIN_MAX_BYTES = 1 << 20
 STDIN_CHUNK = 65536
-WIRE_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_:-]{1,96}$")
-HOST_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
-EVENT_NAME_VALID_RE = re.compile(r"^[A-Za-z0-9._]{1,64}$")
+WIRE_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9_:-]{1,96}\Z")
+HOST_RE = re.compile(r"^[a-z0-9_-]{1,32}\Z")
+EVENT_NAME_VALID_RE = re.compile(r"^[A-Za-z0-9._]{1,64}\Z")
 LOG_VALUE_MAX = 80
 
 
@@ -119,7 +119,7 @@ def _parse_json_object(raw: object) -> Optional[dict]:
     if not isinstance(raw, str) or not raw.strip():
         return None
     try:
-        value = json.loads(raw)
+        value = jsonsafe.loads(raw)
     except ValueError:
         return None
     return value if isinstance(value, dict) else None

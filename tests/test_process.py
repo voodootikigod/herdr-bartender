@@ -79,10 +79,33 @@ class HerdrPidSelectionTests(SandboxTestCase):
         self.assertEqual(process.get_herdr_instance_id(), "")
 
     def test_r15_python_pattern_matches_guard_pattern(self):
-        """R15 (gap portability-guard-herdr-liveness): Python and hook_guard.sh share one bundle rule."""
+        """R15 (gap portability-guard-herdr-liveness): Python and hook_guard.sh share one bundle rule (both with -a,
+        R44: macOS pgrep skips the caller's ancestors otherwise)."""
         guard = (Path(process.__file__).parent / "hook_guard.sh").read_text(encoding="utf-8")
-        needle = f"pgrep -f '{process.HERDR_APP_PATTERN}'"
+        needle = f"pgrep -a -f '{process.HERDR_APP_PATTERN}'"
         self.assertTrue(needle in guard, f"hook_guard.sh does not use {needle!r}")
+        self.assertIn('pgrep -a -xi "herdr"', guard)
+
+    def test_r44_herdr_that_spawned_this_process_is_alive(self):
+        """R44 (round-3 finding): Herdr spawns the plugin processes, so it is their ancestor, and macOS pgrep drops
+        ancestors unless -a is given. Without -a an ancestor Herdr read as confirmed dead (known, no pid), which
+        disarmed vendor dedup and fed the dead-Herdr expiry. Both probes (name and bundle) must find it."""
+        for label, name, cmdline in (("name", "herdr", "herdr server"),
+                                     ("bundle", "Herdr Main", "/Applications/Herdr.app/Contents/MacOS/Herdr Main")):
+            with self.subTest(probe=label):
+                self.clear_fake_processes()
+                process.reset_caches()
+                pid = self.add_fake_process(name, pid=5100 + len(label), comm=name, cmdline=cmdline, ancestor=True)
+                self.assertEqual(get_herdr_pid(), pid)
+                self.assertIs(process.herdr_liveness(), True)
+
+    def test_r44_procps_full_listing_yields_only_the_pid(self):
+        """R44: on Linux procps ``-a`` means --list-full ("<pid> <command line>"); digits in the command line (a port,
+        a count) are never taken for PIDs."""
+        (self.sandbox / "pgrep.procps").write_text("")
+        pid = self.add_fake_process("herdr", pid=5150, comm="herdr", cmdline="herdr server --port 8080 --workers 4")
+        self.assertEqual(process._pgrep(["-a", "-xi", "herdr"]), [pid])
+        self.assertEqual(get_herdr_pid(), pid)
 
 
 class BartenderPidSelectionTests(SandboxTestCase):

@@ -111,9 +111,17 @@ def deferred_exit() -> Iterator[None]:
 
 
 def run_bounded(fn: Callable[..., T], *args) -> T:
-    """Run the event path; a SIGALRM outside critical sections becomes a hand-off and exit code 0."""
+    """Run the event path; a SIGALRM outside critical sections becomes a hand-off and exit code 0.
+
+    The timer is disarmed however the path ends, so a process that finishes just before the
+    deadline is not killed by SIGALRM during its teardown (exit by signal 14 instead of 0).
+    An alarm landing while it is disarmed is still caught here.
+    """
     try:
-        return fn(*args)
+        try:
+            return fn(*args)
+        finally:
+            disarm_watchdog()
     except WatchdogExpired:
         log_debug("Watchdog deadline exceeded (SIGALRM); handing off to the reconciler")
         hand_off_to_reconciler()

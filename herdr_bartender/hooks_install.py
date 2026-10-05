@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 from . import hooks_fs
-from .hooks_text import GuardTextError, find_guard, insert_guard, replace_guard, strip_guard
+from .hooks_text import GuardTextError, find_guard, insert_guard, is_legacy_layout, replace_guard, strip_guard
 from .log import log_debug
 from .paths import get_state_dir, get_vendor_hooks_dir
 
@@ -45,11 +45,19 @@ def load_template_bytes() -> bytes:
     return get_hook_guard_template().encode("utf-8")
 
 
-def patched_content(content: bytes, template: bytes) -> bytes:
-    """Content with exactly one current guard (in-place swap, or insertion at the anchor)."""
-    if find_guard(content) is None:
+def patched_content(content: bytes, template: bytes, clean: Optional[bytes] = None) -> bytes:
+    """Content with exactly one current guard (in-place swap, or insertion at the anchor).
+
+    A legacy-layout guard (R37), or ``clean`` (the approved guard-free bytes, when they are not what
+    ``strip_guard`` yields), is re-laid out canonically: the current guard inserted into those bytes.
+    """
+    span = find_guard(content)
+    if span is None:
         return insert_guard(content, template)
-    return replace_guard(content, template)
+    stripped = strip_guard(content)
+    if not is_legacy_layout(content, span) and clean in (None, stripped):
+        return replace_guard(content, template)
+    return insert_guard(stripped if clean is None else clean, template)
 
 
 def _say(msg: str) -> None:

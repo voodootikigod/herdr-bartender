@@ -237,6 +237,32 @@ class ResultsTests(SandboxTestCase):
         s, _ = self._session()
         self.assertEqual(s["delivered_seq"], 4)
 
+    def test_parse_rejects_wrong_typed_optional_fields(self):
+        """Gate finding (review round 6): optional Transmission fields were copied unchecked, so an object pane_id
+        raised TypeError while the result was applied (not quarantined: every pass hit it again)."""
+        for field, bad in (("pane_id", {"x": 1}), ("agent", [1]), ("lease_token", 5), ("generation", "3"),
+                           ("generation", True), ("admitted_at_ns", [1]), ("arrival_ns", {"a": 1}),
+                           ("arrival_ns", -1), ("resync_generation", "x"), ("error", {"e": 1})):
+            with self.subTest(field=field, bad=bad):
+                env = build_result_envelope(self._tx(), Outcome("success"), 1, 1)
+                env[field] = bad
+                with self.assertRaises(ValueError):
+                    parse_result_envelope(env)
+        env = build_result_envelope(self._tx(), Outcome("success"), 1, 1)
+        env.update({"pane_id": None, "agent": None, "lease_token": None, "generation": None,
+                    "admitted_at_ns": None, "arrival_ns": None, "error": None})
+        parse_result_envelope(env)   # control: absent optional fields stay valid
+
+    def test_wrong_typed_result_is_quarantined_and_the_drain_continues(self):
+        self._seed()
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        env = build_result_envelope(self._tx(), Outcome("success"), 1, 1)
+        (self.results_dir / "00000000000000000001_1_2.json").write_text(json.dumps({**env, "pane_id": {"x": 1}}))
+        write_result_envelope(self._tx(), Outcome("success"))
+        report = drain_results_dir(self.state_dir)
+        self.assertEqual((report.applied, report.quarantined), (1, 1))
+        self.assertEqual(self._session()[0]["delivered_seq"], 2)
+
     def test_invalid_result_is_quarantined(self):
         """Poison results never block the drain: they move to results/bad/."""
         self.results_dir.mkdir(parents=True, exist_ok=True)

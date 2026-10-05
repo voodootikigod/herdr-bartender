@@ -67,6 +67,20 @@ class CacheSalvageTests(SandboxTestCase):
                 self.cache_mgr.save(data)
         self.assertIn("after-signal", json.loads(self.cache_mgr.cache_file.read_text())["sessions"])
 
+    def test_salvage_removes_every_existing_pane_marker(self):
+        """Plan §10.1 #12 / R39 (§3 L118, §6.3 step 4): ALL existing pane markers go on salvage (vendor hooks fall through at once),
+        also a pane whose session id the corrupt text no longer names; .vendor_active and others are kept."""
+        panes = self._panes_dir()
+        lost = get_hex_pane_id("w1:pUnrecoverable")
+        (panes / lost).write_text("1")
+        (panes / f"{lost}.failed").write_text("1")
+        (panes / f"{lost}.vendor_active").write_text('{"vendor_session_id":"vendor_uuid_kept_0001"}')
+        (panes / ".va.tmp.keep").write_text("")
+        self._write_corrupt("w1:pRecovered")
+        with self.cache_mgr:
+            pass
+        self.assertEqual(sorted(p.name for p in panes.iterdir()), sorted([f"{lost}.vendor_active", ".va.tmp.keep"]))
+
     @staticmethod
     def _pre_crash_envelope(event_name, event_data, arrival_ns):
         return {"event_name": event_name, "event_data": event_data, "context": {}, "arrival_ns": arrival_ns,
@@ -138,11 +152,12 @@ class CacheSalvageTests(SandboxTestCase):
         self.assertEqual([e["state"] for e in self.bridge.events_for(sid_exited)], ["Ended"])
         self.assertEqual(self.bridge.events_for(sid_quiet), [])
 
-    def test_salvage_marker_removal_is_per_candidate(self):
-        """Plan §6.3 step 4 (gap salvage-marker-removal-scope): only salvaged panes lose markers; unrelated files stay."""
+    def test_salvage_marker_removal_spares_unrelated_files(self):
+        """Plan §6.3 step 4 (gap salvage-marker-removal-scope) with R39: markers go (every pane's, see
+        test_salvage_removes_every_existing_pane_marker), unrelated files in panes/ stay."""
         panes = self._panes_dir()
         other = get_hex_pane_id("w2:pOther")
-        keep = [panes / other, panes / f"{other}.vendor_active", panes / f"{other}.va.tmp"]
+        keep = [panes / f"{other}.vendor_active", panes / f"{other}.va.tmp", panes / "README"]
         for path in keep:
             path.write_text("x")
         self._write_corrupt("w1:pOnly")

@@ -1,10 +1,14 @@
 """Terminal-control stripping, field sanitization and canonical pane-ID normalization.
 
 Plan §2.3: title/agent/cwd are stripped of ANSI CSI, OSC, DCS and C0/C1 control
-characters (one shared helper) and bounded (title 120, agent 64, cwd 256); the
+characters (one shared helper) and bounded (title 120, agent 64, cwd 256). R47: the
+same helper also removes Unicode bidi controls and every other invisible format
+character (Cf, except ZWJ/ZWNJ) plus the line/paragraph separators, so a pane title
+cannot reorder or hide what Top Shelf shows. The
 ``event`` field is reduced to ``[A-Za-z0-9._]`` (64) -- the underscore is kept
 because the real event name ``pane.agent_status_changed`` contains it. Hostnames follow
-``re.sub(r'[^a-z0-9_-]', '', host.split('.')[0].lower())[:32] or "local"``.
+``re.sub(r'[^a-z0-9_-]', '', host.split('.')[0].lower())[:32] or "local"`` (R46: the
+first DNS label, as the monolith did).
 """
 
 from __future__ import annotations
@@ -35,6 +39,14 @@ DCS_RE = re.compile(r"(?:\x1b[PX^_]|[\x90\x98\x9e\x9f])[^\x1b\x9c]*(?:\x1b\\|\x9
 # Any other two-byte escape (e.g. ESC c, ESC 7).
 ESC_RE = re.compile(r"\x1b[@-Z\\-~]?")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# R47: Unicode general categories Cf (format: bidi embeddings/overrides/isolates and marks, zero-width
+# space, word joiner, BOM, invisible operators, tag characters, ...), Zl and Zp (Unicode 16), listed
+# literally: scanning unicodedata at import would cost the event path ~0.3s. ZWNJ/ZWJ (U+200C/D) are
+# kept: emoji sequences and Indic/Persian shaping depend on them, and they cannot reorder text.
+INVISIBLE_RE = re.compile(
+    "[\u00ad\u0600-\u0605\u061c\u06dd\u070f\u0890\u0891\u08e2\u180e\u200b\u200e\u200f\u2028-\u202e"
+    "\u2060-\u2064\u2066-\u206f\ufeff\ufff9-\ufffb\U000110bd\U000110cd\U00013430-\U0001343f"
+    "\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0001\U000e0020-\U000e007f]")
 EVENT_NAME_RE = re.compile(r"[^A-Za-z0-9._]")
 HOST_STRIP_RE = re.compile(r"[^a-z0-9_-]")
 
@@ -46,9 +58,9 @@ def _as_text(raw: object) -> str:
 
 
 def strip_terminal_controls(raw: object) -> str:
-    """Remove CSI, OSC, DCS/SOS/PM/APC, stray escapes and every C0/C1 control."""
+    """Remove CSI, OSC, DCS/SOS/PM/APC, stray escapes, every C0/C1 control and invisible format characters."""
     text = _as_text(raw)
-    for pattern in (OSC_RE, DCS_RE, CSI_RE, ESC_RE, CONTROL_RE):
+    for pattern in (OSC_RE, DCS_RE, CSI_RE, ESC_RE, CONTROL_RE, INVISIBLE_RE):
         text = pattern.sub("", text)
     return text
 

@@ -1,11 +1,12 @@
 """Universal Sender Protocol Step B: network I/O outside the cache lock (Plan §4.3 item 3, §3.3, R5).
 
 At most ``policy.max_posts`` POSTs per claimed session: the primary POST, plus ONE
-minimal ``{"state": "Ended", "agent": "Herdr", "session_id": sid}`` retry, only when an
-``Ended`` was rejected non-retryably (§3.3 rows 200/ok:false, 3xx, 4xx). Every POST is
-gated on the policy budget (``time_remaining() > 0.3`` on the event path) and uses the
-policy socket timeout (``min(0.2, max(0.05, time_remaining() - 0.3))``). Sending while
-the cache lock is held is a programming error and raises.
+minimal ``{"state": "Ended", "agent": "Herdr", "session_id": sid}`` retry when an
+``Ended`` failed or was rejected (§4.3 L479, §1 L119, R45): every unsuccessful outcome
+except a request that never reached the bridge (Bartender not running, invalid bridge
+URL). Every POST is gated on the policy budget (``time_remaining() > 0.3`` on the event
+path) and uses the policy socket timeout (``min(0.2, max(0.05, time_remaining() - 0.3))``).
+Sending while the cache lock is held is a programming error and raises.
 """
 
 from __future__ import annotations
@@ -14,13 +15,14 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .. import runtime
-from ..bridge import (ERR_INVALID_BRIDGE_URL, CriticalSectionViolation, DeliveryResult, minimal_ended_payload,
-                      send_event)
+from ..bridge import (ERR_BARTENDER_NOT_RUNNING, ERR_INVALID_BRIDGE_URL, CriticalSectionViolation, DeliveryResult,
+                      minimal_ended_payload, send_event)
 from ..log import log_debug
 from .lease import Claim
 from .policy import SendPolicy
 
 NOT_SENT_BUDGET = "budget"
+UNSENT_ERRORS = (ERR_BARTENDER_NOT_RUNNING, ERR_INVALID_BRIDGE_URL)   # never reached the bridge: a retry fixes nothing
 
 
 @dataclass(frozen=True)
@@ -44,8 +46,8 @@ def ensure_outside_critical_section() -> None:
 
 
 def _wants_minimal_retry(claim: Claim, result: DeliveryResult) -> bool:
-    """§3.3: an Ended rejected by the bridge is retried once with the minimal payload."""
-    if claim.state != "Ended" or not result.non_retryable or result.error == ERR_INVALID_BRIDGE_URL:
+    """§4.3 L479 / R45: an Ended that failed or was rejected is retried once with the minimal payload."""
+    if claim.state != "Ended" or result.success or result.error in UNSENT_ERRORS:
         return False
     return minimal_ended_payload(claim.payload) != claim.payload
 

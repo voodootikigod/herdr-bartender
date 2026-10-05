@@ -5,6 +5,7 @@ budgeted and persisted).
 """
 
 import json
+import os
 import time
 import unittest
 from unittest import mock
@@ -129,6 +130,39 @@ class PaneCloseVendorTests(VendorCase):
         with self.cache_mgr as data:
             self.assertEqual(data["sessions"][self.sid(PANE)]["delivery_status"], "non_retryable_failed")
 
+    def test_dual_teardown_pane_close_dismisses_after_a_rejected_container_close(self):
+        """Plan §1 L103 / L249 (Dual Teardown) + R24, pinned at the final gate (review round 9 asked why a rejected
+        tab-close Ended leaves the vendor entry): R24 queues a container close's dismissal only on a confirmed Ended,
+        and Herdr follows every tab/workspace close with a ``pane.closed`` per enclosed pane, whose Step A queues the
+        dismissal whatever happens to the session's own Ended - also for a session the tab close already ended."""
+        from herdr_bartender.handlers import handle_tab_closed
+        self._working(tab_id="w1:t1")
+        self._write_uuid()
+        self.bridge.on_post = lambda p: self.bridge.enqueue(400) if p.get("session_id") == self.sid(PANE) else None
+        handle_tab_closed({"tab_id": "w1:t1", "workspace_id": "w1"}, {}, bridge_url=self.mock_url)
+        self.assertEqual(self._dismissals(), [], "R24: the container close's Ended was not confirmed")
+        handle_pane_closed({"pane_id": PANE}, {}, bridge_url=self.mock_url)
+        self.assertEqual(len(self._dismissals()), 1, "the per-pane close of the dual teardown dismisses it")
+        self.assertFalse(self.vendor_file.exists())
+
+    def test_unreadable_record_is_never_retired(self):
+        """Gate finding (review round 11): a ``.vendor_active`` that could not be read was retired with no rewrite
+        check, so a valid UUID record the guard wrote after the failed read was deleted undismissed."""
+        self._write_uuid()
+        real_open = open
+
+        def flaky_open(path, *args, **kwargs):
+            if str(path) == str(self.vendor_file):
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=flaky_open):
+            record = vendor.read_vendor_file(self.vendor_file)
+        self.assertIsNone(record.content, "control: the read failed")
+        self._write_uuid("vendor-session-uuid-0002")   # the guard rewrites it meanwhile
+        vendor.retire_vendor_file(record)
+        self.assertEqual(json.loads(self.vendor_file.read_text())["vendor_session_id"], "vendor-session-uuid-0002")
+
     def test_stale_close_does_not_dismiss(self):
         arr = time.time_ns()
         handle_agent_status_changed({"agent_status": "working", "pane_id": PANE, "workspace_id": "w1",
@@ -188,6 +222,33 @@ class PaneCloseVendorTests(VendorCase):
         self.assertEqual(json.loads(self.vendor_file.read_text()), {"vendor_session_id": newer})
         self.assertEqual(sorted(p.name for p in self.vendor_file.parent.iterdir() if "vendor_active" in p.name),
                          [self.vendor_file.name], "no claimed leftovers")
+
+    def test_identical_record_rewritten_or_refreshed_after_it_was_read_is_kept(self):
+        """Low finding: the guard rewrites an UNCHANGED UUID record (mktemp + mv -f) and touches it on every unhealthy
+        pass-through - the vendor fallback is live again. Comparing bytes alone could not see that, so the refreshed
+        record was retired. The file identity read under the lock (inode, mtime) is compared too."""
+        def claimed_leftovers():
+            return [p.name for p in self.vendor_file.parent.iterdir() if vendor.CLAIM_INFIX in p.name]
+
+        for label in ("rewrite", "touch"):
+            with self.subTest(refresh=label):
+                self._write_uuid()
+                record = vendor.read_vendor_file(self.vendor_file)
+                if label == "rewrite":
+                    tmp = self.vendor_file.with_name(".va.tmp.guard")
+                    tmp.write_bytes(record.content)
+                    tmp.replace(self.vendor_file)
+                else:
+                    later = self.vendor_file.stat().st_mtime + 5
+                    os.utime(self.vendor_file, (later, later))
+                vendor.retire_vendor_file(record)
+                self.assertTrue(self.vendor_file.exists(), "the refreshed record is put back")
+                self.assertEqual(self.vendor_file.read_bytes(), record.content)
+                self.assertEqual(claimed_leftovers(), [])
+        untouched = vendor.read_vendor_file(self.vendor_file)
+        vendor.retire_vendor_file(untouched)
+        self.assertFalse(self.vendor_file.exists(), "control: the record that was read is retired")
+        self.assertEqual(claimed_leftovers(), [])
 
     def test_compat_cleanup_stages_before_sending(self):
         """``cleanup_vendor_active`` (reconciler drain) follows the same stage -> send -> record order."""

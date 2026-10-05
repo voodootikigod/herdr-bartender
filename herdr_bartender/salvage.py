@@ -32,6 +32,7 @@ GENERATION_PAIR_RE = re.compile(r'"([^"]+)"\s*:\s*(\d+)')
 CORRUPT_PREFIX = "active-sessions.json.corrupt."
 QUARANTINE_RETENTION_SECONDS = 7 * 86400
 QUARANTINE_NAME_ATTEMPTS = 100   # .corrupt.<ts>, then .corrupt.<ts>.1 ... within one second
+MARKER_NAME_RE = re.compile(r"^[0-9a-f]+\Z")   # panes/<hex(canonical pane)>: the marker itself, no suffix
 
 
 def parse_pane_generations(raw_text: str) -> Dict[str, int]:
@@ -196,7 +197,25 @@ def preserve_close_envelopes(state_dir: Path) -> List[Path]:
     return moved
 
 
-def remove_salvaged_markers(data: dict) -> None:
-    """Plan §6.3 step 4: remove_pane_marker for each salvaged pane (marker + .failed, nothing else)."""
+def remove_salvaged_markers(data: dict, state_dir: Path) -> None:
+    """Plan §6.3 step 4 / §3 L118: every existing pane marker goes (marker + its .failed, nothing else).
+
+    Not only the salvaged panes' markers: a pane whose session id the corrupt text no longer names would
+    otherwise keep suppressing its vendor hook for up to 60s with nothing behind it.
+    """
     for record in data.get("sessions", {}).values():
         remove_pane_marker(record.get("pane_id"))
+    panes = Path(state_dir) / "panes"
+    try:
+        markers = [p for p in panes.iterdir() if MARKER_NAME_RE.match(p.name)] if panes.is_dir() else []
+    except OSError as e:
+        log_debug(f"Could not list pane markers for salvage: {e}")
+        return
+    for marker in markers:
+        for path in (marker, marker.with_name(f"{marker.name}.failed")):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                log_debug(f"Could not remove {path.name} on salvage: {e}")

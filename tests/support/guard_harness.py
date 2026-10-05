@@ -6,6 +6,7 @@ Everything here writes only inside the caller-provided sandbox directory.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -41,11 +42,8 @@ def run_guard_with_umask(script: Path, umask: str, *args: str, **kwargs) -> subp
 
 
 def start_fifo_writer(test_case, fifo_path: Path, shell: str) -> subprocess.Popen:
-    """Spawn ``bash -c shell`` (expected to write into ``fifo_path``); killed/reaped in cleanup."""
-    writer = subprocess.Popen(["bash", "-c", shell], stdin=subprocess.DEVNULL)
-    test_case.addCleanup(writer.wait)
-    test_case.addCleanup(writer.kill)
-    return writer
+    """Spawn ``bash -c shell`` (expected to write into ``fifo_path``); its process group is killed/reaped in cleanup."""
+    return spawn_group(test_case, ["bash", "-c", shell])
 
 
 def leftovers(state_dir: Path, *patterns: str) -> list:
@@ -58,3 +56,23 @@ def leftovers(state_dir: Path, *patterns: str) -> list:
 
 def file_mode(path: Path) -> int:
     return os.stat(path).st_mode & 0o7777
+
+
+
+def spawn_group(test_case, argv: list) -> subprocess.Popen:
+    """Spawn ``argv`` as the leader of a new process group; cleanup SIGKILLs the whole group, then reaps.
+
+    Killing only a ``bash -c "...; :"`` child orphans its running ``sleep`` (the trailing ``:`` stops bash
+    from exec-ing it), so the group is signalled instead and nothing outlives the test.
+    """
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, start_new_session=True)
+    test_case.addCleanup(_kill_group, proc)
+    return proc
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)  # leader not yet reaped, so its pid still names the group
+    except (ProcessLookupError, PermissionError):
+        pass
+    proc.wait()

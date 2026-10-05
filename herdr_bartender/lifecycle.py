@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Optional, Tuple
 
+from .cache import ORPHAN_MIRROR_OWED, mirror_copy
 from .delivery_state import RETRY_DELAYS, foreign_lease_open, resync_live_sessions
 from .log import log_debug
 from .process import known_start_time, start_times_differ
@@ -296,6 +297,11 @@ def horizon_exports(data: dict, now: float) -> Tuple[Tuple[str, dict], ...]:
     return tuple((sid, dict(record)) for sid, record in _sessions(data) if past_horizon(record, now))
 
 
+def mirror_owed_records(data: dict) -> Tuple[Tuple[str, dict], ...]:
+    """(sid, record copy) for every record flagged ``ORPHAN_MIRROR_OWED`` (R52: its orphan export is not durable)."""
+    return tuple((sid, dict(record)) for sid, record in _sessions(data) if record.get(ORPHAN_MIRROR_OWED) is True)
+
+
 def all_sessions(data: dict) -> Tuple[Tuple[str, dict], ...]:
     """(sid, record copy) for every cached session (the terminal absence horizon exports them all)."""
     return tuple((sid, dict(record)) for sid, record in _sessions(data))
@@ -303,7 +309,7 @@ def all_sessions(data: dict) -> Tuple[Tuple[str, dict], ...]:
 
 def orphan_record(record: Mapping) -> dict:
     """The orphan-file copy of an unconfirmed session: replayed as an Ended (Plan §9.2)."""
-    return {**record, "desired_state": "Ended", "orphaned_ended": True}
+    return mirror_copy(dict(record), desired_state="Ended", orphaned_ended=True)
 
 
 def same_record(current: Optional[Mapping], exported: Mapping) -> bool:

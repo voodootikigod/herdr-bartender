@@ -3,11 +3,12 @@
 import unittest
 from unittest import mock
 
-from herdr_bartender import background
+from herdr_bartender import background, handoff
 from herdr_bartender.cache import CacheReadError, LockTimeout
 from herdr_bartender.schedule import CacheView, IDLE_EXIT_SECONDS
 from herdr_bartender.snapshot import Instance, ProcessSnapshot
 from tests.support import SandboxTestCase
+from tests.support.reconciler_fixtures import seed, session
 
 BUSY_LOOP_GUARD = 50
 PRESENT = ProcessSnapshot(bartender=Instance(4242, "1", True), herdr=Instance(4343, "1", True), herdr_alive=True)
@@ -112,6 +113,54 @@ class LostWakeupTests(ReconcilerLoopCase):
         self._exit_idle(flag_while_exiting=False)
         self.assertEqual(self.spawner.calls, [])
         self.assertGreaterEqual(self.clock.time() - start, IDLE_EXIT_SECONDS, "idle exit only after 60s")
+
+    def _admit_and_deliver(self, pane):
+        """An event in the exit window: Step A admits a session, Step C confirms it (hand_off False), and the
+        finish's ensure_watchdog() probes reconciler.lock - still held by the exiting reconciler - so it neither
+        spawns nor touches reconciler.pending."""
+        seed(self.cache_mgr, {self.sid(pane): session(pane, now=self.clock.time())})
+        self.assertFalse(handoff.ensure_reconciler_running(), "the singleton is still busy")
+        self.assertFalse(self.pending.exists())
+
+    def test_session_delivered_in_the_exit_window_starts_a_successor(self):
+        """Plan §10.1 #11 / §5.1 item 5. Finding (lost wake-up at idle exit): a session admitted and delivered after the final pass read its view,
+        while reconciler.lock is still held, must not be left without a reconciler (marker heartbeat, TTLs)."""
+        real_release = background._release_singleton
+
+        def release(lock_fd):
+            self._admit_and_deliver("w1:pExitWindow")
+            real_release(lock_fd)
+
+        with mock.patch.object(background, "_sweep_pass", return_value=outcome()), \
+                mock.patch.object(background, "_release_singleton", side_effect=release):
+            background.run_reconcile_background()
+        self.assertEqual(len(self.spawner.calls), 1, "the exiting reconciler starts a successor")
+        self.assertEqual(self.spawner.in_critical_section, [False])
+
+    def test_session_admitted_before_the_idle_exit_keeps_the_loop_running(self):
+        """The idle decision re-reads the cache: a session admitted after the pass's view keeps this reconciler."""
+        real_idle_expired = background.idle_expired
+        injected, sweeps_after = [], []
+
+        def idle_expired(state, now):
+            expired = real_idle_expired(state, now)
+            if expired and not injected:
+                injected.append(now)
+                self._admit_and_deliver("w1:pLateAdmit")
+            return expired
+
+        def sweep(*_args):
+            if injected:
+                sweeps_after.append(self.clock.time())
+                (self.state_dir / "DISABLED").touch()   # end the run after the pass that follows
+            return outcome()
+
+        with mock.patch.object(background, "_sweep_pass", side_effect=sweep), \
+                mock.patch.object(background, "idle_expired", side_effect=idle_expired):
+            background.run_reconcile_background()
+        self.assertEqual(len(injected), 1)
+        self.assertEqual(len(sweeps_after), 1, "the loop ran another pass instead of exiting idle")
+        self.assertEqual(self.spawner.calls, [])
 
 
 if __name__ == "__main__":

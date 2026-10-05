@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
+from . import jsonsafe
 from .intake import EVENT_NAMES, PANE_CLOSED, TAB_CLOSED, WORKSPACE_CLOSED, is_agent_exit_signal
 from .log import log_debug
 from .paths import PRIVATE_FILE_MODE, ensure_private_dir
@@ -70,7 +71,7 @@ def is_close_envelope(env: object) -> bool:
 def read_json(path: Path) -> object:
     """Decode a JSON file; raises OSError or ValueError."""
     with open(path, "rb") as f:
-        return json.loads(f.read())
+        return jsonsafe.loads(f.read())
 
 
 def write_json_atomic(path: Path, obj: object) -> None:

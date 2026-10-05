@@ -291,6 +291,31 @@ class SanitizeTests(unittest.TestCase):
         self.assertEqual(len(sanitize.sanitize_title("t" * 500)), 120)
         self.assertEqual(sanitize.sanitize_title(12), "12")
 
+    def test_bidi_and_invisible_format_characters_are_stripped(self):
+        """R47 (low finding): a terminal-set title, agent or cwd cannot spoof Top Shelf with Unicode bidi overrides
+        (Trojan-Source style reordering), zero-width/invisible format characters, tag characters or line/paragraph
+        separators. ZWJ/ZWNJ stay (emoji sequences and Indic/Persian shaping need them)."""
+        self.assertEqual(sanitize.sanitize_title("build \u202eexe.txt\u202c ok"), "build exe.txt ok")
+        self.assertEqual(sanitize.sanitize_title("a\u2066b\u2067c\u2068d\u2069e\u200ef\u200fg\u061ch"), "abcdefgh")
+        self.assertEqual(sanitize.sanitize_title("\ufeffz\u200bw\u2060s\u00adp\u2028l\u2029x"), "zwsplx")
+        self.assertEqual(sanitize.sanitize_title("hi\U000e0041\U000e0042\U000e007f"), "hi")
+        family = "\U0001f468\u200d\U0001f469\u200d\U0001f467"
+        self.assertEqual(sanitize.sanitize_title(f"team {family}"), f"team {family}")
+        self.assertEqual(sanitize.sanitize_title("ab\u200cc"), "ab\u200cc")
+        self.assertEqual(sanitize.format_agent_name("\u202eedoc\u202c"), "Edoc (Herdr)")
+        self.assertEqual(sanitize.sanitize_cwd("/tmp/\u202egpj.sh"), "/tmp/gpj.sh")
+
+    def test_every_format_or_separator_character_is_stripped(self):
+        """R47: every Unicode Cf/Zl/Zp code point this Python knows (except ZWJ/ZWNJ) is removed by the shared helper.
+        A failure on a newer Python names a format character a later Unicode version added to INVISIBLE_RE's list."""
+        import sys
+        import unicodedata
+        kept = {"\u200c", "\u200d"}
+        missed = [f"U+{cp:04X}" for cp in range(sys.maxunicode + 1)
+                  if unicodedata.category(chr(cp)) in ("Cf", "Zl", "Zp") and chr(cp) not in kept
+                  and sanitize.strip_terminal_controls(f"a{chr(cp)}b") != "ab"]
+        self.assertEqual(missed, [])
+
     def test_format_agent_name_sanitized(self):
         """Plan §2.3 agent row (gap agent-sanitization): OSC-injected and 200-char agents are cleaned, <= 64 chars."""
         self.assertEqual(sanitize.format_agent_name("\x1b]0;pwn\x07claude"), "Claude (Herdr)")
@@ -317,6 +342,18 @@ class HostAndSessionIdTests(unittest.TestCase):
             self.assertEqual(sanitize.sanitized_hostname(), "h" * 32)
         with mock.patch("herdr_bartender.sanitize.socket.gethostname", return_value="!!!.lan"):
             self.assertEqual(sanitize.sanitized_hostname(), "local")
+
+    def test_host_is_the_first_dns_label(self):
+        """R46 (low finding, documented deviation from the §2.3 formula): the domain suffix is dropped, as in the
+        pre-package monolith, so session ids neither change across the upgrade nor with the network-dependent
+        suffix macOS appends (.local, .lan, .attlocal.net). config and intake agree."""
+        from herdr_bartender import config
+        for raw, host in (("Chris-MacBook-Pro.local", "chris-macbook-pro"), ("Chris-MacBook-Pro.lan", "chris-macbook-pro"),
+                          ("dev_box", "dev_box"), (".hidden", "local")):
+            with self.subTest(raw=raw):
+                with mock.patch("socket.gethostname", return_value=raw):
+                    self.assertEqual(sanitize.sanitized_hostname(), host)
+                    self.assertEqual(config.get_sanitized_hostname(), host)
 
     def test_pinned_host_revalidated(self):
         """Plan §2.3 session_id row (gap hostname-truncation): an invalid pinned host falls back to the current host."""

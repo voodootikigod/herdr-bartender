@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+import sys
 import time
 import unittest
 import urllib.error
@@ -15,7 +16,8 @@ from herdr_bartender.markers import touch_pane_failed
 from herdr_bartender.paths import get_orphan_path, get_state_dir, get_vendor_hooks_dir
 from herdr_bartender.process import get_bartender_pid, get_herdr_pid, get_process_start_time, own_start_time
 from herdr_bartender.sanitize import get_hex_pane_id
-from tests.support import SHIM_DIR, SandboxTestCase
+from tests.support import REPO_ROOT, SHIM_DIR, SandboxTestCase
+from tests.support.guard_harness import spawn_group
 
 
 class SandboxIsolationTests(SandboxTestCase):
@@ -35,6 +37,77 @@ class SandboxIsolationTests(SandboxTestCase):
         self.assertEqual(runtime.PROCESS_DEADLINE_SECONDS, 60.0)
         self.assertFalse(runtime.IN_CRITICAL_SECTION)
         self.assertFalse(runtime.PENDING_WATCHDOG_EXIT)
+
+
+class SuiteHygieneTests(SandboxTestCase):
+    """Gate finding: tests outside SandboxTestCase must not write under $HOME; spawned groups must not orphan."""
+
+    start_bridge = False
+
+    def test_unsandboxed_test_classes_never_write_under_home(self):
+        """Every discovered test that is not a SandboxTestCase runs with an empty HOME and no state-dir overrides;
+        HOME stays empty (the plugin.log fallback is $HOME/.local/state/..., i.e. the developer's real home)."""
+        ids = unsandboxed_test_ids()
+        self.assertTrue(ids, "control: some plain unittest.TestCase tests exist")
+        home = self.tmp / "plain-home"
+        home.mkdir()
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("HERDR_", "NOTCHBAR_")) and k != "XDG_STATE_HOME"}
+        env["HOME"] = str(home)
+        res = subprocess.run([sys.executable, "-m", "unittest", *ids], cwd=str(REPO_ROOT), env=env,
+                             capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
+        self.assertEqual(res.returncode, 0, res.stderr[-4000:])
+        self.assertEqual(sorted(str(p.relative_to(home)) for p in home.rglob("*")), [])
+
+    def test_spawn_group_cleanup_reaps_grandchildren(self):
+        """A `bash -c "sleep N; :"` child keeps bash as the parent of sleep; killing only bash orphans the sleep.
+        spawn_group's cleanup signals the whole process group, so the grandchild dies too."""
+        pid_file = self.tmp / "grandchild.pid"
+
+        class _Inner(unittest.TestCase):
+            def runTest(inner):
+                spawn_group(inner, ["bash", "-c", f"sleep 30 & echo $! > '{pid_file}'; wait; :"])
+                deadline = time.monotonic() + 5
+                while not pid_file.exists() or not pid_file.read_text().strip():
+                    if time.monotonic() > deadline:
+                        inner.fail("grandchild pid never written")
+                    time.sleep(0.02)
+
+        result = unittest.TestResult()
+        _Inner().run(result)
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        grandchild = int(pid_file.read_text())
+        deadline = time.monotonic() + 5
+        while _pid_alive(grandchild) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(_pid_alive(grandchild), "the grandchild sleep outlived the test")
+
+
+def unsandboxed_test_ids() -> list:
+    suite = unittest.defaultTestLoader.discover(str(REPO_ROOT / "tests"), top_level_dir=str(REPO_ROOT))
+    ids = []
+
+    def walk(node):
+        for item in node:
+            if isinstance(item, unittest.TestSuite):
+                walk(item)
+            elif not isinstance(item, SandboxTestCase):
+                ids.append(item.id())
+
+    walk(suite)
+    return sorted(ids)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    # A zombie still answers kill(0); treat one whose state is Z as gone.
+    res = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+    return bool(res.stdout.strip()) and not res.stdout.strip().startswith("Z")
 
 
 class ShimTests(SandboxTestCase):
@@ -58,6 +131,18 @@ class ShimTests(SandboxTestCase):
         self.assertEqual(res.stdout.split(), [str(herdr_pid)])
         expected = str(int(time.mktime(time.strptime("Sat Oct 4 08:00:00 2026", "%a %b %d %H:%M:%S %Y"))))
         self.assertEqual(get_process_start_time(bart_pid), expected)
+
+    def test_pgrep_shim_models_bsd_ancestor_exclusion(self):
+        """macOS pgrep never matches the caller's ancestors unless -a is given (procps mode excludes nothing)."""
+        pid = self.add_fake_process("herdr", pid=424300, comm="herdr", cmdline="herdr server", ancestor=True)
+        self.assertEqual(subprocess.run(["pgrep", "-xi", "herdr"], capture_output=True, text=True).returncode, 1)
+        res = subprocess.run(["pgrep", "-a", "-xi", "herdr"], capture_output=True, text=True)
+        self.assertEqual((res.returncode, res.stdout.split()), (0, [str(pid)]))
+        (self.sandbox / "pgrep.procps").write_text("")
+        res = subprocess.run(["pgrep", "-xi", "herdr"], capture_output=True, text=True)
+        self.assertEqual(res.stdout.split(), [str(pid)])
+        res = subprocess.run(["pgrep", "-a", "-xi", "herdr"], capture_output=True, text=True)
+        self.assertEqual(res.stdout.strip(), f"{pid} herdr server")
 
     def test_ps_delegates_for_real_processes(self):
         """Unregistered PIDs (this test process) still get their genuine start time."""

@@ -23,17 +23,20 @@ triggers (``.vendor_active``, ``.failed``) do not apply to it (R24, see ``dismis
 Other confirmed Endeds (TTL, agent exit, Herdr dead/restart, --cleanup) do not set it.
 The queue holds at most ``DISMISSED_VENDOR_CAP`` (64) entries; staging a new one
 prunes the oldest.
+
+R35: while Herdr is dead or the integration is off (``DISABLED``/``NO_HOOKS``) the vendor
+fallback is the live representation, so step 1 cancels the cleanup instead (the pending
+entry is dropped; ``.vendor_active`` is neither read nor unlinked; nothing is sent).
 """
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
-from . import clock, runtime
+from . import clock, jsonsafe, runtime
 from .bridge import DEFAULT_EVENT_TIMEOUT, DeliveryResult, send_event
 from .cache import BoundedSessionCache, CacheError, IntegrationDisabled
 from .cache_schema import DISMISSED_VENDOR_CAP
@@ -41,6 +44,7 @@ from .config import VENDOR_UUID_REGEX
 from .delivery_state import clear_pending_vendor_cleanup
 from .log import log_debug, log_warning
 from .paths import get_state_dir
+from .process import is_herdr_alive, memoised_herdr_alive
 from .sanitize import get_hex_pane_id
 
 VENDOR_ACTIVE_SUFFIX = ".vendor_active"
@@ -52,10 +56,15 @@ NETWORK_RESERVE_SECONDS = 0.3
 
 @dataclass(frozen=True)
 class VendorFile:
-    """A ``.vendor_active`` file as read under the cache lock (``content`` None: unreadable)."""
+    """A ``.vendor_active`` file as read under the cache lock (``content`` None: unreadable).
+
+    ``identity`` is ``(st_ino, st_mtime_ns)`` of the bytes read: the guard refreshes an unchanged
+    record (mktemp + ``mv -f``, then ``touch``), which only the identity shows.
+    """
 
     path: Path
     content: Optional[bytes]
+    identity: Optional[Tuple[int, int]] = None
 
 
 @dataclass(frozen=True)
@@ -82,13 +91,15 @@ def vendor_active_path(pane_id: str) -> Path:
 
 
 def read_vendor_file(path: Path) -> Optional[VendorFile]:
-    """The file and the bytes read now; None when it does not exist."""
+    """The file, the bytes read now and their identity; None when it does not exist."""
     try:
-        return VendorFile(path, path.read_bytes())
+        with open(path, "rb") as handle:
+            stat = os.fstat(handle.fileno())
+            return VendorFile(path, handle.read(), (stat.st_ino, stat.st_mtime_ns))
     except FileNotFoundError:
         return None
     except OSError as exc:
-        log_debug(f"Unreadable {path.name} ({exc}); treating it as a bare touch")
+        log_debug(f"Unreadable {path.name} ({exc}); treating it as a bare touch, but never retiring it")
         return VendorFile(path, None)
 
 
@@ -102,7 +113,7 @@ def parse_vendor_uuid(record: VendorFile) -> Optional[str]:
     if not text.startswith("{"):
         return None
     try:
-        parsed = json.loads(text)
+        parsed = jsonsafe.loads(text)
     except ValueError:
         return None
     uuid = parsed.get("vendor_session_id") if isinstance(parsed, dict) else None
@@ -146,10 +157,15 @@ def _put_back(claimed: Path, path: Path) -> None:
 def retire_vendor_file(record: VendorFile) -> None:
     """Unlink the record read under the lock (outside it, after the save), never a newer one.
 
-    The guard rewrites ``.vendor_active`` without the cache lock (mktemp + ``mv -f``), so
-    the file is first claimed by an atomic rename; claimed bytes that differ from what
-    was read (and queued) belong to a newer record, which is put back.
+    A record that could not be read is left in place (its bytes and identity were never observed). The guard
+    rewrites ``.vendor_active`` without the cache lock (mktemp + ``mv -f``), so the file is first claimed by an
+    atomic rename; a claimed file whose bytes OR identity
+    (inode, mtime) differ from what was read (and queued) is a newer record - possibly the
+    same UUID refreshed by a pass-through, i.e. a live vendor fallback - and is put back.
     """
+    if record.content is None:   # never observed: whatever is there now may be a newer record (gate, round 11)
+        log_warning(f"{record.path.name} could not be read; it is left in place, not retired")
+        return
     claimed = _claimed_path(record.path)
     try:
         os.rename(record.path, claimed)
@@ -158,11 +174,16 @@ def retire_vendor_file(record: VendorFile) -> None:
     except OSError as exc:
         log_warning(f"Could not claim {record.path.name} for removal: {exc}")
         return
-    if record.content is not None:
-        current = read_vendor_file(claimed)
-        if current is None or current.content != record.content:
-            _put_back(claimed, record.path)
+    if _rewritten_since(record, read_vendor_file(claimed)):
+        _put_back(claimed, record.path)
     _discard(claimed)
+
+
+def _rewritten_since(record: VendorFile, current: Optional[VendorFile]) -> bool:
+    """The claimed file is not the one ``record`` read (a rename keeps the inode and mtime)."""
+    if current is None or current.content != record.content:
+        return True
+    return record.identity is not None and current.identity != record.identity
 
 
 def pending_vendor_panes(data: dict) -> Tuple[str, ...]:
@@ -207,13 +228,48 @@ def _closed_panes(data: dict) -> frozenset:
     return frozenset(e.get("pane_id") for e in entries if isinstance(e, dict) and e.get("is_pane_closed"))
 
 
+def fallback_protected(state_dir: Optional[Path] = None) -> bool:
+    """R35: the vendor fallback is the live representation, so no cleanup may dismiss or unlink it.
+
+    True while the integration is off (``DISABLED``, ``NO_HOOKS``: vendor hooks run unguarded) or Herdr is
+    confirmed dead (Plan §3.2 Codex row item 3: ``.vendor_active`` is kept until Herdr recovers, the pane
+    closes or a vendor session-terminal event unlinks it). Safe under the cache lock: Herdr liveness comes
+    from the 0.5s memo only, which callers that may run while Herdr is dead warm before locking.
+    """
+    directory = Path(state_dir) if state_dir is not None else get_state_dir()
+    if (directory / "DISABLED").exists() or (directory / "NO_HOOKS").exists():
+        return True
+    return not memoised_herdr_alive()
+
+
+def warm_fallback_probe() -> None:
+    """Resolve Herdr liveness before the cache lock (memoised 0.5s) for ``fallback_protected`` under it.
+
+    For callers that may run while Herdr is dead (the reconciler, --cleanup); the event path runs because
+    Herdr invoked it, so it relies on whatever is memoised (not memoised counts as alive).
+    """
+    is_herdr_alive()
+
+
+def _cancel_cleanups(data: dict, panes: Sequence[str]) -> VendorResolution:
+    """R35: drop the panes' pending cleanups without touching ``.vendor_active`` or queueing a dismissal."""
+    resolved = [pane for pane in dict.fromkeys(p for p in panes if p) if pane in pending_vendor_panes(data)]
+    for pane in resolved:
+        clear_pending_vendor_cleanup(data, pane)
+    if panes:
+        log_debug(f"Vendor fallback protected (Herdr dead / integration off): cleanup of {list(panes)} cancelled")
+    return VendorResolution(resolved_panes=tuple(resolved))
+
+
 def resolve_vendor_cleanups(data: dict, panes: Sequence[str], now: float,
                             closed_panes: Sequence[str] = ()) -> VendorResolution:
     """Under the cache lock: queue each pane's vendor dismissal and clear its pending cleanup entry.
 
     A pane closed by this request (``closed_panes``, or a persisted ``is_pane_closed`` entry) marks its
-    queued dismissal ``pane_closed``.
+    queued dismissal ``pane_closed``. While ``fallback_protected()`` the cleanups are cancelled instead (R35).
     """
+    if panes and fallback_protected():
+        return _cancel_cleanups(data, panes)
     dismissals, unlink, resolved = [], [], []
     closed = _closed_panes(data) | frozenset(closed_panes)
     for pane in dict.fromkeys(p for p in panes if p):
@@ -287,6 +343,7 @@ def cleanup_vendor_active(pane_id: str, raw_pane_id: Optional[str] = None, is_pa
     if not pane_id:
         return
     cache_mgr = BoundedSessionCache(get_state_dir(), check_disabled=True)
+    warm_fallback_probe()
     try:
         with cache_mgr as data:
             resolution = resolve_vendor_cleanups(data, (pane_id,), clock.time(),

@@ -1,11 +1,14 @@
 """active-sessions.json schema v4 (Plan §4.2, §4.3): fresh caches and migration of older ones.
 
-Pure functions: nothing here touches the filesystem or the lock.
+Pure functions: nothing here touches the filesystem or the lock (``cache_fields`` may log a dropped field).
 """
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Dict, Iterable
+
+from .cache_fields import sane_cache_fields
 
 SCHEMA_VERSION = 4
 SALVAGE_EPOCH_FLOOR = 1_700_000_000   # Plan §6.3 step 4: epoch-dominating salvage generation floor
@@ -77,8 +80,12 @@ def _cap_dismissed(dismissed: dict) -> dict:
         return dismissed
 
     def stamp(item) -> float:
-        meta = item[1]
-        return meta.get("timestamp", 0) if isinstance(meta, dict) else 0
+        """Total sort key: an unusable stamp (missing, non-numeric, NaN) sorts oldest, never raises."""
+        value = item[1].get("timestamp") if isinstance(item[1], dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return float("-inf")
+        number = float(value)
+        return number if math.isfinite(number) else float("-inf")
 
     newest = sorted(dismissed.items(), key=stamp)[-DISMISSED_VENDOR_CAP:]
     return dict(newest)
@@ -110,4 +117,4 @@ def normalize_cache(raw: object, current_host: Callable[[], str]) -> dict:
     if not isinstance(data.get("host"), str) or not data["host"]:
         data["host"] = current_host()
     data["version"] = SCHEMA_VERSION
-    return data
+    return sane_cache_fields(data)   # R55: wrong-typed known fields are dropped before any code coerces them

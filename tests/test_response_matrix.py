@@ -101,14 +101,16 @@ class ResponseMatrixTests(MatrixCase):
 
     def test_p08_retryable_rows(self):
         """Plan §10.1 #8 (complement): 5xx and network failures stay in_flight, touch .failed, and hand off to the
-        reconciler with no inline retry."""
+        reconciler. A status send is not retried inline; an Ended gets its single minimal retry (R45: Step B L479
+        retries an Ended "on failure or rejection"), here failing the same way, so the retryable bookkeeping holds."""
         for kind in ("Waiting", "Ended"):
             for row, (status, body, error, delay) in RETRYABLE.items():
                 with self.subTest(kind=kind, row=row):
                     pane = f"w1:pRt{kind}{row}"
                     self._admit(pane)
                     self.spawner.reset()
-                    self.bridge.enqueue(status, body, delay=delay)
+                    for _ in range(2 if kind == "Ended" else 1):
+                        self.bridge.enqueue(status, body, delay=delay)
                     self._send(kind, pane)
                     s = self._session(pane)
                     self.assertEqual((s["delivery_status"], s["delivery_error"], s["delivery_attempts"]),
@@ -116,7 +118,11 @@ class ResponseMatrixTests(MatrixCase):
                     self.assertLess(s.get("delivered_seq", 0), s["seq"])
                     self.assertTrue(self._failed(pane).exists())
                     self.assertFalse(self._marker(pane).exists())
-                    self.assertEqual(len(self._posts(pane)), 2, "no inline retry of a retryable failure")
+                    self.assertEqual(len(self._posts(pane)), 3 if kind == "Ended" else 2,
+                                     "admission + primary (+ the Ended's one minimal retry), never more")
+                    if kind == "Ended":
+                        self.assertEqual(self._posts(pane)[-1], {"state": "Ended", "agent": "Herdr",
+                                                                  "session_id": self.sid(pane)})
                     self.assertEqual(len(self.spawner.calls), 1, "handed to the reconciler")
                     with self.cache_mgr as data:
                         data["consecutive_failures"] = 0

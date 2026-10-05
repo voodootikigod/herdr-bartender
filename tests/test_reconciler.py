@@ -16,8 +16,8 @@ from herdr_bartender.background import run_reconcile_background
 from herdr_bartender.handlers import handle_agent_status_changed
 from herdr_bartender.paths import get_orphan_path
 from herdr_bartender.reconciler import reconcile_active_sessions
-from herdr_bartender.schedule import CacheView
-from herdr_bartender.snapshot import Instance, ProcessSnapshot
+from herdr_bartender.schedule import CacheView, LoopState
+from herdr_bartender.snapshot import Instance, ProcessSnapshot, take_snapshot
 from tests.support import SandboxTestCase
 from tests.support.reconciler_fixtures import LoopRunner, pane_file, read_cache, seed, session
 
@@ -102,6 +102,29 @@ class IdleExitTests(LoopCase):
                 for leftover in (self.state_dir / "DISABLED", self.state_dir / "DELIVERY_DOWN", get_orphan_path()):
                     leftover.unlink(missing_ok=True)
                 self.bridge.health_ok, self.bridge.return_code = True, 200
+
+    def test_bartender_not_running_lets_an_empty_loop_idle_out(self):
+        """Low finding / R40: with Bartender confirmed absent (Herdr up) and nothing cached, owed or queued, the
+        startup-spawned reconciler idles out after 60s instead of polling the process table forever. An unknown
+        Bartender probe, a session or DELIVERY_DOWN still keep it alive."""
+        snap = lambda bartender: ProcessSnapshot(bartender=bartender, herdr=Instance(2, "1", True))
+        absent, unknown = Instance(None, None, True), Instance(None, None, False)
+        idle = lambda bartender, sessions=0: background._idle_now(
+            self.state_dir, background.PassOutcome(snap(bartender), CacheView(sessions=sessions), False))
+        self.assertTrue(idle(absent))
+        self.assertFalse(idle(unknown), "a failed probe is no information")
+        self.assertFalse(idle(absent, sessions=1))
+        (self.state_dir / "DELIVERY_DOWN").touch()
+        self.assertFalse(idle(absent))
+        (self.state_dir / "DELIVERY_DOWN").unlink()
+        self.clear_fake_processes()
+        self.set_herdr_alive()
+        process.reset_caches()
+        start = self.clock.time()
+        runner = LoopRunner(self.state_dir, stop=lambda: self.clock.time() - start > 600)
+        runner.run(bridge_url=self.mock_url)
+        self.assertFalse((self.state_dir / "DISABLED").exists(), "the loop ended by idling out")
+        self.assertLess(self.clock.time() - start, 61.0)
 
     def test_owed_side_effects_alone_keep_the_loop_from_idling(self):
         """Plan §5.1 item 11: no session, a healthy bridge, but a compensation/cleanup/dismissal still owed."""
@@ -216,6 +239,33 @@ class AbsenceTests(LoopCase):
             run_reconcile_background(bridge_url=self.mock_url)
         after = [(round(t - back_at[0], 1), kind) for t, kind in calls if t > back_at[0]]
         self.assertEqual(after[0], (0.5, "sweep"), after)
+
+    def _advance_with_real_probe(self):
+        process.reset_caches()
+        snap = take_snapshot(self.state_dir)
+        outcome = self._pass_outcome(snap)
+        step = background._Step(outcome, True)
+        return snap, outcome, background._advance(self.state_dir, LoopState(), step, frozenset())
+
+    def test_failed_bartender_probe_is_unknown_not_absent(self):
+        """Round-2 finding (tests): a failing/hung ``pgrep`` for Bartender is no information (snapshot.Instance.known
+        False). It must not start the absence clocks (``absent_since`` = terminal-horizon origin, ``backoff_since`` =
+        300s backoff) nor count as a settled bridge for the R40 idle exit. Control: a working probe that finds no
+        Bartender process does start both clocks."""
+        (self.sandbox / "pgrep.fail").touch()
+        snap, outcome, state = self._advance_with_real_probe()
+        self.assertEqual((snap.bartender.pid, snap.bartender.known, snap.bartender.absent), (None, False, False))
+        self.assertEqual((state.absent_since, state.backoff_since), (None, None), "an unknown probe changes nothing")
+        self.assertFalse(background._bridge_settled(outcome), "an unknown Bartender never settles the bridge")
+
+        (self.sandbox / "pgrep.fail").unlink()
+        self.clear_fake_processes()
+        self.set_herdr_alive()
+        snap, outcome, state = self._advance_with_real_probe()
+        self.assertTrue(snap.bartender.absent, "the probe worked and found no Bartender")
+        now = self.clock.time()
+        self.assertEqual((state.absent_since, state.backoff_since), (now, now))
+        self.assertTrue(background._bridge_settled(outcome))
 
     def test_terminal_horizon_exports_evicts_and_exits(self):
         """Plan §5.1 item 11 (gap terminal-horizon-no-evict): Bartender absent >12h (43200s, strictly) and Herdr dead -
@@ -350,6 +400,22 @@ class DrainTests(LoopCase):
         run_reconcile_background(bridge_url=self.mock_url, loop_once=True)
         self.assertEqual(self.bridge.events_for(sid), [])
         self.assertEqual(read_cache(self.cache_mgr)["pending_compensations"], [])
+
+    def test_p54_live_session_with_same_or_unknown_generation_aborts(self):
+        """Plan §10.1 #54 (round-3 finding): the live-state half of the re-verification has its own test. With the
+        entry's generation equal to the live session's, or unknown (None: stage_compensation falls back to a pruned
+        pane generation), only the "a live session owns the session id" check stops the compensating Ended - the
+        generation clause never fires. Nothing is POSTed (no Ended to a live Top Shelf entry) and the entry is purged."""
+        for label, target in (("same", 2), ("unknown", None)):
+            with self.subTest(generation=label):
+                pane = f"w1:pLive{label}"
+                sid = self.sid(pane)
+                entry = {**self._comp(sid, target), "pane_id": pane}
+                self._seed_comp(entry, {sid: session(pane, now=self.clock.time(), generation=2)})
+                run_reconcile_background(bridge_url=self.mock_url, loop_once=True)
+                self.assertEqual(self.bridge.events_for(sid), [], "no POST for a live session")
+                self.assertEqual(read_cache(self.cache_mgr)["pending_compensations"], [])
+                self.assertEqual(self.sessions()[sid]["desired_state"], "Working")
 
     def test_p54_readmission_raced_during_the_send_forces_resync(self):
         """Plan §10.1 #54: a session admitted while the compensating Ended is in flight is re-synced."""

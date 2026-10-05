@@ -31,12 +31,13 @@ from .envelopes import (
     validate_envelope,
     write_json_atomic,
 )
-from .intake import PANE_CLOSED, STATUS_EVENT, resolve_identity
+from .intake import PANE_CLOSED, STATUS_EVENT, container_id, resolve_identity
 from .log import log_debug, log_warning
 from .paths import ensure_private_dir, get_state_dir
 from .process import is_herdr_alive, memoised_herdr_alive
 from .handoff import ensure_reconciler_running, touch_reconciler_pending
-from .staging import stage_container_close, stage_pane_close, stage_status
+from .markers import remove_pane_marker
+from .staging import stage_container_close, stage_pane_close_result, stage_status
 
 SPOOL_CAP = 100
 REPLAY_BATCH = 16
@@ -68,9 +69,13 @@ def spool_dir(state_dir: Optional[Path] = None) -> Path:
 
 # -- enqueue ---------------------------------------------------------------------------
 def _with_env_workspace(event_data: dict) -> dict:
-    """R1: freeze this process's HERDR_WORKSPACE_ID into a colon-less pane event (the replayer's env differs)."""
+    """R1: freeze this process's HERDR_WORKSPACE_ID into a colon-less pane event (the replayer's env differs).
+
+    Live intake falls back to it when the event's ``workspace_id`` is missing OR invalid (R1/R2), so both are
+    replaced; a valid event workspace is kept.
+    """
     pane, ws = event_data.get("pane_id"), os.environ.get(WORKSPACE_ENV)
-    if isinstance(pane, str) and ":" not in pane and not event_data.get("workspace_id") and ws:
+    if isinstance(pane, str) and ":" not in pane and not container_id(event_data, "workspace_id") and ws:
         return {**event_data, "workspace_id": ws}
     return dict(event_data)
 
@@ -136,12 +141,16 @@ def apply_envelope_locked(data: dict, env: dict, herdr_alive: Callable[[], bool]
         if identity is None:
             return ()
         if name == PANE_CLOSED:
-            return tuple(t.session_id for t in stage_pane_close(data, identity.canonical_pane, event_data,
-                                                                arrival_ns, generation))
+            closed = stage_pane_close_result(data, identity.canonical_pane, event_data, arrival_ns, generation,
+                                             herdr_alive=herdr_alive)
+            if closed.recorded:   # Plan §1 L59: the marker goes under the close's lock
+                remove_pane_marker(identity.canonical_pane)
+            return tuple(t.session_id for t in closed.targets)
         stage = stage_status(data, identity, event_data, context, arrival_ns, herdr_alive=herdr_alive,
                              spool_generation=generation, require_newer=True)
         return (stage.session_id,) if stage.staged else ()
-    return tuple(t.session_id for t in stage_container_close(data, name, event_data, arrival_ns, generation))
+    return tuple(t.session_id for t in stage_container_close(data, name, event_data, arrival_ns, generation,
+                                                             herdr_alive=herdr_alive))
 
 
 def _replay_one(data: dict, path: Path, bad_dir: Path, herdr_alive: Callable[[], bool]) -> Optional[Tuple[str, ...]]:

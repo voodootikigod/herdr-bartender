@@ -20,12 +20,14 @@ that is not saved therefore never loses the flag that makes the next confirmatio
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import asdict, dataclass, replace
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 from . import clock
-from .log import log_debug
+from .cache import ORPHAN_MIRROR_OWED, mirror_copy
+from .log import log_debug, log_warning
 from .markers import (
     clear_delivery_down,
     clear_pane_failed,
@@ -35,7 +37,7 @@ from .markers import (
     touch_pane_failed,
     touch_pane_marker,
 )
-from .orphans import run_orphan_io
+from .orphans import flush_pending_orphan_ops, journal_orphan_exports, run_orphan_io
 
 STATUS_SUCCESS = "success"
 STATUS_NON_RETRYABLE = "non_retryable"
@@ -209,9 +211,10 @@ def _num(value: object) -> float:
     if isinstance(value, bool):
         return 0.0
     try:
-        return float(value or 0.0)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+        number = float(value or 0.0)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
         return 0.0
+    return number if math.isfinite(number) else 0.0
 
 
 def record_tombstone(data: dict, pane: str, closed_at_ns: int, closed_source_ts: float,
@@ -428,7 +431,7 @@ def _orphan_if_ended(session: dict, tx: Transmission, desired: bool, now: float)
     session["orphaned_ended"] = True
     if not isinstance(session.get("orphaned_at"), (int, float)) or isinstance(session.get("orphaned_at"), bool):
         session["orphaned_at"] = now
-    return ((tx.session_id, dict(session)),)
+    return ((tx.session_id, mirror_copy(session)),)
 
 
 def _apply_non_retryable(data: dict, session: dict, tx: Transmission, outcome: Outcome,
@@ -541,12 +544,58 @@ def commit_delivery_down(effects: StagedEffects) -> None:
         clear_delivery_down()
 
 
-def run_orphan_effects(effects: StagedEffects, blocking: bool = False) -> None:
+def journal_owed_exports(effects: StagedEffects, data: dict) -> bool:
+    """Under the cache lock, BEFORE the save that marks them ``orphaned_ended``: journal the owed exports durably.
+
+    ``orphaned_ended`` makes a record evictable at the 256 cap without another export (``cache.safe_to_evict``),
+    so a crash between that save and the export after the lock would drop the owed Ended. The fsynced R10 journal
+    entry closes that window (the Step A pattern); a save that then fails leaves only a harmless duplicate mirror.
+    False (nothing journaled): no exports, or the journal failed; ``run_orphan_effects`` then exports after the save
+    and the records stay flagged ``ORPHAN_MIRROR_OWED`` in ``data`` (not cap-evictable) - see
+    ``journal_exports_before_save``.
+    """
+    return journal_exports_before_save(data, effects.orphans_to_export)
+
+
+def journal_exports_before_save(data: dict, exports: Tuple[Tuple[str, dict], ...]) -> bool:
+    """Journal ``exports`` (fsynced, no orphan lock) before the save that marks them; True when journaled.
+
+    On failure each exported record still in ``data`` is flagged ``ORPHAN_MIRROR_OWED`` so the save does not make
+    it cap-evictable while the cache holds the only copy of its Ended; on success the flag is dropped (the export
+    is durable now).
+    """
+    if not exports:
+        return False
+    try:
+        journal_orphan_exports(exports)
+        journaled = True
+    except (OSError, TypeError, ValueError) as exc:
+        log_warning(f"Could not journal {len(exports)} orphan export(s) before the save ({exc}); exporting after it "
+                    "instead and keeping the record(s) out of the cap prune until an export is confirmed")
+        journaled = False
+    sessions = data.get("sessions", {})
+    for sid, _ in exports:
+        record = sessions.get(sid)
+        if not isinstance(record, dict):
+            continue
+        if journaled:
+            record.pop(ORPHAN_MIRROR_OWED, None)
+        else:
+            record[ORPHAN_MIRROR_OWED] = True
+    return journaled
+
+
+def run_orphan_effects(effects: StagedEffects, blocking: bool = False, journaled: bool = False) -> None:
     """Execute staged orphan exports/removals OUTSIDE the cache lock (Plan §1 L108).
 
     On orphan-lock contention the orphans module journals the operation for the
-    reconciler (R10), so nothing is lost.
+    reconciler (R10), so nothing is lost. ``journaled``: the exports already wait in the
+    journal (``journal_owed_exports``), so they are folded first and only the removals follow.
     """
+    if journaled:
+        flush_pending_orphan_ops(blocking=blocking)
+        run_orphan_io((), effects.orphans_to_remove, blocking=blocking)
+        return
     run_orphan_io(effects.orphans_to_export, effects.orphans_to_remove, blocking=blocking)
 
 
@@ -564,6 +613,7 @@ def merge_all(effects: List[StagedEffects]) -> StagedEffects:
 __all__ = [
     "Outcome", "StagedEffects", "Transmission", "apply_delivery_result", "clear_pending_compensation",
     "clear_pending_vendor_cleanup", "commit_delivery_down", "empty_effects", "force_resync_superseding_senders",
-    "foreign_lease_open", "merge_all", "rearm_exhausted", "record_tombstone", "resync_live_sessions", "retry_delay", "run_orphan_effects",
+    "foreign_lease_open", "journal_exports_before_save", "journal_owed_exports", "merge_all", "rearm_exhausted", "record_tombstone",
+    "resync_live_sessions", "retry_delay", "run_orphan_effects",
     "stage_compensation", "stage_vendor_cleanup",
 ]

@@ -27,6 +27,7 @@ from .delivery_state import (
     apply_delivery_result,
     commit_delivery_down,
     empty_effects,
+    journal_owed_exports,
     run_orphan_effects,
 )
 from .envelopes import quarantine, read_json, unlink_files, write_json_atomic
@@ -115,13 +116,24 @@ def parse_result_envelope(env: object) -> Tuple[Transmission, Outcome]:
     sid, seq, state = env.get("session_id"), env.get("transmitting_seq"), env.get("transmitting_state")
     if not isinstance(sid, str) or not sid or not isinstance(state, str):
         raise ValueError("session_id/transmitting_state missing")
-    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+    if not _count(seq):
         raise ValueError("transmitting_seq must be a non-negative integer")
+    for name in ("pane_id", "agent", "lease_token", "error"):   # R55 for result envelopes: typed or poison
+        if env.get(name) is not None and not isinstance(env.get(name), str):
+            raise ValueError(f"{name} must be a string")
+    for name in ("generation", "admitted_at_ns", "arrival_ns", "resync_generation"):
+        if env.get(name) is not None and not _count(env.get(name)):
+            raise ValueError(f"{name} must be a non-negative integer")
     raw = {k: env.get(k) for k in ("pane_id", "agent", "lease_token", "generation", "admitted_at_ns", "arrival_ns")}
     tx = Transmission(sid, raw["pane_id"], state, seq, raw["agent"] or "Herdr", raw["lease_token"],
                       int(env.get("resync_generation") or 0), raw["generation"], raw["admitted_at_ns"],
                       raw["arrival_ns"])
     return tx, Outcome(env["status"], env.get("error"))
+
+
+def _count(value: object) -> bool:
+    """A non-negative integer (not a bool)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 @dataclass(frozen=True)
@@ -137,7 +149,7 @@ def _load_batch(directory: Path, max_batch: int) -> _Batch:
     for path in files[:max_batch]:
         try:
             tx, outcome = parse_result_envelope(read_json(path))
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, TypeError) as e:
             quarantined += int(quarantine(path, directory / "bad", f"invalid result envelope: {e}"))
             continue
         entries.append((path, tx, outcome))
@@ -160,10 +172,12 @@ def drain_results_dir(state_dir: Path, max_batch: int = RESULTS_BATCH,
     with cache_mgr as data:
         for _, tx, outcome in batch.entries:   # one critical section: later results see earlier DELIVERY_DOWN changes
             merged = merged.merge(apply_delivery_result(data, tx, outcome, delivery_down=merged.delivery_down))
+        journaled = journal_owed_exports(merged, data)   # durable before the save marks them orphaned_ended
         cache_mgr.save(data)
         commit_delivery_down(merged)   # only once saved: an unsaved reconnection keeps DELIVERY_DOWN for the retry
         unlink_files([path for path, _, _ in batch.entries])  # under the lock: no other drainer can re-apply them
-    run_orphan_effects(merged)
-    if merged.touch_pending or batch.backlog:  # backlog: drain the rest on the next pass, not after an idle sleep
+    run_orphan_effects(merged, journaled=journaled)
+    unmirrored = bool(merged.orphans_to_export) and not journaled   # R52: the next pass re-mirrors the flagged
+    if merged.touch_pending or batch.backlog or unmirrored:  # backlog: drain the rest on the next pass, not after
         touch_reconciler_pending()
     return DrainReport(len(batch.entries), batch.quarantined, merged)

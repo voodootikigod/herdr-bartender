@@ -22,21 +22,114 @@ if [ -n "${HERDR_PANE_ID:-}" ]; then
       _HB_IS_TURN_TERMINAL=0
       _HB_ARGV_IS_JSON=0
       _HB_ARGV_SID=""
+      _HB_CLASSIFY_ERR=0
+      # R36: classify by TOP-LEVEL members only (hook_event_name/event/state/type and session_id), never by keys
+      # nested in tool_input/tool_response. Prints "<S|T|N> <session_id>": S session-terminal, T turn-terminal,
+      # N neither; no output fails open. R41: one streaming pass, linear in the payload under BWK awk (macOS), mawk
+      # and busybox: lines are split on '"' (a string whose quote has an odd backslash run continues), escape pairs
+      # are neutralised, and brackets are found with nested single-character splits (no per-match gsub/substr over
+      # the payload, which is quadratic in BWK awk). Lines keep BWK's split from treating newlines as separators.
+      _HB_AWK='function sess(v) { return v == "Ended" || v == "SessionEnd" || v == "session-end" }
+function turn(v) { return v == "Stop" || v == "Done" || v == "AgentDone" || v == "AgentWaiting" || v == "agent-turn-complete" }
+function oddtail(x,   n, j) {
+  n = length(x)
+  if (substr(x, n, 1) != "\\") return 0
+  if (substr(x, n - 1, 1) != "\\") return 1
+  n = split(x, Y, "\\"); j = n
+  while (j > 1 && Y[j] == "") j--
+  return (n - j) % 2
+}
+function keep(x) { if (length(a) <= 256) a = a substr(x, 1, 257) }
+function top(u) {
+  if (match(u, /[,:][^,:]*$/)) { w = (substr(u, RSTART, 1) == ",") ? "k" : "v"; u = substr(u, RSTART + 1) }
+  if (w == "v" && u ~ /[^ \t\r\n]/) w = ""
+}
+function br(c) {
+  if (c == "{" || c == "[") { d++; if (d == 1) { o = (c == "{"); w = "k" } else w = "" }
+  else if (--d < 1) z = 1
+}
+function seg(x,   na, ia, nb, ib, nc, ic, ne, ie) {
+  if (index(x, "\\")) gsub(/\\./, "\002", x)
+  if (!index(x, "{") && !index(x, "}") && !index(x, "[") && !index(x, "]")) { if (d == 1) top(x); return }
+  na = split(x, A, "]")
+  for (ia = 1; ia <= na && !z; ia++) {
+    if (ia > 1) { br("]"); if (z) break }
+    nb = split(A[ia], B, "}")
+    for (ib = 1; ib <= nb && !z; ib++) {
+      if (ib > 1) { br("}"); if (z) break }
+      nc = split(B[ib], C, "[")
+      for (ic = 1; ic <= nc; ic++) {
+        if (ic > 1) br("[")
+        ne = split(C[ic], E, "{")
+        for (ie = 1; ie <= ne; ie++) {
+          if (ie > 1) br("{")
+          if (d == 1) top(E[ie])
+        }
+      }
+    }
+  }
+}
+function endstr() {
+  gsub(/\\./, "\002", a)
+  if (r == "k") { k = a; w = "" }
+  else if (r == "v") { if (!(k in t)) t[k] = a; w = "" }
+  q = 0; r = ""
+}
+BEGIN { d = 0; w = ""; k = ""; o = 0; q = 0; z = 0; r = ""; a = ""; nl = 0; h = 0 }
+z || h { next }
+{
+  s = $0
+  if ((i = index(s, "\001")) > 0) { s = substr(s, 1, i - 1); h = 1 }
+  if (q && nl && r != "") keep("\n")
+  nl = 0
+  n = split(s, p, "\"")
+  for (i = 1; i <= n && !z; i++) {
+    if (q) {
+      if (r != "") keep(p[i])
+      if (i == n) nl = 1
+      else if (oddtail(p[i])) { if (r != "") keep("\"") }
+      else endstr()
+    } else if (i < n && oddtail(p[i])) seg(p[i] "\"")
+    else {
+      seg(p[i])
+      if (i < n && !z) { q = 1; r = (o && d == 1) ? w : ""; a = "" }
+    }
+  }
+}
+END {
+  if (q) endstr()
+  v = "N"
+  split("hook_event_name event state type", K, " ")
+  for (j = 1; j <= 4; j++) if ((K[j] in t) && sess(t[K[j]])) v = "S"
+  if (v == "N") for (j = 1; j <= 4; j++) if ((K[j] in t) && turn(t[K[j]])) v = "T"
+  print v " " (("session_id" in t) ? t["session_id"] : "")
+}'
+      # R41: the classifier runs under its own 1s deadline (perl's alarm survives the exec into awk, which the default
+      # SIGALRM action then ends); a timeout is a classification error and fails open (pass through).
+      _HB_HAS_PERL=0
+      if command -v perl >/dev/null 2>&1; then _HB_HAS_PERL=1; fi
+      _HB_DEADLINE='$SIG{ALRM} = "DEFAULT"; alarm 1; exec { $ARGV[0] } @ARGV; exit 127;'
 
       case "${1:-}" in
         "{"*)
           _HB_ARGV_IS_JSON=1
-          _HB_RAW_SID=$(printf '%s' "$1" | grep -m1 -Eo '(\{|,)[[:space:]]*"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | sed 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
-          if [ -z "$_HB_RAW_SID" ]; then
-            _HB_RAW_SID=$(printf '%s' "$1" | grep -m1 -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | sed 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
+          if [ "$_HB_HAS_PERL" -eq 1 ]; then
+            _HB_CLASS=$(printf '%s' "$1" | LC_ALL=C perl -e "$_HB_DEADLINE" awk "$_HB_AWK" 2>/dev/null) || _HB_CLASS=""
+          else
+            _HB_CLASS=$(printf '%s' "$1" | LC_ALL=C awk "$_HB_AWK" 2>/dev/null) || _HB_CLASS=""
           fi
+          case "$_HB_CLASS" in
+            S*) _HB_IS_SESSION_TERMINAL=1 ;;
+            T*) _HB_IS_TURN_TERMINAL=1 ;;
+            N*) : ;;
+            *) _HB_CLASSIFY_ERR=1 ;;
+          esac
+          _HB_RAW_SID="${_HB_CLASS#??}"
+          # grep matches line by line: a multi-line value (raw newline in the JSON string) is never a UUID.
+          case "$_HB_RAW_SID" in *"
+"*) _HB_RAW_SID="" ;; esac
           if printf '%s' "$_HB_RAW_SID" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
             _HB_ARGV_SID="$_HB_RAW_SID"
-          fi
-          if printf '%s' "$1" | grep -m1 -Eq '(\{|,)[[:space:]]*"(hook_event_name|event|state|type)"[[:space:]]*:[[:space:]]*"(Ended|SessionEnd|session-end)"' 2>/dev/null; then
-            _HB_IS_SESSION_TERMINAL=1
-          elif printf '%s' "$1" | grep -m1 -Eq '(\{|,)[[:space:]]*"(hook_event_name|event|state|type)"[[:space:]]*:[[:space:]]*"(Stop|Done|AgentDone|AgentWaiting|agent-turn-complete)"' 2>/dev/null; then
-            _HB_IS_TURN_TERMINAL=1
           fi
           ;;
         Ended|SessionEnd|session-end) _HB_IS_SESSION_TERMINAL=1 ;;
@@ -50,15 +143,90 @@ if [ -n "${HERDR_PANE_ID:-}" ]; then
           mkdir -m 700 -p "$_HB_STATE_HOME" 2>/dev/null || true
           _HB_GUARD_TMP=$(mktemp "$_HB_STATE_HOME/.guard_stdin.XXXXXX" 2>/dev/null || true)
           if [ -n "$_HB_GUARD_TMP" ]; then
-            if command -v perl >/dev/null 2>&1; then
-              perl -e '$SIG{ALRM} = sub { exit 142 }; alarm 1; while (sysread(STDIN, my $b, 65536)) { print $b; } alarm 0; exit 0;' > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
+            # A capture that cannot write what it read (disk full) exits 75 after forking a splicer that feeds
+            # <capture>.fifo with the file's prefix, the unwritten bytes and the rest of stdin (then removes the file).
+            # The splicer gives up after 30s if the guard never opens the FIFO (the hook was killed).
+            if [ "$_HB_HAS_PERL" -eq 1 ]; then
+              # R41: a cooperative 1s deadline (select + sysread + syswrite, no signal handler): every chunk taken
+              # from the pipe is written in full before the deadline is checked again, so a timeout never drops one.
+              perl -e 'use Time::HiRes qw(time); my $end = time + 1; my $in = ""; vec($in, 0, 1) = 1;
+sub splice_rest {
+  my ($rest, $tmp) = ($_[0], $ARGV[0]); my $fifo = "$tmp.fifo"; my $data;
+  open(my $kept, "<", $tmp); require POSIX; exit 1 unless POSIX::mkfifo($fifo, 0600);
+  my $pid = fork; if (!defined $pid) { unlink $fifo; exit 1 } exit 75 if $pid;
+  alarm 30; open(my $out, ">", $fifo) or exit 1; alarm 0; unlink $tmp;
+  if ($kept) { print {$out} $data while read($kept, $data, 65536) }
+  print {$out} $rest;
+  while (1) { my $got = sysread(STDIN, $data, 65536); if (!defined $got) { next if $!{EINTR}; last } last if !$got; print {$out} $data }
+  exit 0;
+}
+while (1) {
+  my $left = $end - time; exit 142 if $left <= 0;
+  my $n = select(my $ready = $in, undef, undef, $left);
+  if ($n < 0) { next if $!{EINTR}; exit 142 }
+  exit 142 if $n == 0;
+  my $got = sysread(STDIN, my $buf, 65536);
+  if (!defined $got) { next if $!{EINTR} || $!{EAGAIN}; exit 142 }
+  last if $got == 0;
+  for (my $off = 0; $off < $got; ) {
+    my $put = syswrite(STDOUT, $buf, $got - $off, $off);
+    if (!defined $put) { next if $!{EINTR}; splice_rest(substr($buf, $off, $got - $off)) }
+    $off += $put;
+  }
+}
+exit 0;' "$_HB_GUARD_TMP" > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
             elif command -v python3 >/dev/null 2>&1; then
-              python3 -c 'import sys, signal; signal.signal(signal.SIGALRM, lambda s,f: sys.exit(142)); signal.alarm(1);
+              # Unbuffered os.read + select deadline (no signal): every chunk read is written before the 1s
+              # deadline is checked again, so a timeout never swallows bytes already taken from the pipe.
+              python3 -c 'import os, select, sys, time
+def splice_rest(rest):
+    tmp = sys.argv[1]
+    fifo = tmp + ".fifo"
+    try:
+        kept = open(tmp, "rb")
+    except OSError:
+        kept = None
+    try:
+        os.mkfifo(fifo, 0o600)
+    except OSError:
+        os._exit(1)
+    try:
+        pid = os.fork()
+    except OSError:
+        os.unlink(fifo)
+        os._exit(1)
+    if pid:
+        os._exit(75)
+    import signal
+    signal.alarm(30)
+    out = os.open(fifo, os.O_WRONLY)
+    signal.alarm(0)
+    try:
+        os.unlink(tmp)
+        def put(data):
+            while data:
+                data = data[os.write(out, data):]
+        for block in iter(lambda: kept.read(65536) if kept else b"", b""):
+            put(block)
+        put(rest)
+        for block in iter(lambda: os.read(0, 65536), b""):
+            put(block)
+    except OSError:
+        pass
+    os._exit(0)
+end = time.monotonic() + 1.0
 while True:
-    b = sys.stdin.buffer.read(65536)
-    if not b: break
-    sys.stdout.buffer.write(b)
-signal.alarm(0)' > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
+    left = end - time.monotonic()
+    if left <= 0 or not select.select([0], [], [], left)[0]:
+        os._exit(142)
+    chunk = os.read(0, 65536)
+    if not chunk:
+        break
+    while chunk:
+        try:
+            chunk = chunk[os.write(1, chunk):]
+        except OSError:
+            splice_rest(chunk)' "$_HB_GUARD_TMP" > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
             else
               # Pure bash cannot safely capture unbounded multiline stdin with timeout.
               # Skip stdin capture and leave stdin untouched for the vendor script.
@@ -66,7 +234,13 @@ signal.alarm(0)' > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
               _HB_GUARD_TMP=""
               _HB_CAPTURE_ERR=1
             fi
-            if [ "$_HB_CAPTURE_ERR" -ne 0 ]; then
+            if [ "$_HB_CAPTURE_ERR" -eq 75 ] && [ -p "${_HB_GUARD_TMP}.fifo" ]; then
+              # The capture's splicer replays every byte through the FIFO (and removes the capture file).
+              _HB_SPLICE_FIFO="${_HB_GUARD_TMP}.fifo"
+              exec < "$_HB_SPLICE_FIFO" || true
+              rm -f "$_HB_SPLICE_FIFO" 2>/dev/null || true
+              _HB_GUARD_TMP=""
+            elif [ "$_HB_CAPTURE_ERR" -ne 0 ]; then
               if [ -s "$_HB_GUARD_TMP" ]; then
                 _HB_SPLICE_FIFO=$(mktemp -u "$_HB_STATE_HOME/.guard_splice.XXXXXX" 2>/dev/null || true)
                 if [ -n "$_HB_SPLICE_FIFO" ] && mkfifo "$_HB_SPLICE_FIFO" 2>/dev/null; then
@@ -104,18 +278,27 @@ signal.alarm(0)' > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
 
       _HB_VENDOR_SID="${_HB_ARGV_SID:-}"
       if [ -n "$_HB_GUARD_TMP" ] && [ -f "$_HB_GUARD_TMP" ]; then
-        _HB_RAW_SID=$(grep -m1 -Eo '(\{|,)[[:space:]]*"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' "$_HB_GUARD_TMP" 2>/dev/null | head -n1 | sed 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
-        if [ -z "$_HB_RAW_SID" ]; then
-          _HB_RAW_SID=$(grep -m1 -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' "$_HB_GUARD_TMP" 2>/dev/null | head -n1 | sed 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
+        if [ "$_HB_HAS_PERL" -eq 1 ]; then
+          _HB_CLASS=$(LC_ALL=C perl -e "$_HB_DEADLINE" awk "$_HB_AWK" "$_HB_GUARD_TMP" 2>/dev/null) || _HB_CLASS=""
+        else
+          _HB_CLASS=$(LC_ALL=C awk "$_HB_AWK" "$_HB_GUARD_TMP" 2>/dev/null) || _HB_CLASS=""
         fi
+        case "$_HB_CLASS" in
+          S*) _HB_IS_SESSION_TERMINAL=1 ;;
+          T*) _HB_IS_TURN_TERMINAL=1 ;;
+          N*) : ;;
+          *) _HB_CLASSIFY_ERR=1 ;;
+        esac
+        _HB_RAW_SID="${_HB_CLASS#??}"
+        case "$_HB_RAW_SID" in *"
+"*) _HB_RAW_SID="" ;; esac
         if printf '%s' "$_HB_RAW_SID" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
           _HB_VENDOR_SID="$_HB_RAW_SID"
         fi
-        if grep -m1 -Eq '(\{|,)[[:space:]]*"(hook_event_name|event|state|type)"[[:space:]]*:[[:space:]]*"(Ended|SessionEnd|session-end)"' "$_HB_GUARD_TMP" 2>/dev/null; then
-          _HB_IS_SESSION_TERMINAL=1
-        elif grep -m1 -Eq '(\{|,)[[:space:]]*"(hook_event_name|event|state|type)"[[:space:]]*:[[:space:]]*"(Stop|Done|AgentDone|AgentWaiting|agent-turn-complete)"' "$_HB_GUARD_TMP" 2>/dev/null; then
-          _HB_IS_TURN_TERMINAL=1
-        fi
+      fi
+      # An unclassifiable payload (awk missing or failed) is never suppressed: fail open.
+      if [ "$_HB_CLASSIFY_ERR" -ne 0 ]; then
+        _HB_CAPTURE_ERR=1
       fi
 
       _HB_VA_HAS_UUID=0
@@ -130,6 +313,7 @@ signal.alarm(0)' > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
         _HB_NOW_TIME=$(date +%s 2>/dev/null) || _HB_NOW_TIME=0
         case "$_HB_NOW_TIME" in ''|*[!0-9]*) _HB_NOW_TIME=0 ;; esac
         # R15: exact process name, or an executable inside the app bundle (never a loose cmdline match).
+        # R44: -a, because macOS pgrep skips the caller's ancestors and Herdr is an ancestor of this hook.
         # Fresh only when both clocks are known and 0 <= age < 60; a failed `date`/`stat` or a
         # future (skewed) mtime is "unknown freshness" and must fail open (pass through).
         _HB_MARKER_AGE=-1
@@ -137,7 +321,7 @@ signal.alarm(0)' > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
           _HB_MARKER_AGE=$((_HB_NOW_TIME - _HB_MARKER_MTIME))
         fi
         if [ "$_HB_MARKER_AGE" -ge 0 ] && [ "$_HB_MARKER_AGE" -lt 60 ] && \
-           { pgrep -xi "herdr" >/dev/null 2>&1 || pgrep -f '^[^[:space:]]*/Herdr\.app/Contents/MacOS/' >/dev/null 2>&1; }; then
+           { pgrep -a -xi "herdr" >/dev/null 2>&1 || pgrep -a -f '^[^[:space:]]*/Herdr\.app/Contents/MacOS/' >/dev/null 2>&1; }; then
           _HB_HERDR_HEALTHY=1
         fi
       fi
@@ -208,8 +392,9 @@ signal.alarm(0)' > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
       fi
 
 
+      # Refresh only (-c never creates): Python may retire .vendor_active between the test and the touch.
       if [ "$_HB_IS_SESSION_TERMINAL" -eq 0 ] && [ -f "$_HB_VENDOR_ACTIVE" ]; then
-        touch "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
+        touch -c "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
       fi
       if [ -n "$_HB_GUARD_TMP" ] && [ -f "$_HB_GUARD_TMP" ]; then
         exec < "$_HB_GUARD_TMP" || true
@@ -220,7 +405,7 @@ signal.alarm(0)' > "$_HB_GUARD_TMP" 2>/dev/null || _HB_CAPTURE_ERR=$?
             _HB_IS_SESSION_TERMINAL _HB_IS_TURN_TERMINAL _HB_VENDOR_SID _HB_VA_HAS_UUID \
             _HB_HERDR_HEALTHY _HB_MARKER_MTIME _HB_MARKER_AGE _HB_NOW_TIME _HB_OLD_UMASK _HB_FIRST_LINE \
             _HB_READ_STATUS _HB_RAW_SID _HB_VA_TMP _HB_CAPTURE_ERR _HB_GUARD_TMP _HB_SPLICE_FIFO \
-            _HB_ARGV_IS_JSON _HB_ARGV_SID
+            _HB_ARGV_IS_JSON _HB_ARGV_SID _HB_AWK _HB_CLASS _HB_CLASSIFY_ERR _HB_HAS_PERL _HB_DEADLINE
     fi
   fi
 fi

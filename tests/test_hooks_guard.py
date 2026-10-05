@@ -476,6 +476,25 @@ class HookGuardHardeningTests(_GuardCase):
                 self.assertEqual(res.returncode, 0, res.stderr)
                 self.assertEqual("PASSTHROUGH" in res.stdout, expect_pass)
 
+    def test_herdr_running_as_the_hooks_ancestor_is_seen(self):
+        """Round-3 finding (critical): macOS (BSD) pgrep drops the caller and ALL its ancestors from the match list
+        unless -a is given, and Herdr is an ancestor of every vendor hook (Herdr -> pane shell -> agent CLI -> hook ->
+        pgrep). Without -a neither probe ever saw Herdr, so the guard never suppressed and every agent showed twice.
+        The pgrep shim models BSD ancestry; both probes must still find an ancestor Herdr."""
+        script = self.script("guard-ancestor.sh", 'echo "PASSTHROUGH"')
+        cases = (("name", "herdr", "herdr server"),
+                 ("bundle", "Herdr-GUI", "/Applications/Herdr.app/Contents/MacOS/Herdr-GUI --flag"))
+        for label, name, cmdline in cases:
+            with self.subTest(probe=label):
+                self.clear_fake_processes()
+                self.add_fake_process(name, pid=41000 + len(label), comm=name, cmdline=cmdline, ancestor=True)
+                pane = f"w1:pAncestor{label}"
+                self.fresh_marker(pane)
+                res = run_guard(script, "Working", env_extra={"HERDR_PANE_ID": pane})
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertNotIn("PASSTHROUGH", res.stdout, "Herdr (an ancestor) is alive: the event is suppressed")
+                self.assertFalse(self.paths(pane)[1].exists(), "no .vendor_active for a suppressed event")
+
     def test_r15_pgrep_failure_fails_open(self):
         """R15 (gap portability-guard-herdr-liveness): a failing pgrep means Herdr is not proven alive -> pass through."""
         (self.sandbox / "pgrep.fail").write_text("")

@@ -151,11 +151,14 @@ class SandboxTestCase(unittest.TestCase):
         comm: str = "",
         cmdline: str = "",
         live: bool = False,
+        ancestor: bool = False,
     ) -> int:
         """Register a process the pgrep/ps shims will report.
 
         With ``live=True`` a real ``sleep`` child is spawned so os.kill-based
-        liveness checks see the PID as alive; it is killed in cleanup.
+        liveness checks see the PID as alive; it is killed in cleanup. With
+        ``ancestor=True`` the process is an ancestor of every pgrep caller: the shim,
+        like macOS pgrep, then matches it only when ``-a`` is given.
         """
         if live:
             child = subprocess.Popen(["sleep", "300"], stdin=subprocess.DEVNULL,
@@ -166,6 +169,9 @@ class SandboxTestCase(unittest.TestCase):
             raise ValueError("pid is required unless live=True")
         with open(self.procs_file, "a", encoding="utf-8") as f:
             f.write(f"{pid}|{name}|{lstart}|{comm}|{cmdline}\n")
+        if ancestor:
+            with open(self.sandbox / "ancestors.list", "a", encoding="utf-8") as f:
+                f.write(f"{pid}\n")
         return pid
 
     @staticmethod
@@ -173,12 +179,13 @@ class SandboxTestCase(unittest.TestCase):
         child.kill()
         child.wait()
 
-    def set_herdr_alive(self) -> int:
+    def set_herdr_alive(self, ancestor: bool = False) -> int:
         app = "/Applications/Herdr.app/Contents/MacOS/herdr"
-        return self.add_fake_process("herdr", comm=app, cmdline=app, live=True)
+        return self.add_fake_process("herdr", comm=app, cmdline=app, live=True, ancestor=ancestor)
 
     def clear_fake_processes(self) -> None:
         self.procs_file.write_text("")
+        (self.sandbox / "ancestors.list").unlink(missing_ok=True)
 
     def osascript_calls(self) -> list:
         log = self.sandbox / "osascript.log"

@@ -16,6 +16,7 @@ from .. import clock
 from ..intake import TAB_CLOSED, WORKSPACE_CLOSED, container_id, loggable
 from ..log import log_debug
 from ..markers import touch_heartbeat
+from ..process import memoised_herdr_alive
 from ..sender import Stage, Staged, Target
 from ..staging import stage_container_close
 from .flow import run_event
@@ -23,7 +24,8 @@ from .flow import run_event
 
 def _container_stage(event_name: str, event_data: dict, arr_ns: int, spool_generation: Optional[int]) -> Stage:
     def stage(data: dict) -> Staged:
-        targets = stage_container_close(data, event_name, event_data, arr_ns, spool_generation)
+        targets = stage_container_close(data, event_name, event_data, arr_ns, spool_generation,
+                                        herdr_alive=memoised_herdr_alive)
         return Staged(tuple(Target(t.session_id, t.pane_id, t.record) for t in targets), mutated=bool(targets))
     return stage
 

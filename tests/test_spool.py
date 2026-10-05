@@ -72,6 +72,20 @@ class SpoolTests(SandboxTestCase):
         replay_spool_dir(self.state_dir)
         self.assertIsNotNone(self._session("w7:p1")[0])
 
+    def test_r1_invalid_event_workspace_is_replaced_by_the_frozen_one(self):
+        """Gate finding (review round 9): live intake ignores an invalid event ``workspace_id`` and falls back to
+        HERDR_WORKSPACE_ID (R1/R2), but the freezer only filled an EMPTY one, so the replay (no env) dropped it."""
+        from herdr_bartender.intake import resolve_identity
+        live, _ = resolve_identity({"pane_id": "p1", "workspace_id": "bad ws!"}, {}, env={"HERDR_WORKSPACE_ID": "w7"})
+        self.assertEqual(live.canonical_pane, "w7:p1", "control: the live path resolves it")
+        os.environ["HERDR_WORKSPACE_ID"] = "w7"
+        path = enqueue_spool(STATUS, {"pane_id": "p1", "workspace_id": "bad ws!", "agent_status": "working",
+                                      "agent": "claude"}, {}, arrival_ns=self.t0)
+        del os.environ["HERDR_WORKSPACE_ID"]
+        self.assertEqual(json.loads(path.read_text())["event_data"]["workspace_id"], "w7")
+        replay_spool_dir(self.state_dir)
+        self.assertIsNotNone(self._session("w7:p1")[0])
+
     # -- FIFO replay -------------------------------------------------------------------------
     def test_p10_fifo_order_and_supersession(self):
         """Plan §10.1 #10 (gap t10-spool-fifo): envelopes are applied in filename order and an envelope whose

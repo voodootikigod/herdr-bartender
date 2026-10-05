@@ -10,12 +10,17 @@ A guard is well formed only with exactly one BEGIN and one END marker, BEGIN
 first, each at the start of its own line, END followed by a newline or EOF
 (Plan §9.1, gap marker-count-validation). Anything else raises MarkerError and
 callers must leave the file untouched.
+
+R37 legacy layout: the pre-package monolith inserted ``b"\n" + block + b"\n"``, i.e. a
+blank line before BEGIN. ``insert_guard`` always places BEGIN right after a non-empty
+anchor line, so a blank line directly before BEGIN only ever comes from that layout;
+``strip_guard`` removes it with the block, restoring the original hook byte-exact.
 """
 
 from __future__ import annotations
 
 import os
-from typing import List, NamedTuple, Optional
+from typing import List, NamedTuple, Optional, Tuple
 
 BEGIN_MARKER = b"# BEGIN HERDR-BARTENDER DEDUP GUARD"
 END_MARKER = b"# END HERDR-BARTENDER DEDUP GUARD"
@@ -75,12 +80,33 @@ def guard_block(content: bytes) -> Optional[bytes]:
     return None if span is None else content[span.start:span.block_end]
 
 
+def is_legacy_layout(content: bytes, span: Optional[GuardSpan] = None) -> bool:
+    """R37: the guard sits after a blank line (the monolith's ``"\n" + block + "\n"`` insertion)."""
+    span = find_guard(content) if span is None else span
+    return span is not None and span.start >= 2 and content[span.start - 2:span.start] == b"\n\n"
+
+
 def strip_guard(content: bytes) -> bytes:
-    """Remove the guard exactly as insert_guard placed it; no-op when absent."""
+    """Remove the guard exactly as insert_guard (or the legacy monolith, R37) placed it; no-op when absent."""
     span = find_guard(content)
     if span is None:
         return content
-    return content[:span.start] + content[span.end:]
+    start = span.start - 1 if is_legacy_layout(content, span) else span.start
+    return content[:start] + content[span.end:]
+
+
+def legacy_clean_variants(content: bytes) -> Tuple[bytes, ...]:
+    """R37: other guard-free bytes an earlier installer may have approved for a legacy-layout hook.
+
+    ``strip_guard`` gives the monolith's first-install hash (the original hook). A monolith re-install hashed
+    the hook with two blank lines at the anchor, and the pre-R37 strip kept one; both are whitespace at our own
+    insertion point only. Empty for any other layout.
+    """
+    span = find_guard(content)
+    if span is None or not is_legacy_layout(content, span):
+        return ()
+    head, tail = content[:span.start - 1], content[span.end:]
+    return head + b"\n" + tail, head + b"\n\n" + tail
 
 
 def replace_guard(content: bytes, template: bytes) -> bytes:

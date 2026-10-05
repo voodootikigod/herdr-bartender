@@ -145,6 +145,63 @@ class CleanupLockTests(SandboxTestCase):
         self.assertEqual((result["session_id"], result["transmitting_state"], result["status"]),
                          (self.sid_, "Ended", "success"))
 
+    def test_readmission_after_a_deferred_step_c_still_exits_2(self):
+        """R31 (gate finding: cleanup skipped a landed-but-unrecorded session unconditionally): the Ended landed, its
+        Step C went to results/, then another process re-admitted the pane live before the final scan. That live
+        session is left alone (not marked, not exported) but the exit code is 2, so the rollback keeps the state."""
+        real_flock, posted, failed = cache._flock_within, [], []
+
+        def post(payload, timeout=0.2, bridge_url=None):
+            posted.append(payload)
+            return DeliveryResult("success", None, 200)
+
+        def readmit_live():
+            data = json.loads(self.cache_mgr.cache_file.read_text())
+            record = data["sessions"][self.sid_]
+            seq = int(record["seq"]) + 1
+            record.update({"desired_state": "Working", "seq": seq, "delivered_seq": seq, "delivered_state": "Working",
+                           "delivery_status": "delivered", "generation": int(record.get("generation", 1)) + 1})
+            cache.write_cache_file(self.cache_mgr.cache_file, data)
+
+        def flock(fd, timeout):
+            if posted and not failed:   # Step C: another process holds the lock and re-admits the pane meanwhile
+                failed.append(True)
+                readmit_live()
+                return False
+            return real_flock(fd, timeout)
+
+        with mock.patch.object(step_b, "send_event", side_effect=post), \
+                mock.patch.object(cache, "_flock_within", side_effect=flock):
+            self.assertEqual(run_cleanup(bridge_url=self.mock_url), 2, "a live session remains: never exit 0")
+        self.assertTrue(failed, "control: Step C was deferred")
+        self.assertEqual(len(list((self.state_dir / "results").glob("*.json"))), 1, "the landed Ended is recorded")
+        with self.cache_mgr as data:
+            record = data["sessions"][self.sid_]
+        self.assertEqual(record["desired_state"], "Working")
+        self.assertNotIn("orphaned_ended", record)
+        self.assertFalse(get_orphan_path().exists(), "a live session is not exported")
+
+    def test_unconfirmed_ended_is_exported_from_the_peek_when_the_cache_cannot_be_relocked(self):
+        """Plan §5.2 / R31 (round-4 finding: the lock-free fallback was untested): the bridge fails the Ended AND the
+        cache cannot be relocked afterwards (another process holds it past the unbounded wait). --cleanup still
+        exports the unconfirmed Ended from the last saved cache and exits 2; it never reports success."""
+        real_flock, posted = cache._flock_within, []
+
+        def post(payload, timeout=0.2, bridge_url=None):
+            posted.append(payload)
+            return DeliveryResult("retryable", "network_timeout", None)
+
+        def flock(fd, timeout):
+            return False if posted else real_flock(fd, timeout)
+
+        with mock.patch.object(step_b, "send_event", side_effect=post), \
+                mock.patch.object(cache, "_flock_within", side_effect=flock):
+            self.assertEqual(run_cleanup(bridge_url=self.mock_url), 2, "an unconfirmed Ended is exit 2, never 0")
+        self.assertTrue(posted, "the Ended was attempted")
+        orphans = json.loads(get_orphan_path().read_text())
+        self.assertIn(self.sid_, orphans["sessions"], "the unconfirmed Ended is exported to the orphan file")
+        self.assertEqual(orphans["sessions"][self.sid_]["pane_id"], "w1:pCleanLock")
+
 
 if __name__ == "__main__":
     unittest.main()

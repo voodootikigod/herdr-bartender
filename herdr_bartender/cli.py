@@ -8,9 +8,9 @@ import os
 import sys
 from typing import Optional, Tuple
 
-from . import handoff, intake, process, runtime
+from . import handoff, intake, process, reconciler_stamp, runtime
 from .background import run_reconcile_background
-from .bridge import check_bridge_health
+from .bridge import health_report
 from .cache import BoundedSessionCache, CacheError
 from .cleanup import run_cleanup
 from .handlers import (
@@ -20,8 +20,9 @@ from .handlers import (
     handle_workspace_closed,
 )
 from .hooks import install_hooks, uninstall_hooks, verify_vendor_hooks_intact
+from .hooks_integrity import recorded_review_reasons
 from .live_test import run_live_test
-from .log import log_debug
+from .log import log_debug, log_warning
 from .markers import is_disabled, touch_heartbeat
 from .replay import run_replay_orphans
 from .paths import get_state_dir, repo_root
@@ -40,6 +41,15 @@ EVENT_HANDLERS = {
 }
 
 LIVE_TEST_FLAGS = frozenset({"--live-test", "--test"})  # Plan §10.2 item 1; --test is the legacy alias
+HELP_FLAGS = frozenset({"--help", "-h"})
+EXIT_USAGE = 2
+USAGE = """usage: herdr-bartender <event>                 Herdr plugin event (JSON envelope on stdin)
+       herdr-bartender --health | --status | --sessions
+       herdr-bartender --install-hooks | --uninstall-hooks
+       herdr-bartender --cleanup
+       herdr-bartender --replay-orphans <file>
+       herdr-bartender --live-test | --unit-test
+       herdr-bartender --reconcile-background"""
 
 STDIN_BUDGET_CAP = 0.3  # seconds; Herdr writes the envelope and closes stdin immediately
 STDIN_BUDGET_SHARE = 0.25  # never spend more than this share of the remaining process budget
@@ -91,7 +101,18 @@ def run_reconcile_command(args) -> int:
     if FOREGROUND_FLAG in args:
         run_reconcile_background()
         return 0
+    _warn_if_outdated_reconciler()
     return _spawn_detached_reconciler()
+
+
+def _warn_if_outdated_reconciler() -> Optional[str]:
+    """R38: the startup hook and --status name an older reconciler that still holds reconciler.lock."""
+    reason = reconciler_stamp.outdated_holder()
+    if reason is None:
+        return None
+    message = reconciler_stamp.outdated_warning(reason)
+    log_warning(message)
+    return message
 
 
 UNIT_TEST_HANG_SECONDS = 900.0   # the suite runs in about 70s: a run this long is hung
@@ -143,8 +164,7 @@ def main(launched_at: Optional[Tuple[float, int]] = None):
         sys.exit(run_live_test())
 
     if "--health" in args:
-        h = check_bridge_health()
-        result = h or {"error": "unreachable"}
+        result = health_report()
         hooks_ok, missing = verify_vendor_hooks_intact()
         result["hooks_guard_intact"] = hooks_ok
         if missing:
@@ -156,6 +176,12 @@ def main(launched_at: Optional[Tuple[float, int]] = None):
         state_dir = get_state_dir()
         if (state_dir / "HOOK_NEEDS_REVIEW").exists():
             print("[WARNING] Vendor hook modified upstream (SHA mismatch). Run 'herdr-bartender --install-hooks' to re-verify and approve changes.")
+            causes = recorded_review_reasons(state_dir)
+            if causes:  # R42: the recorded per-hook causes (unknown SHA, malformed markers, unreadable...)
+                print(f"          Review needed: {causes}")
+        outdated = _warn_if_outdated_reconciler()
+        if outdated:
+            print(f"[WARNING] {outdated}")
         data = _read_cache_or_exit(state_dir)
         sessions = data.get("sessions", {})
         print(f"Active sessions: {len(sessions)}")
@@ -192,6 +218,9 @@ def main(launched_at: Optional[Tuple[float, int]] = None):
     if "--reconcile-background" in args:
         sys.exit(run_reconcile_command(args))
 
+    if args and args[0].startswith("-"):
+        sys.exit(_usage(args[0]))
+
     if is_disabled():
         sys.exit(0)
 
@@ -201,6 +230,16 @@ def main(launched_at: Optional[Tuple[float, int]] = None):
     process.warm_process_identity()
     arm_watchdog()
     sys.exit(run_bounded(_run_event_path, args))
+
+
+def _usage(option: str) -> int:
+    """An option that is no command (Herdr only ever passes an event name): help, or a usage error (exit 2)."""
+    if option in HELP_FLAGS:
+        print(USAGE)
+        return 0
+    print(f"herdr-bartender: unknown option {option!r}", file=sys.stderr)
+    print(USAGE, file=sys.stderr)
+    return EXIT_USAGE
 
 
 def _run_event_path(args) -> int:

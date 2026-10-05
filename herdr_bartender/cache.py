@@ -26,7 +26,7 @@ import os
 from pathlib import Path
 from typing import FrozenSet, List, Optional
 
-from . import clock, runtime, watchdog
+from . import clock, jsonsafe, runtime, watchdog
 from .cache_schema import CorruptCache, new_cache, normalize_cache
 from .config import get_sanitized_hostname
 from .housekeeping import sweep_stale_temp_files
@@ -52,6 +52,9 @@ SESSION_CAP = 256
 PANE_GENERATION_CAP = 512
 TOMBSTONE_TTL_NS = 60_000_000_000
 AGENT_EXIT_TTL_NS = 60_000_000_000   # Plan §4.1 L303: agent_exits entries are pruned after 60s
+# An ``orphaned_ended`` record whose orphan export could not be made durable before the marking save (journal and
+# file both failed): the cache holds the only copy of the unconfirmed Ended, so the cap prune must keep it.
+ORPHAN_MIRROR_OWED = "orphan_mirror_owed"
 
 
 class CacheError(Exception):
@@ -139,21 +142,49 @@ def _prune_agent_exits(agent_exits: dict, now_ns: int) -> dict:
 
 
 def safe_to_evict(record: dict) -> bool:
-    """Salvaged, or an Ended that Bartender confirmed or that is mirrored to the orphan file."""
+    """Salvaged, or an Ended that Bartender confirmed or that is mirrored to the orphan file.
+
+    ``orphaned_ended`` alone means "mirrored" only when its export was durable when it was marked; a record flagged
+    ``ORPHAN_MIRROR_OWED`` waits for the R12 horizon eviction (export confirmed first) or a journaling Step A prune.
+    """
     if record.get("salvaged", False):
         return True
     return record.get("desired_state") == "Ended" and (
-        record.get("delivered_state") == "Ended"
-        or record.get("delivered_seq") == record.get("seq")
-        or record.get("orphaned_ended", False)
+        (record.get("delivered_state") == "Ended" and not _seq_behind(record))
+        or _seq_confirmed(record)
+        or (bool(record.get("orphaned_ended", False)) and not record.get(ORPHAN_MIRROR_OWED, False))
     )
+
+
+def _seq_behind(record: dict) -> bool:
+    """A newer seq is known undelivered: ``delivered_state`` then describes an older send (e.g. an old Ended's late
+    success after a newer turn and Ended were staged), not the current Ended."""
+    seq, delivered = record.get("seq"), record.get("delivered_seq")
+    return all(isinstance(v, int) and not isinstance(v, bool) for v in (seq, delivered)) and delivered < seq
+
+
+def _seq_confirmed(record: dict) -> bool:
+    """``delivered_seq == seq`` with both real integers: two missing (or dropped, R55) fields are no evidence."""
+    seq, delivered = record.get("seq"), record.get("delivered_seq")
+    return all(isinstance(v, int) and not isinstance(v, bool) for v in (seq, delivered)) and seq == delivered
+
+
+def mirror_copy(record: dict, **overrides) -> dict:
+    """The orphan-file copy of a cached record: its cache-only ``ORPHAN_MIRROR_OWED`` flag is not mirrored."""
+    return {**{k: v for k, v in record.items() if k != ORPHAN_MIRROR_OWED}, **overrides}
+
+
+def event_time(record: object) -> float:
+    """Total sort key for "oldest first": ``last_event_at`` when it is a number, else 0 (null/missing sort oldest)."""
+    value = record.get("last_event_at") if isinstance(record, dict) else None
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
 
 
 def sessions_to_prune(sessions: dict, cap: int = SESSION_CAP) -> List[str]:
     """256 cap: only Ended-safe or salvaged records are evictable, oldest first (Plan §4.1)."""
     if len(sessions) <= cap:
         return []
-    oldest_first = sorted(sessions.items(), key=lambda kv: kv[1].get("last_event_at", 0))
+    oldest_first = sorted(sessions.items(), key=lambda kv: event_time(kv[1]))
     return [sid for sid, rec in oldest_first if safe_to_evict(rec)][:len(sessions) - cap]
 
 
@@ -254,8 +285,8 @@ class BoundedSessionCache:
         except OSError as e:
             raise CacheReadError(f"could not read {self.cache_file.name}: {e}") from e
         try:
-            return normalize_cache(json.loads(raw), get_sanitized_hostname)
-        except (ValueError, CorruptCache) as e:
+            return normalize_cache(jsonsafe.loads(raw), get_sanitized_hostname)
+        except (ValueError, TypeError, CorruptCache) as e:   # TypeError: a shape no normalizer anticipated
             log_warning(f"Quarantining corrupt cache: {e}")
             return self._salvage(raw)
 
@@ -267,7 +298,7 @@ class BoundedSessionCache:
         self._install_salvaged(salvaged, raw, now)
         prune_corrupt_quarantine(self.state_dir, now)
         preserve_close_envelopes(self.state_dir)
-        remove_salvaged_markers(salvaged)
+        remove_salvaged_markers(salvaged, self.state_dir)
         log_warning(f"Salvaged {len(salvaged['sessions'])} session(s) from a corrupt cache")
         return salvaged
 

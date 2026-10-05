@@ -7,7 +7,7 @@
 #   - both plugin link locations are removed (README path plugins/local/...);
 #   - state dir follows the §2.2 rule; vendor hooks dir honours
 #     HERDR_BARTENDER_VENDOR_HOOKS_DIR like the Python code;
-#   - pkill is scoped to the current user;
+#   - pkill is scoped to the current user and to real reconciler command lines;
 #   - the fallback guard strip is the byte-exact inverse of the installer.
 # Exit 0: everything removed. Exit 1: something needs attention; DISABLED stays.
 set -u
@@ -18,7 +18,13 @@ STATE_DIR="${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr
 VENDOR_HOOKS_DIR="${HERDR_BARTENDER_VENDOR_HOOKS_DIR:-$HOME/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks}"
 ORPHAN_FILE="$HOME/.herdr-bartender-orphans.json"
 PLUGIN_LINKS=("$HOME/.config/herdr/plugins/herdr-bartender" "$HOME/.config/herdr/plugins/local/herdr-bartender")
-RECONCILER_PATTERN="herdr-bartender --reconcile-background"
+# pkill -f matches this ERE against each process's full command line. Only a Python interpreter (first word)
+# running a .../herdr-bartender launcher whose arguments END with the reconciler flag (plus --flags such as
+# --foreground) is a reconciler; a process that merely mentions the string (grep, an editor, a shell) is not.
+RECONCILER_PATTERN='^[^ ]*[Pp]ython[^ /]* .*/herdr-bartender --reconcile-background( --[a-z-]+)*$'
+# An event handler: the same launcher whose only argument is a Herdr event name (pane.*, tab.*, workspace.*).
+EVENT_PATTERN='^[^ ]*[Pp]ython[^ /]* .*/herdr-bartender (pane|tab|workspace)\.[a-z_.]+$'
+EVENT_DRAIN_TICKS=30   # 3s in 0.1s ticks: twice the 1.5s event-path process deadline
 
 # Resolve this script's real directory (follows symlinks without GNU readlink -f).
 _src="${BASH_SOURCE[0]}"
@@ -30,12 +36,57 @@ done
 SCRIPT_DIR=$(cd -P "$(dirname "$_src")" && pwd)
 BIN="${HERDR_BARTENDER_BIN:-$(dirname "$SCRIPT_DIR")/bin/herdr-bartender}"
 
-case "${STATE_DIR%/}" in
-  "" | "/" | "${HOME%/}")
-    echo "Error: refusing to use unsafe state directory '$STATE_DIR'"
-    exit 1
-    ;;
-esac
+# The physical path of an existing directory (symlinks resolved), else the path unchanged.
+physical_dir() {
+  if [ -d "$1" ]; then (cd -P "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"; else printf '%s\n' "$1"; fi
+}
+
+# True when "$1" must never be created into or `rm -rf`ed: relative, holding a "." or ".." segment, or (with
+# repeated slashes squeezed, logically or physically) "/", $HOME or any ancestor of $HOME.
+unsafe_state_dir() {
+  local dir home_l home_p dir_p d h
+  case "$1" in /*) ;; *) return 0 ;; esac
+  case "/$1/" in */./* | */../*) return 0 ;; esac
+  dir=$(printf '%s' "$1" | tr -s '/'); dir="${dir%/}"
+  home_l=$(printf '%s' "${HOME:-/}" | tr -s '/'); home_l="${home_l%/}"
+  home_p=$(physical_dir "${home_l:-/}"); home_p="${home_p%/}"
+  dir_p=$(physical_dir "${dir:-/}"); dir_p="${dir_p%/}"
+  for d in "$dir" "$dir_p"; do
+    [ -n "$d" ] || return 0
+    for h in "$home_l" "$home_p"; do
+      case "$h/" in "$d"/*) return 0 ;; esac
+    done
+  done
+  return 1
+}
+
+# R53: the final `rm -rf` reaches only this plugin's own directory - a real directory (not a symlink) named
+# herdr-bartender. Any other HERDR_PLUGIN_STATE_DIR override (/tmp, /var, ~/Library/..., a shared dir) is kept.
+removable_state_dir() {
+  local dir
+  dir=$(printf '%s' "$1" | tr -s '/'); dir="${dir%/}"
+  [ -n "$dir" ] && [ -d "$dir" ] && [ ! -L "$dir" ] && [ "${dir##*/}" = "herdr-bartender" ]
+}
+
+if unsafe_state_dir "$STATE_DIR"; then
+  echo "Error: refusing to use unsafe state directory '$STATE_DIR'"
+  exit 1
+fi
+
+# Event handlers that passed the DISABLED check before Step 0 may still be sending (each is bounded by the 1.5s
+# process deadline). Wait for them, so --cleanup's Ended is the last word and none recreates the state dir later.
+drain_event_handlers() {
+  local ticks=0
+  while pgrep -u "$(id -u)" -f "$EVENT_PATTERN" >/dev/null 2>&1; do
+    if [ "$ticks" -ge "$EVENT_DRAIN_TICKS" ]; then
+      echo "Warning: herdr-bartender event handlers still running after 3s; keeping $STATE_DIR"
+      ERRORS=$((ERRORS + 1))
+      return
+    fi
+    sleep 0.1
+    ticks=$((ticks + 1))
+  done
+}
 
 stop_reconcilers() {
   pkill -9 -u "$(id -u)" -f "$RECONCILER_PATTERN" 2>/dev/null || true
@@ -60,6 +111,8 @@ end = end_at + len(E)
 tail = data[end:end + 1]
 if tail not in (b"", b"\n"):
     sys.exit(3)
+if start >= 2 and data[start - 2:start] == b"\n\n":
+    start -= 1  # R37: the old monolith inserted a blank line before BEGIN
 cleaned = data[:start] + data[end + len(tail):]
 tmp = "%s.tmp.%d" % (hook, os.getpid())
 try:
@@ -127,7 +180,8 @@ if command -v herdr >/dev/null 2>&1; then
   fi
 fi
 
-# Step 2: terminate running background reconcilers (this user only)
+# Step 2: let in-flight event handlers finish, then terminate running background reconcilers (this user only)
+drain_event_handlers
 stop_reconcilers
 
 # Step 3: clear Top Shelf entries (--cleanup bypasses the tombstone and has its own budget)
@@ -156,7 +210,12 @@ fi
 # Step 5: remove the state dir ONLY if cleanup was confirmed (exit 0) and every step succeeded
 if [ "$ERRORS" -eq 0 ]; then
   stop_reconcilers
-  if ! rm -rf "$STATE_DIR"; then
+  if ! removable_state_dir "$STATE_DIR"; then
+    echo "Error: refusing to remove $STATE_DIR recursively: only a real directory named herdr-bartender is removed."
+    echo "Every other step succeeded; $STATE_DIR/DISABLED stays. Check its contents and remove it by hand."
+    exit 1
+  fi
+  if ! rm -rf -- "$STATE_DIR"; then
     echo "Error: failed to remove $STATE_DIR"
     exit 1
   fi

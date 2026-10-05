@@ -39,6 +39,13 @@ def critical():
         cache.save(data)
     return 4
 
+def returns():
+    return 0
+
+if sys.argv[3] == "returns":
+    code = watchdog.run_bounded(returns)
+    time.sleep(float(sys.argv[2]) + 0.3)   # finished near the deadline: a slow teardown runs past it
+    sys.exit(code)
 sys.exit(watchdog.run_bounded(blocked if sys.argv[3] == "blocked" else critical))
 """
 
@@ -102,6 +109,23 @@ class HandlerTests(SandboxTestCase):
         self.assertEqual(self.spawner.calls, [handoff.loop_argv()])
         self.assertTrue((self.state_dir / "reconciler.pending").exists())
 
+    def test_run_bounded_disarms_the_timer_once_the_event_path_returns(self):
+        """Low finding (watchdog never disarmed): a finished event path leaves no ITIMER_REAL pending, so a SIGALRM
+        can no longer hit the interpreter's shutdown (signal 14 instead of exit 0)."""
+        previous = signal.getsignal(signal.SIGALRM)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+        runtime.PROCESS_DEADLINE_SECONDS = 30.0
+        runtime.START_TIME = time.monotonic()
+        self.assertTrue(watchdog.arm_watchdog())
+        self.assertGreater(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+        self.assertEqual(watchdog.run_bounded(lambda: 7), 7)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+        self.assertTrue(watchdog.arm_watchdog())
+        with self.assertRaises(SystemExit):
+            watchdog.run_bounded(lambda: (_ for _ in ()).throw(SystemExit(0)))
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0), "disarmed on any exit from the path")
+
     def test_watchdog_armed_at_1p5s_from_process_start(self):
         """Plan §6.1 L698 (gap watchdog-deadline-1p4): ITIMER_REAL is 1.5s measured from the start baseline."""
         self.assertEqual(runtime.DEFAULT_DEADLINE_SECONDS, 1.5)
@@ -150,6 +174,14 @@ class ProcessLevelWatchdogTests(SandboxTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertLess(elapsed, 0.4 + SLACK_SECONDS)
         self.assertTrue((self.state_dir / "reconciler.pending").exists())
+
+    def test_finished_event_path_is_not_killed_after_the_deadline(self):
+        """Low finding: a process that finishes just before the deadline must exit with its own code even when its
+        teardown runs past the deadline (the timer was never disarmed: SIGALRM then raised outside run_bounded)."""
+        proc, _ = self._run_snippet("returns", deadline=0.3)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("WatchdogExpired", proc.stderr)
+        self.assertFalse((self.state_dir / "reconciler.pending").exists(), "a finished path hands nothing off")
 
     def test_deadline_inside_critical_section_is_deferred_until_unlock(self):
         """Plan §6.1 L728 / §10.1 #12: SIGALRM during the critical section waits for save + unlock, then exits 0;

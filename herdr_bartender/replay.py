@@ -20,7 +20,9 @@
    ``in_flight``, ``resync_generation`` bumped) and the reconciler is flagged; a salvaged one
    is never flipped (gap replay-marker-resync). A cached Ended for the session id is
    confirmed through the shared apply-result (evicted). The pane marker is removed only when
-   no live session remains on the pane.
+   no live session remains on the pane. When this check cannot be saved (CacheError) the
+   record is kept, stamped ``resync_owed``: the next replay re-runs only the check, without
+   posting the Ended again.
 6. **Commit under the orphan lock again**: fold any new journal entries, then drop only the
    records that were confirmed, skipped or invalid AND are unchanged since the snapshot
    (concurrent exports are kept). An empty file is unlinked; otherwise it is rewritten
@@ -68,12 +70,16 @@ from .orphans import (
     write_orphan_sessions,
 )
 from .paths import get_state_dir
+from .sanitize import sanitize_agent
 
 REPLAY_CAPACITY = 256
 REPLAY_SOCKET_SECONDS = DEFAULT_EVENT_TIMEOUT   # Plan §9.2 item 3: 0.2s
 REPLAY_BACKOFF_BASE_SECONDS = 20.0              # one reconciler cadence
 REPLAY_BACKOFF_MAX_SECONDS = 300.0              # the absence backoff interval
 ATTEMPTS_FIELD, LAST_ATTEMPT_FIELD = "replay_attempts", "last_replay_at"
+# The record's Ended landed but its post-send re-sync check (§9.2 4a) could not be saved: the next replay re-runs
+# only that check (never a second Ended, which would end a live re-admission again).
+RESYNC_OWED_FIELD = "resync_owed"
 
 Between = Optional[Callable[[], None]]   # called between records (the reconciler's marker heartbeat)
 
@@ -88,10 +94,12 @@ class ReplayReport:
     remaining: Optional[int] = None   # records left in the file after the commit (None: commit failed)
     resynced: Tuple[str, ...] = field(default=())
     deferred: int = 0                 # records in backoff, not replayed by an automatic run
+    resync_owed: Tuple[str, ...] = ()  # Ended landed, re-sync check not saved: kept for the next replay
 
     @property
     def ok(self) -> bool:
-        return not self.unconfirmed and not self.beyond_capacity and self.remaining is not None
+        return not self.unconfirmed and not self.resync_owed and not self.beyond_capacity \
+            and self.remaining is not None
 
 
 # -- automatic replay backoff (pure) ------------------------------------------------------------
@@ -254,8 +262,9 @@ def settle_confirmed(cache_mgr: BoundedSessionCache, sid: str, pane: Optional[st
 
 # -- replay ---------------------------------------------------------------------------------------
 def _send_ended(sid: str, record: object, bridge_url: Optional[str]) -> bool:
-    agent = record.get("agent") if isinstance(record, dict) else None
-    payload = {"state": "Ended", "agent": agent if isinstance(agent, str) and agent else "Herdr", "session_id": sid}
+    # The orphan file is outside data: its agent gets the same control/bidi stripping and 64-char bound as intake.
+    agent = sanitize_agent(record.get("agent")) if isinstance(record, dict) else ""
+    payload = {"state": "Ended", "agent": agent or "Herdr", "session_id": sid}
     return deliver_event(payload, timeout=REPLAY_SOCKET_SECONDS, bridge_url=bridge_url).success
 
 
@@ -275,6 +284,7 @@ class _Run:
     invalid: List[str] = field(default_factory=list)
     unconfirmed: List[str] = field(default_factory=list)
     resynced: List[str] = field(default_factory=list)
+    resync_owed: List[str] = field(default_factory=list)
 
 
 def _settle_unsent(run: _Run, sid: object, record: object, sessions: dict, emit) -> bool:
@@ -293,8 +303,32 @@ def _settle_unsent(run: _Run, sid: object, record: object, sessions: dict, emit)
     return False
 
 
+def _settle_landed(run: _Run, sid: str, record: object, cache_mgr: BoundedSessionCache, emit) -> None:
+    """The Ended for ``sid`` landed: run the post-send re-sync check; the record is settled only once it is saved.
+
+    On CacheError the record stays in the file stamped ``RESYNC_OWED_FIELD``: nothing else would ever re-send a
+    live session admitted while the Ended was in flight (its cache record still reads delivered).
+    """
+    try:
+        if settle_confirmed(cache_mgr, sid, record_pane(sid, record)):
+            run.resynced.append(sid)
+    except CacheError as exc:
+        log_warning(f"Post-send re-sync check for {sid} not saved ({exc}); kept in the orphan file for the next replay")
+        emit(f"    [-] Re-sync check for {sid} not saved; kept for the next replay")
+        run.resync_owed.append(sid)
+        run.retried[sid] = (record, {**with_attempt(record, clock.time()), RESYNC_OWED_FIELD: True})
+        run.resynced.append(sid)   # flags the reconciler, whose automatic replay retries it
+        return
+    run.settled[sid] = record
+
+
 def _replay_one(run: _Run, sid: str, record: object, sessions: dict, cache_mgr: BoundedSessionCache,
                 bridge_url: Optional[str], emit) -> None:
+    if isinstance(record, dict) and record.get(RESYNC_OWED_FIELD) is True and isinstance(sid, str) \
+            and SESSION_ID_REGEX.match(sid):
+        emit(f"    [*] Re-running the re-sync check for {sid} (its Ended already landed)")
+        _settle_landed(run, sid, record, cache_mgr, emit)
+        return
     if _settle_unsent(run, sid, record, sessions, emit):
         return
     if not _send_ended(sid, record, bridge_url):
@@ -304,13 +338,7 @@ def _replay_one(run: _Run, sid: str, record: object, sessions: dict, cache_mgr: 
         return
     emit(f"    [+] Cleared {sid}")
     run.confirmed.append(sid)
-    run.settled[sid] = record
-    try:
-        if settle_confirmed(cache_mgr, sid, record_pane(sid, record)):
-            run.resynced.append(sid)
-    except CacheError as exc:  # the Ended landed; a missed re-sync is caught by the next reconciler pass
-        log_warning(f"Post-send re-sync check for {sid} skipped ({exc}); flagging the reconciler")
-        run.resynced.append(sid)
+    _settle_landed(run, sid, record, cache_mgr, emit)
 
 
 def replay_records(records: Mapping[str, object], bridge_url: Optional[str], emit, between: Between = None) -> _Run:
@@ -358,7 +386,8 @@ def replay_orphan_file(path: Path, bridge_url: Optional[str] = None, quiet: bool
     if remaining == 0:
         emit(f"[+] Successfully cleared all orphaned sessions; removed {path}")
     return ReplayReport(tuple(run.confirmed), tuple(run.skipped), tuple(run.invalid), tuple(run.unconfirmed),
-                        max(0, len(candidates) - len(batch)), remaining, tuple(run.resynced), deferred)
+                        max(0, len(candidates) - len(batch)), remaining, tuple(run.resynced), deferred,
+                        tuple(run.resync_owed))
 
 
 def run_replay_orphans(orphan_path_str: str, bridge_url: Optional[str] = None, quiet: bool = False,

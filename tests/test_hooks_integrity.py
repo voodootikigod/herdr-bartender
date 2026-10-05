@@ -16,6 +16,7 @@ from herdr_bartender.hooks import (
     STATUS_NEEDS_PATCH,
     STATUS_NEEDS_REVIEW,
     STATUS_NO_HOOKS,
+    STATUS_NOT_INSTALLED,
     check_hook_integrity,
     install_hooks,
     repair_hooks_if_allowlisted,
@@ -57,6 +58,12 @@ class _IntegrityCase(SandboxTestCase):
 
     def unpatch(self, paths, name, content):
         paths[name].write_bytes(content)
+
+    def opt_in_with_old_release(self):
+        """R42: an earlier explicit install approved an OLDER vendor release; both hooks were since replaced upstream
+        (guard gone, unknown SHA). The allowlist file is the opt-in evidence."""
+        return write_allowlist(self.state_dir, {CLAUDE_HOOK: sha256(b"#!/bin/bash\n# claude release 1\n"),
+                                                CODEX_HOOK: sha256(b"#!/bin/bash\n# codex release 1\n")})
 
     def plugin_log(self):
         log = self.state_dir / "plugin.log"
@@ -144,6 +151,7 @@ class RepairHooksTests(_IntegrityCase):
     def test_unknown_hook_is_flagged_not_patched_and_alerts_once(self):
         """Plan §10.1 #68 (gaps t68-hook-review, hook-integrity-allowlist-bypass): unknown -> review, one alert."""
         paths = seed_vendor_hooks(self.hooks_dir)
+        allowlist = self.opt_in_with_old_release().read_bytes()
         for attempt in (1, 2):
             with self.subTest(attempt=attempt):
                 result = repair_hooks_if_allowlisted()
@@ -153,7 +161,7 @@ class RepairHooksTests(_IntegrityCase):
                 self.assertEqual(paths[CLAUDE_HOOK].read_bytes(), VENDOR_CLAUDE, "unknown content is never patched")
                 self.assertEqual(len(self.osascript_calls()), 1, "the macOS alert fires exactly once")
         self.assertEqual(result.alert_sent, False)
-        self.assertFalse(self.sha_file.exists())
+        self.assertEqual(self.sha_file.read_bytes(), allowlist, "the allowlist is never written by the check")
         self.assertIn("WARNING: vendor hook needs review", self.plugin_log())
 
     def test_one_unknown_hook_blocks_all_patching(self):
@@ -192,6 +200,7 @@ class RepairHooksTests(_IntegrityCase):
     def test_alert_failure_is_logged_not_raised(self):
         """Plan §7.3: a missing osascript (non-macOS) never breaks the reconciler; the flag is still set."""
         seed_vendor_hooks(self.hooks_dir)
+        self.opt_in_with_old_release()
         with mock.patch.object(hooks_integrity.subprocess, "run", side_effect=FileNotFoundError("osascript")):
             result = repair_hooks_if_allowlisted()
         self.assertTrue(result.review_flagged)
@@ -232,6 +241,7 @@ class ReconcilerHookReviewTests(_IntegrityCase):
     def test_p68_unknown_hook_needs_review_in_reconciler(self):
         """Plan §10.1 #68 (gap hook-integrity-allowlist-bypass): no allowlist entry -> review, never auto-patched."""
         paths = seed_vendor_hooks(self.hooks_dir)
+        write_allowlist(self.state_dir, {CODEX_HOOK: KNOWN[CODEX_HOOK]})   # opted in; no entry for the Claude hook
         self.reconcile()
         self.assertEqual(paths[CLAUDE_HOOK].read_bytes(), VENDOR_CLAUDE)
         self.assertTrue(self.hnr.exists() and self.alerted.exists())
@@ -250,6 +260,71 @@ class ReconcilerHookReviewTests(_IntegrityCase):
         self.assertTrue(self.hnr.exists() and self.alerted.exists())
         self.assertEqual(self.sha_file.read_bytes(), before)
         self.assertEqual(os.stat(self.sha_file).st_mtime, 1)
+
+
+class NeverOptedInTests(_IntegrityCase):
+    """R42. Round-2 finding (operability): a fresh install that skipped the OPTIONAL ``--install-hooks`` (no allowlist
+    file, no guard in any hook) raised HOOK_NEEDS_REVIEW, a false "Vendor hook updated" macOS alert, a false
+    "modified upstream" --status warning, and a WARNING line in plugin.log on every 20s reconciler pass."""
+
+    def reconcile(self):
+        run_reconcile_background(bridge_url=self.mock_url, loop_once=True)
+
+    def test_unpatched_hooks_without_allowlist_are_not_installed(self):
+        paths = seed_vendor_hooks(self.hooks_dir)
+        result = check_hook_integrity()
+        self.assertEqual(result.status, STATUS_NOT_INSTALLED)
+        self.assertEqual([h.status for h in result.hooks], ["missing_guard", "missing_guard"])
+        for _ in range(3):
+            self.reconcile()
+            repair = repair_hooks_if_allowlisted()
+            self.assertEqual((repair.status, repair.repaired, repair.review_flagged), (STATUS_NOT_INSTALLED, (), False))
+        self.assertEqual(paths[CLAUDE_HOOK].read_bytes(), VENDOR_CLAUDE, "nothing is ever patched")
+        self.assertEqual(paths[CODEX_HOOK].read_bytes(), VENDOR_CODEX)
+        self.assertFalse(self.hnr.exists() or self.alerted.exists() or self.sha_file.exists())
+        self.assertEqual(self.osascript_calls(), [])
+        self.assertNotIn("needs review", self.plugin_log())
+        status = self.run_cli("--status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertNotIn("[WARNING]", status.stdout)
+
+    def test_opt_in_evidence_keeps_the_fail_closed_review(self):
+        """An allowlist file (any content) or a guard in any hook is opt-in evidence: unknown still means review."""
+        cases = {"allowlist-empty-object": "{}", "allowlist-corrupt": "{oops", "allowlist-old-release": None,
+                 "guard-in-one-hook": "guard"}
+        for label, allowlist in cases.items():
+            with self.subTest(case=label):
+                self.sha_file.unlink(missing_ok=True)
+                paths = seed_vendor_hooks(self.hooks_dir)
+                if allowlist == "guard":
+                    paths[CODEX_HOOK].write_bytes(insert_guard(VENDOR_CODEX, T))
+                elif allowlist is None:
+                    self.opt_in_with_old_release()
+                else:
+                    self.sha_file.write_text(allowlist)
+                self.assertEqual(check_hook_integrity().status, STATUS_NEEDS_REVIEW)
+
+    def test_review_warning_logged_once_per_change_of_causes(self):
+        """Plan §10.1 #68 / R42. An unchanged review is re-checked every pass but logged once; HOOK_NEEDS_REVIEW
+        records the causes, which --status prints; a new cause logs again."""
+        paths = seed_vendor_hooks(self.hooks_dir)
+        self.opt_in_with_old_release()
+        for _ in range(3):
+            self.assertTrue(repair_hooks_if_allowlisted().review_flagged)
+        warnings = [l for l in self.plugin_log().splitlines() if "WARNING: vendor hook needs review" in l]
+        self.assertEqual(len(warnings), 1, warnings)
+        causes = f"{CLAUDE_HOOK}=missing_guard/unknown-sha, {CODEX_HOOK}=missing_guard/unknown-sha"
+        self.assertEqual(self.hnr.read_text().strip(), causes)
+        self.assertEqual(os.stat(self.hnr).st_mode & 0o777, 0o600)
+        status = self.run_cli("--status")
+        self.assertIn(f"Review needed: {causes}", status.stdout)
+
+        paths[CODEX_HOOK].write_bytes(insert_guard(VENDOR_CODEX, T) + T + b"\n")   # now malformed markers
+        self.assertTrue(repair_hooks_if_allowlisted().review_flagged)
+        warnings = [l for l in self.plugin_log().splitlines() if "WARNING: vendor hook needs review" in l]
+        self.assertEqual(len(warnings), 2, "a changed cause is logged again")
+        self.assertIn(f"{CODEX_HOOK}=malformed", self.hnr.read_text())
+        self.assertEqual(len(self.osascript_calls()), 1, "still a single alert")
 
 
 if __name__ == "__main__":

@@ -25,10 +25,11 @@ Exit codes:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Optional, Set, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 from . import clock, runtime
 from .cache import UNBOUNDED_LOCK_TIMEOUT, BoundedSessionCache, CacheError
+from .delivery_state import journal_exports_before_save
 from .lifecycle import expire_session, orphan_record, sendable
 from .log import log_debug, log_warning
 from .markers import touch_heartbeat
@@ -58,7 +59,8 @@ class _Progress:
     """Per-run bookkeeping (local to ``run_cleanup``)."""
 
     targeted: Mapping[str, int] = field(default_factory=dict)   # session id -> the seq of the Ended staged
-    landed_unrecorded: Set[str] = field(default_factory=set)   # confirmed, Step C written to results/
+    # session id -> seq of an Ended the bridge confirmed whose Step C went to results/ (the reconciler applies it)
+    landed_unrecorded: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -104,7 +106,7 @@ def _deliver(cache_mgr: BoundedSessionCache, claim: Claim, policy: SendPolicy, b
     post = settle(cache_mgr, claim, sent, policy)
     run_post_lock(cache_mgr, post, policy, bridge_url)
     if sent.transmitted and sent.result.success and post.live_remaining is None:
-        progress.landed_unrecorded.add(claim.session_id)   # Step C deferred to results/: the reconciler applies it
+        progress.landed_unrecorded[claim.session_id] = claim.seq   # Step C deferred to results/
 
 
 def _round(cache_mgr: BoundedSessionCache, outstanding: List[str], policy: SendPolicy,
@@ -151,11 +153,22 @@ def _owed_ended(sid: str, record: dict, progress: _Progress) -> bool:
         and int(record.get("seq", 0) or 0) >= staged
 
 
+def _landed(sid: str, record: dict, progress: _Progress) -> bool:
+    """Confirmed by the bridge (Step C in results/) and not moved on since: still that Ended, no newer seq.
+
+    A session re-admitted live after its Ended landed (or ended again at a newer, unconfirmed seq) is not
+    confirmed: R31 still makes the exit code 2 for it.
+    """
+    landed = progress.landed_unrecorded.get(sid)
+    return landed is not None and record.get("desired_state") == "Ended" \
+        and int(record.get("seq", 0) or 0) <= landed
+
+
 def _sort_leftovers(sessions: Mapping, progress: _Progress, mark_at: Optional[float]) -> _Leftovers:
     """Split the cached sessions into this run's unconfirmed Endeds (marked when ``mark_at``) and the others."""
     exports, others = [], []
     for sid, record in sessions.items():
-        if not isinstance(record, dict) or sid in progress.landed_unrecorded:
+        if not isinstance(record, dict) or _landed(sid, record, progress):
             continue
         if not _owed_ended(sid, record, progress):
             others.append(sid)
@@ -170,6 +183,8 @@ def _leftovers_locked(cache_mgr: BoundedSessionCache, progress: _Progress) -> _L
     with cache_mgr as data:
         leftovers = _sort_leftovers(data.get("sessions", {}), progress, clock.time())
         if leftovers.exports:
+            # Durable before the save marks them orphaned_ended (cap-evictable); a failed journal flags them instead.
+            journal_exports_before_save(data, leftovers.exports)
             cache_mgr.save(data)
     return leftovers
 

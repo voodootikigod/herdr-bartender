@@ -17,9 +17,10 @@ import itertools
 import json
 import os
 from pathlib import Path
-from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple
+from typing import Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Tuple
 
-from . import clock
+from . import clock, jsonsafe
+from .envelopes import quarantine
 from .log import log_debug
 from .paths import PRIVATE_FILE_MODE, ensure_private_dir, get_orphan_path
 from .handoff import in_reconciler_loop, touch_reconciler_pending
@@ -106,7 +107,7 @@ def parse_orphan_records(raw: object) -> Dict[str, object]:
 def read_orphan_records(orphan_path: Path) -> Dict[str, object]:
     """The records of ``orphan_path`` ({} when it does not exist); raises OrphanFileError when unreadable."""
     try:
-        raw = json.loads(orphan_path.read_text(encoding="utf-8"))
+        raw = jsonsafe.loads(orphan_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as exc:
@@ -115,6 +116,16 @@ def read_orphan_records(orphan_path: Path) -> Dict[str, object]:
 
 
 _read_orphan_sessions = read_orphan_records   # writer-side name (one parser for writer and reader)
+
+
+def read_orphan_sids(orphan_file: Optional[Path] = None) -> FrozenSet[str]:
+    """Session ids in the orphan file; lock-free (the file is only ever replaced atomically), empty when unreadable."""
+    orphan_path = orphan_file or get_orphan_path()
+    try:
+        return frozenset(read_orphan_records(orphan_path))
+    except OrphanFileError as e:
+        log_debug(f"Orphan file not readable for its session ids: {e}")
+        return frozenset()
 
 
 def fsync_directory(directory: Path) -> None:
@@ -201,38 +212,58 @@ def _valid_op(op: object) -> bool:
     return op.get("op") == OP_REMOVE
 
 
-def _load_journal(orphan_path: Path) -> Tuple[List[Path], List[dict]]:
-    """(entry paths, valid ops) in arrival order; unreadable entries are logged and dropped."""
+class _Journal(NamedTuple):
+    applied: List[Path]   # read and valid: unlinked once their ops are written
+    ops: List[dict]       # the valid ops, in arrival order
+    poison: List[Path]    # can never be applied (undecodable / malformed): quarantined by the lock holder
+
+
+def _load_journal(orphan_path: Path) -> _Journal:
+    """Read the journal in arrival order (never changes it: lock-free readers use this too).
+
+    An entry that cannot be read right now (OSError, e.g. EIO or EACCES) is in no list: it stays queued for the
+    next lock holder, since it may be the only durable copy of an owed Ended export.
+    """
     pending = pending_dir_for(orphan_path)
     if not pending.is_dir():
-        return [], []
-    entries = sorted(pending.glob("*.json"))
-    ops = []
-    for entry in entries:
+        return _Journal([], [], [])
+    journal = _Journal([], [], [])
+    for entry in sorted(pending.glob("*.json")):
         try:
-            op = json.loads(entry.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as e:
-            log_debug(f"Dropping unreadable orphan journal entry {entry.name}: {e}")
+            op = jsonsafe.loads(entry.read_text(encoding="utf-8"))
+        except OSError as e:
+            log_debug(f"Orphan journal entry {entry.name} unreadable now ({e}); kept for the next lock holder")
+            continue
+        except ValueError as e:
+            log_debug(f"Orphan journal entry {entry.name} undecodable ({e}); quarantining it")
+            journal.poison.append(entry)
             continue
         if _valid_op(op):
-            ops.append(op)
+            journal.applied.append(entry)
+            journal.ops.append(op)
         else:
-            log_debug(f"Dropping malformed orphan journal entry {entry.name}")
-    return entries, ops
+            log_debug(f"Orphan journal entry {entry.name} malformed; quarantining it")
+            journal.poison.append(entry)
+    return journal
 
 
 def journaled_export_sids(orphan_file: Optional[Path] = None) -> FrozenSet[str]:
     """Session ids with an export waiting in the journal (durable, not yet folded into the file)."""
-    _, ops = _load_journal(orphan_file or get_orphan_path())
+    ops = _load_journal(orphan_file or get_orphan_path()).ops
     return frozenset(op["sid"] for op in ops if op.get("op") == OP_EXPORT)
 
 
 def _apply_op(sessions: dict, op: dict) -> dict:
-    """Pure: ``sessions`` with ``op`` applied (exports keep the newest ORPHAN_CAPACITY)."""
+    """Pure: ``sessions`` with ``op`` applied (exports keep the newest ORPHAN_CAPACITY).
+
+    An export always lands at the end (file order is export order, R33): a fresh export of a
+    session id already in the file replaces the record and makes it the newest (R27).
+    """
     sid = op["sid"]
+    others = {k: v for k, v in sessions.items() if k != sid}
     if op["op"] == OP_REMOVE:
-        return {k: v for k, v in sessions.items() if k != sid}
-    merged = {**sessions, sid: op["session"]}
+        return others
+    merged = {**others, sid: op["session"]}
     if len(merged) > ORPHAN_CAPACITY:
         return dict(list(merged.items())[-ORPHAN_CAPACITY:])
     return merged
@@ -243,17 +274,19 @@ def _commit_locked(orphan_path: Path, ops: List[dict]) -> None:
 
     Raises OrphanFileError, leaving the file AND the journal untouched, when the file cannot be understood.
     """
-    entries, journaled = _load_journal(orphan_path)
+    journal = _load_journal(orphan_path)
     before = _read_orphan_sessions(orphan_path)
     after = before
-    for op in [*journaled, *ops]:
+    for op in [*journal.ops, *ops]:
         after = _apply_op(after, op)
     if not after:
         orphan_path.unlink(missing_ok=True)
-    elif after != before or not orphan_path.exists():
+    elif list(after.items()) != list(before.items()) or not orphan_path.exists():   # order is data (R33)
         write_orphan_sessions(orphan_path, after)
-    for entry in entries:
+    for entry in journal.applied:
         entry.unlink(missing_ok=True)
+    for entry in journal.poison:   # never silently deleted: the bytes stay for the operator
+        quarantine(entry, pending_dir_for(orphan_path) / "bad", "orphan journal entry that cannot be applied")
 
 
 def _locked_or_journaled(orphan_path: Path, op: dict, blocking: bool) -> bool:
@@ -368,9 +401,9 @@ def flush_pending_orphan_ops(orphan_file: Optional[Path] = None, blocking: bool 
             return False
         try:
             _commit_locked(orphan_path, [])
-            return True
         finally:
             release_orphan_lock(lock_fd)
+        return not _journal_waiting(orphan_path)   # an entry unreadable now stays queued: not drained
     except Exception as e:
         log_debug(f"Failed to flush orphan journal for {orphan_path}: {e}")
         return False
@@ -399,7 +432,7 @@ def orphan_pane_ids(orphan_file: Optional[Path] = None) -> Optional[FrozenSet[st
         return None
     try:
         sessions = _read_orphan_sessions(orphan_path)
-        _, ops = _load_journal(orphan_path)
+        ops = _load_journal(orphan_path).ops
     except OrphanFileError as e:
         log_debug(f"Orphan panes unknown ({e}); prune deferred")
         return None

@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from herdr_bartender import background, clock
+from herdr_bartender.orphans import journaled_export_sids
 from herdr_bartender.paths import get_orphan_path
 from herdr_bartender.reconciler import reconcile_active_sessions
 from herdr_bartender.sender.compensation import (
@@ -119,6 +120,45 @@ class ReconcilerSpinTests(OwedCompensationCase):
         (entry,) = self.owed()
         self.assertEqual(entry["attempts"], 1)
 
+
+    def test_exhausted_entry_is_exported_only_once_the_last_delay_passed(self):
+        """Low finding (timing not pinned): after the 5th unconfirmed POST the entry is exported to the orphan journal
+        COMPENSATION_RETRY_DELAYS[-1] seconds later - not earlier (an export that skips the last wait gives the 5th
+        POST no chance to be confirmed by the bridge's own retries) - and without a 6th POST."""
+        last_delay = COMPENSATION_RETRY_DELAYS[-1]
+        self.seed(attempts=MAX_COMPENSATION_ATTEMPTS, last_attempt=clock.time(), posted=True)
+        self.clock.advance(last_delay - 0.5)
+        reconcile_active_sessions(self.state_dir, bridge_url=self.mock_url)
+        self.assertEqual(len(self.owed()), 1, "still owed before the last delay passed")
+        self.assertNotIn(self.session_id, journaled_export_sids())
+        self.clock.advance(0.5)
+        reconcile_active_sessions(self.state_dir, bridge_url=self.mock_url)
+        self.assertEqual(self.owed(), [])
+        self.assertIn(self.session_id, journaled_export_sids())
+        self.assertEqual(self.compensation_posts(), [], "an exhausted entry is never POSTed again")
+
+    def test_exhausted_entry_whose_orphan_export_fails_stays_owed(self):
+        """Round-3 finding: when the orphan journal cannot be written (ENOSPC/EACCES) an exhausted compensating Ended
+        is kept owed with a refreshed last_attempt - never dropped (a phantom Working would stay on Top Shelf) and
+        never POSTed again. A later pass whose export works journals it and drops it."""
+        last_delay = COMPENSATION_RETRY_DELAYS[-1]
+        self.seed(attempts=MAX_COMPENSATION_ATTEMPTS, last_attempt=clock.time() - 100, posted=True)
+        from herdr_bartender.sender import dispatch
+        failed_at = clock.time()
+        with mock.patch.object(dispatch, "journal_orphan_exports", side_effect=OSError(28, "No space left on device")):
+            reconcile_active_sessions(self.state_dir, bridge_url=self.mock_url)
+        (entry,) = self.owed()
+        self.assertEqual((entry["attempts"], entry["last_attempt"]), (MAX_COMPENSATION_ATTEMPTS, failed_at))
+        self.assertNotIn(self.session_id, journaled_export_sids())
+        self.assertFalse(get_orphan_path().exists())
+        self.clock.advance(last_delay)
+        reconcile_active_sessions(self.state_dir, bridge_url=self.mock_url)
+        self.assertEqual(self.owed(), [])
+        exported = set(journaled_export_sids())
+        if get_orphan_path().exists():   # the pass may already have folded the journal into the file
+            exported |= set(json.loads(get_orphan_path().read_text())["sessions"])
+        self.assertIn(self.session_id, exported)
+        self.assertEqual(self.compensation_posts(), [], "an exhausted entry is never POSTed again")
 
     def test_malformed_entries_are_purged_not_kept_as_work(self):
         """An entry that can never be sent (no session id) would keep the loop awake forever: the drain drops it."""

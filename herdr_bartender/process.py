@@ -117,13 +117,18 @@ def _run_probe(argv: List[str]) -> Optional[subprocess.CompletedProcess]:
 
 
 def _pgrep(args: List[str]) -> Optional[List[int]]:
-    """PIDs matched by pgrep: [] when nothing matches (exit 1), None when the probe failed."""
+    """PIDs matched by pgrep: [] when nothing matches (exit 1), None when the probe failed.
+
+    Only the first field of each line is a PID: Linux procps prints "<pid> <command line>"
+    for ``-a`` (macOS prints the PID alone), and digits in a command line are not PIDs.
+    """
     res = _run_probe(["pgrep", *args])
     if res is None or res.returncode not in (0, 1):
         return None
     if res.returncode == 1:
         return []
-    return sorted({int(tok) for tok in res.stdout.split() if tok.isdigit()})
+    firsts = (line.split(None, 1)[0] for line in res.stdout.splitlines() if line.strip())
+    return sorted({int(tok) for tok in firsts if tok.isdigit()})
 
 
 def _ps_field(pid: int, field: str) -> Optional[str]:
@@ -264,10 +269,12 @@ def _is_gui_bundle(pid: int) -> bool:
 
 
 def _probe_herdr() -> ProcessProbe:
-    by_name = _pgrep(["-xi", HERDR_PROCESS_NAME])
+    # R44: -a includes our own ancestors. macOS pgrep otherwise skips them, and Herdr is the
+    # ancestor of every plugin process it spawns (on Linux procps -a only lists the command line).
+    by_name = _pgrep(["-a", "-xi", HERDR_PROCESS_NAME])
     if by_name is None:
         return ProcessProbe(None, False)  # pgrep failing/hung: do not spend more budget on it
-    by_bundle = _pgrep(["-f", HERDR_APP_PATTERN])
+    by_bundle = _pgrep(["-a", "-f", HERDR_APP_PATTERN])
     candidates = sorted(set(by_name) | set(by_bundle or []))
     if not candidates:
         return ProcessProbe(None, by_bundle is not None)

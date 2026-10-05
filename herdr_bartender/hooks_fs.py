@@ -15,10 +15,11 @@ import tempfile
 from pathlib import Path
 from typing import Dict, Tuple
 
+from . import jsonsafe
 from .log import log_warning
 
 BASH_CHECK_TIMEOUT_SECONDS = 10.0
-_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+_SHA_RE = re.compile(r"^[0-9a-f]{64}\Z")
 
 
 class HookWriteError(OSError):
@@ -105,7 +106,7 @@ def unlink_flags(state_dir: Path, names) -> None:
 def load_sha_allowlist(path: Path) -> Dict[str, str]:
     """Known-clean hook SHAs; a missing, corrupt or invalid file yields {} (fail closed)."""
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = jsonsafe.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as e:

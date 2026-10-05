@@ -11,11 +11,12 @@ untouched, so several envelopes can be staged into one batch and saved once.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Callable, Mapping, Optional, Tuple
 
 from . import clock
-from .cache import SESSION_CAP, safe_to_evict
+from .cache import ORPHAN_MIRROR_OWED, SESSION_CAP, event_time, mirror_copy, safe_to_evict
 from .delivery_state import foreign_lease_open, record_tombstone, stage_vendor_cleanup
 from .intake import (
     PANE_CLOSED,
@@ -44,9 +45,13 @@ SOURCE_STALENESS_TOLERANCE = 0.1   # Plan §4.3 L425: drop only when older than 
 STAGED = "staged"
 CLOSE_ORIGIN_FIELDS = ("close_kind", "closed_at_ns", "closed_source_ts", "exit_at_ns", "exit_source_ts")
 # Lifecycle stamps of the previous turn's Ended (TTL expiry, orphan horizon, R12): a new turn starts without them.
-PREVIOUS_TURN_FIELDS = CLOSE_ORIGIN_FIELDS + ("ttl_expired_at", "expiry_reason", "orphaned_ended", "orphaned_at")
+PREVIOUS_TURN_FIELDS = CLOSE_ORIGIN_FIELDS + ("ttl_expired_at", "expiry_reason", "orphaned_ended", "orphaned_at",
+                                              ORPHAN_MIRROR_OWED)
 # A salvaged record stamps these with the salvage time, which is not a real arrival or admission (Plan §6.3).
 SALVAGE_STAMPED_FIELDS = ("admitted_at_ns", "last_arrival_ns", "last_event_ns", "last_applied_arrival_time")
+# R48: what a later-processed close needs to judge this generation's admission by arrival order, not lock order.
+ADMISSION_SIGNAL = "admission_signal"   # the generation's admitting event (+ the pane's pre-admission source ts)
+POSITIVE_SIGNAL = "positive_signal"     # the generation's latest positive ``working`` event (event agent present)
 
 
 @dataclass(frozen=True)
@@ -81,12 +86,14 @@ class CloseTarget:
 
 
 def _num(value: object) -> Optional[float]:
+    """A finite float, or None (absent, not a number, ``"NaN"``/``"inf"``, or an int beyond the float range)."""
     if isinstance(value, bool) or value is None:
         return None
     try:
-        return float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
         return None
+    return number if math.isfinite(number) else None
 
 
 def _drop(sid: str, reason: str) -> StatusStage:
@@ -126,7 +133,7 @@ def _capacity_evictions(sessions: Mapping, sid: str, allow_undelivered: bool,
     (oldest ``last_event_at`` first), or None when only live sessions remain (reject)."""
     if sid in sessions or len(sessions) < SESSION_CAP:
         return ()
-    oldest_first = sorted(sessions.items(), key=lambda kv: kv[1].get("last_event_at", 0) or 0)
+    oldest_first = sorted(sessions.items(), key=lambda kv: event_time(kv[1]))
     prunable = [key for key, rec in oldest_first if _prunable_at_cap(rec, allow_undelivered, now_wall)]
     needed = len(sessions) - (SESSION_CAP - 1)
     return tuple(prunable[:needed]) if len(prunable) >= needed else None
@@ -137,7 +144,13 @@ def _undelivered_ended(record: Mapping) -> bool:
 
 
 # -- status --------------------------------------------------------------------------
-def _tombstone_verdict(entry: object, agent_status: object, event_data: Mapping, arr_ns: int,
+def _positive_agent(event_data: Mapping) -> bool:
+    """Plan §4.3 L419: ``event.data.agent`` is non-empty (the raw value; the focused context never counts)."""
+    raw_agent = event_data.get("agent")
+    return bool(raw_agent) and bool(str(raw_agent).strip())
+
+
+def _tombstone_verdict(entry: object, agent_status: object, src_ts: Optional[float], has_agent: bool, arr_ns: int,
                        herdr_alive: Callable[[], bool], pane: str) -> Optional[str]:
     """None: no tombstone or it may be popped; otherwise the drop reason (Plan §4.3 tombstone checks)."""
     if isinstance(entry, dict):
@@ -146,7 +159,6 @@ def _tombstone_verdict(entry: object, agent_status: object, event_data: Mapping,
         last_src = _num(entry.get("last_source_timestamp")) or 0.0
     else:
         closed_ns, closed_src, last_src = int(entry or 0), 0.0, 0.0
-    src_ts = _num(event_data.get("timestamp"))
     if arr_ns <= closed_ns:
         return f"Rejecting late event for closed pane {pane}: arrival {arr_ns} <= tombstone {closed_ns}"
     if src_ts is not None and last_src and src_ts <= last_src:
@@ -155,8 +167,7 @@ def _tombstone_verdict(entry: object, agent_status: object, event_data: Mapping,
         return None
     if agent_status != "working":
         return f"Rejecting non-working status {loggable(agent_status)} for recently closed pane {pane}"
-    raw_agent = event_data.get("agent")
-    if not raw_agent or not str(raw_agent).strip() or not herdr_alive():
+    if not has_agent or not herdr_alive():
         return f"Rejecting event without positive admission signal for recently closed pane {pane}"
     if src_ts is not None and (src_ts <= closed_src or src_ts <= last_src):
         return f"Rejecting pre-close status with source ts {src_ts} <= closed_source_ts {closed_src}"
@@ -214,13 +225,17 @@ def _commit_status(data: dict, sid: str, identity: Identity, event_data: Mapping
         data.get("agent_exits", {}).pop(pane, None)
     record = data["sessions"].setdefault(sid, {})
     event_ns = _clamped_event_ns(plan["arr_ns"], record)
+    signal = plan["signal"]
     if plan["new_generation"] is not None:
         gen = plan["new_generation"]
         data["next_generation"] = gen
         data.setdefault("pane_generations", {})[pane] = gen
-        record.update({"generation": gen, "admitted_at_ns": plan["arr_ns"]})
-        for stale in PREVIOUS_TURN_FIELDS:  # a new turn starts without the previous turn's close origin
-            record.pop(stale, None)
+        record.update({"generation": gen, "admitted_at_ns": plan["arr_ns"],
+                       ADMISSION_SIGNAL: {**signal, "prior_src": _num(record.get("last_source_timestamp")) or 0.0}})
+        for stale in PREVIOUS_TURN_FIELDS + (POSITIVE_SIGNAL,):  # a new turn starts without the previous turn's
+            record.pop(stale, None)                               # close origin and admission evidence
+    if signal["status"] == "working" and signal["agent"]:
+        record[POSITIVE_SIGNAL] = signal
     record["salvaged"] = False
     seq = int(record.get("seq", 0) or 0) + 1
     fields, mapped, arr_ns = plan["fields"], plan["mapped_state"], plan["arr_ns"]
@@ -283,7 +298,7 @@ def stage_status(data: dict, identity: Identity, event_data: Mapping, context: M
     effective_gen = new_gen if new_gen is not None else cached.get("generation", 1)
     if spool_generation is not None and effective_gen > spool_generation:
         return _drop(sid, f"Ignoring spooled event with older generation {spool_generation} < {effective_gen}")
-    exports = tuple((evicted, {**data["sessions"][evicted], "orphaned_ended": True})
+    exports = tuple((evicted, mirror_copy(data["sessions"][evicted], orphaned_ended=True))
                     for evicted in gate.evictions if _undelivered_ended(data["sessions"][evicted]))
     plan = {
         "pop_tombstone": pane in data.get("tombstones", {}), "pop_agent_exit": gate.pop_agent_exit,
@@ -292,6 +307,8 @@ def stage_status(data: dict, identity: Identity, event_data: Mapping, context: M
         "agent_name": format_agent_name(admission.raw_agent),
         "fields": resolve_fields(event_data, context, identity, cached), "host": host, "arr_ns": arr_ns,
         "arr_time": arr_time, "now_wall": now_wall, "source_ts": src_ts,
+        "signal": {"arr_ns": arr_ns, "status": event_data.get("agent_status"), "agent": _positive_agent(event_data),
+                   "src_ts": src_ts},
     }
     return StatusStage(sid, _commit_status(data, sid, identity, event_data, context, plan), STAGED, exports)
 
@@ -313,7 +330,7 @@ def _gate_reason(data: dict, sid: str, pane: str, event_data: Mapping, arr_ns: i
         return _Gate(f"Dropping superseded spooled status for {sid}")
     tomb = data.get("tombstones", {}).get(pane)
     if tomb:
-        reason = _tombstone_verdict(tomb, agent_status, event_data, arr_ns, herdr_alive, pane)
+        reason = _tombstone_verdict(tomb, agent_status, src_ts, _positive_agent(event_data), arr_ns, herdr_alive, pane)
         if reason:
             return _Gate(reason)
     exit_reason, pop_exit = _agent_exit_verdict(data.get("agent_exits", {}).get(pane), agent_status, src_ts,
@@ -360,28 +377,67 @@ def _close_session(record: dict, sid: str, event_name: str, event_data: Mapping,
     return CloseTarget(sid, record.get("pane_id"), record, payload, seq)
 
 
-def _eligible(record: Mapping, arr_ns: int, spool_generation: Optional[int]) -> bool:
-    """R8: skip only when session.generation > envelope.generation; skip closes predating admission.
+def _admission_outlives_close(record: Mapping, arr_ns: int, event_ts: float, herdr_alive: Callable[[], bool],
+                              pane: str) -> bool:
+    """R48: would this generation have been admitted had the close (arrival ``arr_ns``) been processed first?
+
+    Lock order is not arrival order: a trailing status that won the lock before an earlier-arrived close
+    must be judged against the tombstone that close records (Plan §4.3 L410-421), exactly as it would have
+    been had the close won. The generation survives when its admitting event, or its latest positive
+    ``working`` event, passes that tombstone; otherwise the close ends it. A record admitted before
+    admission signals were persisted keeps the plain "close predating admission" rule.
+    """
+    admission = record.get(ADMISSION_SIGNAL)
+    if not isinstance(admission, dict):
+        return True
+    prior_src = _num(admission.get("prior_src")) or 0.0
+    tombstone = {"closed_at_ns": arr_ns, "closed_source_ts": max(event_ts, prior_src, float(arr_ns) / 1e9),
+                 "last_source_timestamp": max(prior_src, event_ts)}
+    for signal in (admission, record.get(POSITIVE_SIGNAL)):
+        if not isinstance(signal, dict):
+            continue
+        reason = _tombstone_verdict(tombstone, signal.get("status"), _num(signal.get("src_ts")),
+                                    bool(signal.get("agent")), int(signal.get("arr_ns") or 0), herdr_alive, pane)
+        if reason is None:
+            return True
+        log_debug(f"Close at {arr_ns} ends a later admission its tombstone would have rejected ({reason})")
+    return False
+
+
+def _eligible(record: Mapping, arr_ns: int, spool_generation: Optional[int], event_ts: float = 0.0,
+              herdr_alive: Callable[[], bool] = lambda: True) -> bool:
+    """R8: skip only when session.generation > envelope.generation; skip closes predating a real admission.
 
     A salvaged record's ``admitted_at_ns`` is the salvage time, not an admission, so the
-    pre-crash closes salvage kept in spool/ still end it (Plan §6.3 step 2).
+    pre-crash closes salvage kept in spool/ still end it (Plan §6.3 step 2). An admission
+    after the close that the close's tombstone would have rejected does not protect the
+    session (R48: the outcome follows arrival order, not which process won the lock).
     """
     if spool_generation is not None and record.get("generation", 1) > spool_generation:
         log_debug(f"Ignoring spooled close with older generation {spool_generation} < {record.get('generation')}")
         return False
     if _ordering_view(record).get("admitted_at_ns", 0) > arr_ns:
-        log_debug(f"Ignoring close predating session admission: close {arr_ns} < admitted {record.get('admitted_at_ns')}")
-        return False
+        if _admission_outlives_close(record, arr_ns, event_ts, herdr_alive, str(record.get("pane_id") or "")):
+            log_debug(f"Ignoring close predating session admission: close {arr_ns} < admitted {record.get('admitted_at_ns')}")
+            return False
     return True
 
 
-def stage_pane_close(data: dict, canonical_pane: str, event_data: Mapping, arr_ns: int,
-                     spool_generation: Optional[int] = None) -> Tuple[CloseTarget, ...]:
+@dataclass(frozen=True)
+class PaneCloseStage:
+    targets: Tuple[CloseTarget, ...]
+    recorded: bool   # the close was applied: pane tombstoned, vendor cleanup staged, marker to be removed
+
+
+def stage_pane_close_result(data: dict, canonical_pane: str, event_data: Mapping, arr_ns: int,
+                            spool_generation: Optional[int] = None, *,
+                            herdr_alive: Callable[[], bool] = lambda: True) -> PaneCloseStage:
     """``pane.closed``: stage every matching session to Ended and tombstone the pane.
 
     The tombstone is recorded only when a matching session accepted the close, or no
-    session is cached for the pane; a close predating the session's admission changes
-    nothing (gap tombstone-on-stale-close).
+    session is cached for the pane; a close predating a real admission of the session
+    changes nothing (gap tombstone-on-stale-close, R48). ``recorded`` tells the caller to
+    remove the pane marker under the same lock (Plan §1 L59).
     """
     sessions = data["sessions"]
     host = resolve_host(data.get("host"))
@@ -390,16 +446,25 @@ def stage_pane_close(data: dict, canonical_pane: str, event_data: Mapping, arr_n
     event_ts = _num(event_data.get("timestamp")) or 0.0
     targets = []
     for sid, rec in matching:
-        if _eligible(rec, arr_ns, spool_generation):
+        if _eligible(rec, arr_ns, spool_generation, event_ts, herdr_alive):
             target = _close_session(rec, sid, PANE_CLOSED, event_data, arr_ns)
             targets.append(CloseTarget(sid, canonical_pane, rec, target.payload, target.seq))
-    if targets or not matching:
+    recorded = bool(targets) or not matching
+    if recorded:
         record_tombstone(data, canonical_pane, arr_ns, max(event_ts, last_src, float(arr_ns) / 1e9),
                          max(last_src, event_ts))
         # Plan §1 L57 / §3.2: a pane close dismisses any vendor entry recorded for the pane, whatever
         # happens to the session's own Ended (persisted; the event path resolves it in the same lock hold).
         stage_vendor_cleanup(data, canonical_pane, True, clock.time())
-    return tuple(targets)
+    return PaneCloseStage(tuple(targets), recorded)
+
+
+def stage_pane_close(data: dict, canonical_pane: str, event_data: Mapping, arr_ns: int,
+                     spool_generation: Optional[int] = None, *,
+                     herdr_alive: Callable[[], bool] = lambda: True) -> Tuple[CloseTarget, ...]:
+    """The targets of ``stage_pane_close_result`` (callers that leave the marker to the Ended's Step C)."""
+    return stage_pane_close_result(data, canonical_pane, event_data, arr_ns, spool_generation,
+                                   herdr_alive=herdr_alive).targets
 
 
 def container_matcher(event_name: str, event_data: Mapping) -> Optional[Callable[[Mapping], bool]]:
@@ -415,15 +480,17 @@ def container_matcher(event_name: str, event_data: Mapping) -> Optional[Callable
 
 
 def stage_container_close(data: dict, event_name: str, event_data: Mapping, arr_ns: int,
-                          spool_generation: Optional[int] = None) -> Tuple[CloseTarget, ...]:
+                          spool_generation: Optional[int] = None, *,
+                          herdr_alive: Callable[[], bool] = lambda: True) -> Tuple[CloseTarget, ...]:
     """``tab.closed`` / ``workspace.closed``: stage matching sessions to Ended and tombstone each pane."""
     matches = container_matcher(event_name, event_data)
     if matches is None:
         log_debug(f"Ignoring {event_name} without a valid container id")
         return ()
+    event_ts = _num(event_data.get("timestamp")) or 0.0
     targets = []
     for sid, rec in list(data["sessions"].items()):
-        if not matches(rec) or not _eligible(rec, arr_ns, spool_generation):
+        if not matches(rec) or not _eligible(rec, arr_ns, spool_generation, event_ts, herdr_alive):
             continue
         target = _close_session(rec, sid, event_name, event_data, arr_ns)
         if target.pane_id:

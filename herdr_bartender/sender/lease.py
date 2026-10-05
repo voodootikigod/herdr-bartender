@@ -11,15 +11,14 @@ unknown Herdr probe counts as alive (as a failed probe does).
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-from .. import runtime
+from .. import jsonsafe, runtime
 from ..cache import CACHE_FILE_NAME
-from ..delivery_state import LEASE_GRACE_SECONDS, Transmission
+from ..delivery_state import LEASE_GRACE_SECONDS, LEASE_SECONDS, Transmission
 from ..delivery_state import foreign_lease_open as _foreign_lease_open
 from ..log import log_debug
 from ..process import (
@@ -32,7 +31,7 @@ from ..process import (
     warm_process_identity,
 )
 
-LEASE_SECONDS = 1.5
+# Plan §1 L68: one lease duration (1.5s) for every code path - the Step A claim reuses delivery_state's constant.
 LEASE_FIELDS = ("lease_token", "sending_pid", "lease_deadline")
 
 InstanceAlive = Callable[[Optional[int], Optional[str]], bool]
@@ -112,7 +111,7 @@ def peek_cache(state_dir: Path) -> dict:
     taken from it.
     """
     try:
-        data = json.loads((Path(state_dir) / CACHE_FILE_NAME).read_bytes())
+        data = jsonsafe.loads((Path(state_dir) / CACHE_FILE_NAME).read_bytes())
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as e:

@@ -8,8 +8,9 @@ import json
 import os
 import time
 import unittest
+from unittest import mock
 
-from herdr_bartender import dismissals, process
+from herdr_bartender import dismissals, process, reconciler
 from herdr_bartender.cache_schema import DISMISSED_VENDOR_CAP
 from herdr_bartender.dismissals import Triggers, plan_dismissals
 from herdr_bartender.handlers import handle_agent_status_changed, handle_pane_closed
@@ -168,14 +169,24 @@ class SettlingWindowTests(DismissalCase):
         self.assertFalse((self.state_dir / "DISABLED").exists(), "the loop idled out on its own")
 
     def test_queue_is_capped_at_64_oldest_pruned(self):
+        """Plan §1 L56. Round-2 low finding: the cap was only checked against the imported constant, so changing it
+        survived the suite. Literals: 70 staged, the 64 newest kept (uuids 6..69), the 6 oldest pruned."""
+        self.assertEqual(DISMISSED_VENDOR_CAP, 64)
         with self.cache_mgr as data:
-            for i in range(DISMISSED_VENDOR_CAP + 6):
+            for i in range(70):
                 stage_dismissal(data, f"vendor-uuid-{i:016d}", PANE, 1000.0 + i)
             self.cache_mgr.save(data)
         queued = self.queued()
-        self.assertEqual(len(queued), DISMISSED_VENDOR_CAP)
-        self.assertNotIn(f"vendor-uuid-{0:016d}", queued)
-        self.assertIn(f"vendor-uuid-{DISMISSED_VENDOR_CAP + 5:016d}", queued)
+        self.assertEqual(sorted(queued), [f"vendor-uuid-{i:016d}" for i in range(6, 70)])
+
+    def test_cache_load_caps_an_oversized_queue_at_64(self):
+        """A cache written with more than 64 queued dismissals (older code, hand edit) is capped on load, newest kept."""
+        with self.cache_mgr as data:
+            data["dismissed_vendor_uuids"] = {
+                f"vendor-uuid-{i:016d}": {"timestamp": 1000.0 + i, "pane_hex": "aa", "attempts": 0, "last_attempt": 0.0}
+                for i in range(80)}
+            self.cache_mgr.save(data)
+        self.assertEqual(sorted(self.queued()), [f"vendor-uuid-{i:016d}" for i in range(16, 80)])
 
     def test_entry_without_timestamp_is_stamped_then_ages_out(self):
         queue = {UUID: {"pane_hex": "aa", "attempts": 1, "last_attempt": 0.0}}
@@ -232,6 +243,95 @@ class VendorActiveHorizonTests(DismissalCase):
         handle_agent_status_changed({"agent_status": "working", "pane_id": pane, "workspace_id": "w1",
                                      "agent": "claude"}, {}, bridge_url=self.mock_url)
         self.assertFalse(bare.exists())
+
+
+class FallbackProtectionTests(DismissalCase):
+    """R35 (Plan §3.2 Codex row item 3, §5.1 5b, #60, R24): while Herdr is dead - or the integration is off
+    (NO_HOOKS / DISABLED) - the native vendor fallback is the live representation. A confirmed Ended (the
+    Herdr-dead expiry above all) must neither dismiss the vendor UUID nor unlink ``.vendor_active``."""
+
+    def kill_herdr(self):
+        self.clear_fake_processes()
+        self.add_fake_process("Bartender 6", pid=DEFAULT_BARTENDER_PID)
+        process.reset_caches()
+
+    def test_herdr_dead_expiry_keeps_the_vendor_fallback(self):
+        """Plan §10.1 #60 / R35. Finding: Herdr dead >300s expires the session; its confirmed Ended dismissed the guard's live vendor
+        fallback (a Waiting prompt) and deleted .vendor_active. Now the Ended is sent and evicted, nothing else."""
+        sid = self.sid(PANE)
+        seed(self.cache_mgr, {sid: session(PANE, "Waiting", seq=2, now=self.clock.time())})
+        self.kill_herdr()
+        self.reconcile()
+        vendor = pane_file(self.state_dir, PANE, ".vendor_active")
+        vendor.write_text(json.dumps({"vendor_session_id": UUID}))   # the guard fell through during the outage
+        self.clock.advance(301)
+        process.reset_caches()
+        self.reconcile()
+        self.assertEqual([e["state"] for e in self.bridge.events_for(sid)], ["Ended"])
+        self.assertNotIn(sid, read_cache(self.cache_mgr)["sessions"])
+        self.assertEqual(self.posts(), [], "no vendor Ended while Herdr is dead")
+        self.assertTrue(vendor.exists(), ".vendor_active preserved while Herdr is dead")
+        data = read_cache(self.cache_mgr)
+        self.assertEqual((data["dismissed_vendor_uuids"], data["pending_vendor_cleanups"]), ({}, []),
+                         "the cleanup is cancelled, not left owed (no busy reconciler)")
+
+    def test_reconciler_settle_re_probes_herdr_before_locking(self):
+        """The pass snapshot's 0.5s liveness memo may have lapsed by the time a send is settled (a long pass); the
+        reconciler's Step C re-resolves it outside the lock instead of reading "not memoised" as alive."""
+        sid = self.sid(PANE)
+        seed(self.cache_mgr, {sid: session(PANE, "Waiting", seq=2, now=self.clock.time())})
+        self.kill_herdr()
+        self.reconcile()
+        vendor = pane_file(self.state_dir, PANE, ".vendor_active")
+        vendor.write_text(json.dumps({"vendor_session_id": UUID}))
+        self.clock.advance(301)
+        process.reset_caches()
+        real_send = reconciler.deliver_claim
+
+        def lapsed_memo_send(*args, **kwargs):
+            process.reset_caches()   # the snapshot's memo expired during the pass
+            return real_send(*args, **kwargs)
+
+        with mock.patch.object(reconciler, "deliver_claim", side_effect=lapsed_memo_send):
+            self.reconcile()
+        self.assertEqual([e["state"] for e in self.bridge.events_for(sid)], ["Ended"])
+        self.assertEqual(self.posts(), [])
+        self.assertTrue(vendor.exists())
+
+    def test_persisted_cleanup_is_cancelled_while_herdr_is_dead(self):
+        """A pending_vendor_cleanups entry (e.g. from a drained results/ envelope) resolved by a reconciler pass
+        while Herdr is dead: cancelled without a POST, the file kept."""
+        vendor = pane_file(self.state_dir, PANE, ".vendor_active")
+        vendor.write_text(json.dumps({"vendor_session_id": UUID}))
+        seed(self.cache_mgr, {}, pending_vendor_cleanups=[
+            {"pane_id": PANE, "is_pane_closed": False, "timestamp": self.clock.time()}])
+        self.kill_herdr()
+        self.reconcile()
+        self.assertEqual(self.posts(), [])
+        self.assertTrue(vendor.exists())
+        self.assertEqual(read_cache(self.cache_mgr)["pending_vendor_cleanups"], [])
+
+    def test_no_hooks_confirmed_delivery_keeps_the_vendor_fallback(self):
+        """NO_HOOKS (hooks uninstalled: vendor hooks run unguarded) is a global trigger for the first send too."""
+        pane = "w1:pNoHooks"
+        vendor = pane_file(self.state_dir, pane, ".vendor_active")
+        vendor.write_text(json.dumps({"vendor_session_id": UUID}))
+        (self.state_dir / "NO_HOOKS").touch()
+        handle_agent_status_changed({"agent_status": "working", "pane_id": pane, "workspace_id": "w1",
+                                     "agent": "claude"}, {}, bridge_url=self.mock_url)
+        self.assertEqual([e["state"] for e in self.bridge.events_for(self.sid(pane))], ["Working"])
+        self.assertEqual(self.posts(), [])
+        self.assertTrue(vendor.exists())
+
+    def test_live_herdr_still_hands_the_pane_back(self):
+        """Control: with Herdr alive a confirmed delivery dismisses the vendor UUID and retires the file."""
+        pane = "w1:pHandBack"
+        vendor = pane_file(self.state_dir, pane, ".vendor_active")
+        vendor.write_text(json.dumps({"vendor_session_id": UUID}))
+        handle_agent_status_changed({"agent_status": "working", "pane_id": pane, "workspace_id": "w1",
+                                     "agent": "claude"}, {}, bridge_url=self.mock_url)
+        self.assertEqual(len(self.posts()), 1)
+        self.assertFalse(vendor.exists())
 
 
 if __name__ == "__main__":

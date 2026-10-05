@@ -32,8 +32,8 @@ FAKE_START_NS = int(FAKE_START * 1e9)
 PAST_WINDOW_NS = TOMBSTONE_WINDOW_NS + 1_000_000_000
 
 
-class TombstoneSourceTimestampTests(SandboxTestCase):
-    """#40: the tombstone's last_source_timestamp rejects trailing events on its own."""
+class _TombstoneCase(SandboxTestCase):
+    """Shared helpers: a frozen wall clock, status/close handlers and cache snapshots (no tests of its own)."""
 
     def setUp(self):
         super().setUp()
@@ -72,6 +72,10 @@ class TombstoneSourceTimestampTests(SandboxTestCase):
         self.assertEqual(tomb.get("last_source_timestamp"), source_ts)
         self.assertEqual(tomb.get("closed_at_ns"), close_ns)
         return close_ns, tomb
+
+
+class TombstoneSourceTimestampTests(_TombstoneCase):
+    """#40: the tombstone's last_source_timestamp rejects trailing events on its own."""
 
     def test_p40_last_source_timestamp_rejects_after_admission_window(self):
         """Plan §10.1 #40: after the 60s window, a positive working+agent event with ts <= the tombstone's
@@ -112,6 +116,44 @@ class TombstoneSourceTimestampTests(SandboxTestCase):
         tomb_after, session = self._snapshot(pane)
         self.assertEqual((tomb_after, session.get("desired_state")), ({}, "Working"),
                          "a strictly newer positive event inside the window is admitted")
+
+
+class TombstoneWindowLiteralTests(_TombstoneCase):
+    """Plan §10.1 #27 (§4.3 L283 / L96): the positive-admission window is 60s, pinned with literals.
+
+    Round-2 finding (tests): every window test derived its offsets from the imported constant, so halving
+    TOMBSTONE_WINDOW_NS to 30s survived the suite. These offsets are literals: 59s is inside, 61s outside.
+    """
+
+    def test_window_constant_is_60_seconds(self):
+        self.assertEqual(TOMBSTONE_WINDOW_NS, 60_000_000_000)
+
+    def _closed_pane(self, pane):
+        self._status(pane, FAKE_START_NS, None)
+        close_ns = FAKE_START_NS + 1_000_000
+        self._close(pane, close_ns)
+        tomb, _ = self._snapshot(pane)
+        self.assertEqual(tomb.get("closed_at_ns"), close_ns)
+        return close_ns, tomb
+
+    def test_non_working_event_rejected_at_59s(self):
+        """A late idle status 59s after the close may not re-admit the pane (non-working inside the window)."""
+        for status in ("idle", "done"):
+            with self.subTest(status=status):
+                pane = f"w1:pTombWin59{status}"
+                close_ns, tomb = self._closed_pane(pane)
+                self._status(pane, close_ns + 59_000_000_000, None, status=status)
+                self._assert_not_resurrected(pane, tomb, f"{status} at closed_at + 59s")
+
+    def test_non_working_event_evaluated_outside_the_window_at_61s(self):
+        """Control: the same event 61s after the close skips the positive-admission gates and pops the tombstone."""
+        for status in ("idle", "done"):
+            with self.subTest(status=status):
+                pane = f"w1:pTombWin61{status}"
+                close_ns, _ = self._closed_pane(pane)
+                self._status(pane, close_ns + 61_000_000_000, None, status=status)
+                tomb_after, _ = self._snapshot(pane)
+                self.assertEqual(tomb_after, {}, f"{status} at closed_at + 61s is past the window: tombstone popped")
 
 
 class MktempFailOpenTests(SandboxTestCase):

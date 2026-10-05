@@ -134,9 +134,11 @@ class CascadeLeaseAndBudgetTests(CascadeCase):
         self.assertEqual(len(self.spawner.calls), 1)
 
     def test_retryable_inline_failure_hands_off(self):
-        """Gap cascade-retryable-no-handoff: a 5xx on the inline Ended flags and ensures the reconciler."""
+        """Gap cascade-retryable-no-handoff: a 5xx on the inline Ended (and on its R45 minimal retry) flags and ensures
+        the reconciler."""
         self._admit("w1:pR", "w1:tR")
         self.spawner.reset()
+        self.bridge.enqueue(502)
         self.bridge.enqueue(502)
         handle_tab_closed({"tab_id": "w1:tR"}, {}, bridge_url=self.mock_url)
         s = self._data()["sessions"][self.sid("w1:pR")]

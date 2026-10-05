@@ -50,6 +50,48 @@ class OrphanJournalCase(SandboxTestCase):
         return json.loads(self.orphan_path.read_text())["sessions"] if self.orphan_path.exists() else {}
 
 
+class OrphanCapacityTests(OrphanJournalCase):
+    """Plan §9.2 item 1 ("bounded to 256 records"). Round-2 low finding: ORPHAN_CAPACITY was never exercised."""
+
+    def test_orphan_file_keeps_the_newest_256_exports(self):
+        self.assertEqual(orphans.ORPHAN_CAPACITY, 256)
+        for i in range(300):
+            sid = f"herdr:h:w1:p{i:04d}"
+            orphans.export_orphan_record(sid, {"pane_id": f"w1:p{i:04d}", "desired_state": "Ended"}, blocking=True)
+        kept = self._orphan_sessions()
+        self.assertEqual(sorted(kept), [f"herdr:h:w1:p{i:04d}" for i in range(44, 300)])
+
+    def test_re_export_of_a_full_files_oldest_record_moves_it_to_the_newest(self):
+        """R27/R33 (round-3 finding): a fresh export of a session id already in the file replaces the record AND makes
+        it the newest. It used to keep its oldest slot, so the next export over the cap evicted the just-refreshed
+        owed Ended while 255 older records survived."""
+        cap = orphans.ORPHAN_CAPACITY
+        for i in range(cap):
+            orphans.export_orphan_record(f"herdr:h:w1:p{i:04d}", {"pane_id": f"w1:p{i:04d}", "n": 0}, blocking=True)
+        refreshed = "herdr:h:w1:p0000"
+        orphans.export_orphan_record(refreshed, {"pane_id": "w1:p0000", "n": 1}, blocking=True)
+        self.assertEqual(list(self._orphan_sessions())[-1], refreshed, "the fresh export is the newest in file order")
+        orphans.export_orphan_record("herdr:h:w1:pNEW", {"pane_id": "w1:pNEW", "n": 0}, blocking=True)
+        kept = self._orphan_sessions()
+        self.assertEqual(len(kept), cap)
+        self.assertEqual(kept[refreshed], {"pane_id": "w1:p0000", "n": 1}, "the refreshed owed Ended survives the cap")
+        self.assertNotIn("herdr:h:w1:p0001", kept, "the oldest untouched record is the one evicted")
+        self.assertEqual(list(kept)[-2:], [refreshed, "herdr:h:w1:pNEW"])
+
+    def test_identical_re_export_still_moves_the_record_to_the_newest(self):
+        """The file is rewritten when only the order changed (dict equality ignores order)."""
+        orphans.export_orphan_record("herdr:h:w1:pA", {"pane_id": "w1:pA"}, blocking=True)
+        orphans.export_orphan_record("herdr:h:w1:pB", {"pane_id": "w1:pB"}, blocking=True)
+        orphans.export_orphan_record("herdr:h:w1:pA", {"pane_id": "w1:pA"}, blocking=True)
+        self.assertEqual(list(self._orphan_sessions()), ["herdr:h:w1:pB", "herdr:h:w1:pA"])
+
+    def test_journal_fold_respects_the_256_cap(self):
+        """Exports queued in the R10 journal are folded oldest first; the file still keeps only the newest 256."""
+        orphans.journal_orphan_exports((f"herdr:h:w1:j{i:04d}", {"pane_id": f"w1:j{i:04d}"}) for i in range(260))
+        self.assertTrue(orphans.flush_pending_orphan_ops())
+        self.assertEqual(sorted(self._orphan_sessions()), [f"herdr:h:w1:j{i:04d}" for i in range(4, 260)])
+
+
 class EventPathOrphanContentionTests(OrphanJournalCase):
     """R10: a handler's Step C orphan export never blocks on a contended orphan lock."""
 

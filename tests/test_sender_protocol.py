@@ -105,12 +105,35 @@ class MinimalRetryTests(SenderCase):
         self.assertEqual(retry, {"state": "Ended", "agent": "Herdr", "session_id": self.sid(PANE)})
         self.assertIsNone(self._session(), "the accepted minimal retry confirms the Ended (evicted)")
 
-    def test_retryable_ended_failure_is_not_retried_inline(self):
-        """Narrow §3.3 reading: a 5xx / network failure on Ended is left to the reconciler, not retried inline."""
+    def test_failed_ended_is_retried_with_the_minimal_payload(self):
+        """R45 (low finding): Plan §4.3 Step B L479 and §1 L119 retry the Ended "on failure or rejection", so a 5xx or
+        a network failure (timeout) of the primary Ended is retried once with the minimal payload too, exactly like
+        replay's deliver_event. An accepted retry confirms the Ended (evicted)."""
+        minimal = {"state": "Ended", "agent": "Herdr", "session_id": self.sid(PANE)}
+        for label, script in (("5xx", lambda: self.bridge.enqueue(500)),
+                              ("network", lambda: self.bridge.enqueue(200, delay=0.6))):
+            with self.subTest(failure=label):
+                if self._session() is None:
+                    handle_agent_status_changed(_working(), {}, bridge_url=self.mock_url)
+                script()
+                handle_pane_closed({"pane_id": PANE}, {}, bridge_url=self.mock_url)
+                self.assertIsNone(self._session(), "the minimal retry confirmed the Ended")
+                self.assertIn(minimal, self._posts_for())
+
+    def test_failed_ended_and_failed_retry_stay_retryable_with_two_posts(self):
+        """R5 cap holds for failures: primary + one minimal retry, then the retryable bookkeeping (reconciler retries)."""
+        self.bridge.enqueue(500)
         self.bridge.enqueue(500)
         handle_pane_closed({"pane_id": PANE}, {}, bridge_url=self.mock_url)
-        self.assertEqual(len([p for p in self._posts_for() if p["state"] == "Ended"]), 1)
+        self.assertEqual(len([p for p in self._posts_for() if p["state"] == "Ended"]), 2)
         self.assertEqual(self._session()["delivery_error"], "5xx_server_error")
+
+    def test_unsent_ended_is_not_retried(self):
+        """A request that never reached the bridge (Bartender not running) gets no minimal retry: nothing to fix."""
+        refused = DeliveryResult("retryable", "bartender_not_running")
+        with mock.patch.object(step_b, "send_event", return_value=refused) as sent:
+            handle_pane_closed({"pane_id": PANE}, {}, bridge_url=self.mock_url)
+        self.assertEqual(sent.call_count, 1)
 
     def test_rejected_non_ended_is_never_retried(self):
         self.bridge.enqueue(400)
@@ -332,6 +355,24 @@ class BackgroundPolicyTests(SenderCase):
         self.assertEqual(self.spawner.calls, [], "the reconciler never spawns itself")
         self.assertTrue(BACKGROUND_POLICY.orphan_blocking and not EVENT_POLICY.orphan_blocking)
 
+
+
+class LeaseDurationTests(unittest.TestCase):
+    """Round-2 low finding: the Step A claim's lease duration (sender/lease.LEASE_SECONDS) was untested and a second
+    copy of delivery_state.LEASE_SECONDS. Plan §1 L68: "Standardized lease duration is 1.5s across all code paths"."""
+
+    def test_claim_sets_a_1_5_second_deadline(self):
+        record = {"pane_id": PANE, "seq": 2, "desired_state": "Working", "desired_payload": {"state": "Working"}}
+        claim = claim_lease("herdr:h:" + PANE, PANE, record, 100.0, None)
+        self.assertEqual(record["lease_deadline"], 101.5)
+        self.assertEqual(claim.token, record["lease_token"])
+
+    def test_one_lease_constant_for_every_path(self):
+        from herdr_bartender import delivery_state
+        from herdr_bartender.sender import lease
+
+        self.assertEqual(delivery_state.LEASE_SECONDS, 1.5)
+        self.assertIs(lease.LEASE_SECONDS, delivery_state.LEASE_SECONDS, "a single source of truth")
 
 if __name__ == "__main__":
     unittest.main()
