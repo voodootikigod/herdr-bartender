@@ -15,7 +15,7 @@ from typing import List, Optional
 from . import jsonsafe
 from .intake import EVENT_NAMES, PANE_CLOSED, TAB_CLOSED, WORKSPACE_CLOSED, is_agent_exit_signal
 from .log import log_debug
-from .boundedio import capped_directory, read_regular_file
+from .boundedio import capped_directory, open_exclusive_tmp, read_regular_file
 from .paths import PRIVATE_FILE_MODE, ensure_private_dir
 
 MAX_ENVELOPE_BYTES = 256 * 1024   # R62/R64: spool and results envelopes are refused / unread past this
@@ -105,7 +105,7 @@ def write_json_atomic(path: Path, obj: object) -> None:
 def write_bytes_atomic(path: Path, data: bytes) -> None:
     """Write ``data`` to ``path`` via ``<path>.tmp`` + fsync + replace (0600); unlinks the tmp file on failure."""
     tmp = path.with_name(f"{path.name}.tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+    fd = open_exclusive_tmp(tmp)
     try:
         with os.fdopen(fd, "wb") as f:
             fd = -1

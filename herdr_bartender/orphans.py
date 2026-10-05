@@ -19,7 +19,14 @@ import os
 from pathlib import Path
 from typing import Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Tuple
 
-from .boundedio import JOURNAL_ENTRY_MAX_BYTES, ORPHAN_FILE_MAX_BYTES, UnusableFile, read_regular_file
+from .boundedio import (
+    JOURNAL_ENTRY_MAX_BYTES,
+    ORPHAN_FILE_MAX_BYTES,
+    UnusableFile,
+    open_exclusive_tmp,
+    open_lock_file,
+    read_regular_file,
+)
 from . import clock, jsonsafe
 from .envelopes import quarantine
 from .log import log_debug
@@ -61,7 +68,7 @@ def acquire_orphan_lock(orphan_path: Path, blocking: bool = False,
     """
     if deadline is None:
         deadline = ORPHAN_BLOCKING_DEADLINE_SECONDS if blocking else ORPHAN_LOCK_DEADLINE_SECONDS
-    fd = os.open(str(_lock_path(orphan_path)), os.O_CREAT | os.O_RDWR, PRIVATE_FILE_MODE)
+    fd = open_lock_file(_lock_path(orphan_path))
     try:
         if _flock_until(fd, deadline):
             return fd
@@ -147,7 +154,7 @@ def fsync_directory(directory: Path) -> None:
 def write_orphan_sessions(orphan_path: Path, sessions: dict) -> None:
     """Atomically and durably replace the orphan file (mode 0600, Plan §8) with ``sessions``."""
     tmp_orphan = orphan_path.with_name(f"{orphan_path.name}.tmp.{os.getpid()}")
-    fd = os.open(str(tmp_orphan), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+    fd = open_exclusive_tmp(tmp_orphan)
     try:
         os.fchmod(fd, PRIVATE_FILE_MODE)
         with os.fdopen(fd, "w", encoding="utf-8") as of:

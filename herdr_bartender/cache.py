@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 from typing import FrozenSet, List, Optional
 
+from .boundedio import open_exclusive_tmp, open_lock_file
 from .boundedio import CACHE_MAX_BYTES, OversizedFile, read_regular_file, read_regular_prefix
 from . import clock, jsonsafe, runtime, watchdog
 from .cache_schema import CorruptCache, new_cache, normalize_cache
@@ -102,7 +103,7 @@ def write_cache_file(cache_file: Path, data: dict) -> None:
     tmp_path = cache_file.with_name(f"{cache_file.name}.tmp.{os.getpid()}")
     fd = -1
     try:
-        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+        fd = open_exclusive_tmp(tmp_path)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             fd = -1
             json.dump(data, f, indent=2)
@@ -248,7 +249,7 @@ class BoundedSessionCache:
     def _acquire(self) -> None:
         timeout = self.effective_lock_timeout()
         try:
-            fd = os.open(str(self.lock_file), os.O_CREAT | os.O_RDWR, PRIVATE_FILE_MODE)
+            fd = open_lock_file(self.lock_file)
         except OSError as e:
             raise CacheReadError(f"cannot open {self.lock_file.name}: {e}") from e
         try:

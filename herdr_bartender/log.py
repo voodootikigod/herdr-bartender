@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import time
 from pathlib import Path
 
@@ -20,7 +21,11 @@ def _rotate_if_needed(log_file: Path) -> None:
 
 
 def _open_private_append(log_file: Path) -> int:
-    fd = os.open(str(log_file), os.O_WRONLY | os.O_CREAT | os.O_APPEND, PRIVATE_FILE_MODE)
+    fd = os.open(str(log_file), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+                 PRIVATE_FILE_MODE)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):   # R70: never write the log into a FIFO or device
+        os.close(fd)
+        raise OSError(f"{log_file.name} is not a regular file")
     if os.fstat(fd).st_mode & 0o077:
         os.fchmod(fd, PRIVATE_FILE_MODE)
     return fd

@@ -106,6 +106,59 @@ def read_regular_prefix(path: Path, max_bytes: int) -> bytes:
             os.close(fd)
 
 
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NONBLOCK | _NOFOLLOW
+
+
+def _require_regular(fd: int, path: Path) -> None:
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        raise NotRegularFile(errno.EINVAL, "not a regular file", str(path))
+
+
+def _open_no_follow(path: Path, flags: int, mode: int) -> int:
+    try:
+        return os.open(str(path), flags, mode)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise NotRegularFile(errno.ELOOP, "is a symlink", str(path)) from exc
+        raise
+
+
+def write_state_file(path: Path, data: bytes = b"") -> None:
+    """R70: write (or touch, with ``b""``) a small state file: never follows a symlink, never blocks on a FIFO
+    (no reader: ENXIO), and refuses anything that is not a regular file; created 0600."""
+    fd = _open_no_follow(path, _WRITE_FLAGS, PRIVATE_FILE_MODE)
+    try:
+        _require_regular(fd, path)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+    finally:
+        os.close(fd)
+
+
+def open_exclusive_tmp(path: Path, mode: int = PRIVATE_FILE_MODE) -> int:
+    """R70: create a predictable temp file with O_EXCL (a stale or planted path - symlink included - is unlinked,
+    never followed, then created afresh); returns a write fd."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW
+    try:
+        return os.open(str(path), flags, mode)
+    except FileExistsError:
+        os.unlink(str(path))   # removes a symlink itself, never its target
+        return os.open(str(path), flags, mode)
+
+
+def open_lock_file(path: Path) -> int:
+    """R70: open (creating) a lock/append target without following symlinks or blocking on a FIFO."""
+    fd = _open_no_follow(path, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | _NOFOLLOW, PRIVATE_FILE_MODE)
+    try:
+        _require_regular(fd, path)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def capped_lock_timeout() -> float:
     """Lock wait for a capped write: the event-path budget rule (Plan §4.3), unbounded paths get the 0.2s cap."""
     from . import runtime   # late: runtime imports half the package
@@ -119,8 +172,7 @@ def _count_json(directory: Path) -> int:
 @contextmanager
 def locked_directory(directory: Path, timeout: float = 0.2) -> Iterator[None]:
     """Hold ``<directory>/.lock`` (exclusive, bounded wait); raises DirectoryFull(EAGAIN) when it stays busy."""
-    fd = os.open(str(directory / LOCK_NAME), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-                 PRIVATE_FILE_MODE)
+    fd = open_lock_file(directory / LOCK_NAME)
     try:
         give_up_at = clock.monotonic() + max(0.0, timeout)
         while True:

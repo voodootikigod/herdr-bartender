@@ -20,7 +20,7 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
-from .boundedio import SMALL_STATE_MAX_BYTES, read_regular_file
+from .boundedio import SMALL_STATE_MAX_BYTES, open_exclusive_tmp, read_regular_file
 from . import clock, jsonsafe
 from .handoff import RECONCILER_LOCK_NAME, reconciler_running
 from .log import log_debug
@@ -66,7 +66,7 @@ def write_stamp(state_dir: Optional[Path] = None) -> None:
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     record = {"version": code_version(), "pid": os.getpid(), "start_time": own_start_time()}
     try:
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
+        fd = open_exclusive_tmp(tmp)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(record, f)
         os.replace(tmp, path)

@@ -15,7 +15,7 @@ import tempfile
 from pathlib import Path
 from typing import Dict, Tuple
 
-from .boundedio import HOOK_SCRIPT_MAX_BYTES, SMALL_STATE_MAX_BYTES, read_regular_file
+from .boundedio import HOOK_SCRIPT_MAX_BYTES, SMALL_STATE_MAX_BYTES, open_lock_file, read_regular_file
 from . import jsonsafe
 from .log import log_warning
 
@@ -90,8 +90,7 @@ def write_private_atomic(path: Path, data: bytes, mode: int = 0o600) -> None:
 def touch_private(path: Path) -> None:
     """Create ``path`` 0600 if missing (existing files keep their content and mode)."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT, 0o600)
-    os.close(fd)
+    os.close(open_lock_file(path))   # R70: no symlink follow, no FIFO block, content kept
 
 
 def unlink_flags(state_dir: Path, names) -> None:

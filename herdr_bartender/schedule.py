@@ -110,7 +110,7 @@ def _session_times(records: Iterable[Mapping], herdr_alive: bool, now: float) ->
     return times
 
 
-def _root_times(data: Mapping, now: float) -> List[float]:
+def _root_times(data: Mapping, now: float, herdr_alive: bool = True) -> List[float]:
     times: List[float] = []
     dead_since = number(data.get("herdr_dead_since"))
     dead_expiry = None if dead_since is None else _upcoming(dead_since + HERDR_DEAD_EXPIRY_SECONDS
@@ -120,7 +120,7 @@ def _root_times(data: Mapping, now: float) -> List[float]:
     owed = next_compensation_wait(data.get("pending_compensations") or [], now)
     if owed is not None:
         times.append(now + owed)
-    if data.get("pending_vendor_cleanups"):
+    if data.get("pending_vendor_cleanups") and herdr_alive:   # R70: deferred while Herdr is dead
         times.append(now)
     dismissal = dismissal_due(data.get("dismissed_vendor_uuids"), now)
     if dismissal is not None:
@@ -130,8 +130,8 @@ def _root_times(data: Mapping, now: float) -> List[float]:
 
 def cache_view(data: Mapping, now: float, herdr_alive: bool) -> CacheView:
     records = [r for r in (data.get("sessions") or {}).values() if isinstance(r, dict)]
-    times = _session_times(records, herdr_alive, now) + _root_times(data, now)
-    owed = bool(data.get("pending_compensations") or data.get("pending_vendor_cleanups")
+    times = _session_times(records, herdr_alive, now) + _root_times(data, now, herdr_alive)
+    owed = bool(data.get("pending_compensations") or (data.get("pending_vendor_cleanups") and herdr_alive)
                 or data.get("dismissed_vendor_uuids"))
     return CacheView(
         sessions=len(records),

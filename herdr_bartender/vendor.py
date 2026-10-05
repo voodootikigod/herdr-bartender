@@ -41,7 +41,7 @@ from .bridge import DEFAULT_EVENT_TIMEOUT, DeliveryResult, send_event
 from .cache import BoundedSessionCache, CacheError, IntegrationDisabled
 from .cache_schema import DISMISSED_VENDOR_CAP
 from .config import VENDOR_UUID_REGEX
-from .delivery_state import clear_pending_vendor_cleanup
+from .delivery_state import clear_pending_vendor_cleanup, stage_vendor_cleanup
 from .boundedio import OversizedFile, read_regular_file_stat
 from .log import log_debug, log_warning
 from .paths import get_state_dir
@@ -76,11 +76,12 @@ class VendorResolution:
     dismissals: Tuple[str, ...] = ()
     unlink: Tuple[VendorFile, ...] = ()
     resolved_panes: Tuple[str, ...] = ()   # panes whose pending_vendor_cleanups entry was cleared
+    deferred_panes: Tuple[str, ...] = ()   # R70: closed panes kept owed while Herdr is dead
 
     @property
     def changed(self) -> bool:
-        """The cache was modified (a dismissal queued or a pending entry cleared): it must be saved."""
-        return bool(self.dismissals or self.resolved_panes)
+        """The cache was modified (a dismissal queued, a pending entry cleared or deferred): it must be saved."""
+        return bool(self.dismissals or self.resolved_panes or self.deferred_panes)
 
     def commit(self) -> None:
         """Retire the resolved ``.vendor_active`` files. Call only after the cache save succeeded."""
@@ -233,6 +234,11 @@ def _closed_panes(data: dict) -> frozenset:
     return frozenset(e.get("pane_id") for e in entries if isinstance(e, dict) and e.get("is_pane_closed"))
 
 
+def integration_off(state_dir: Optional[Path] = None) -> bool:
+    directory = Path(state_dir) if state_dir is not None else get_state_dir()
+    return (directory / "DISABLED").exists() or (directory / "NO_HOOKS").exists()
+
+
 def fallback_protected(state_dir: Optional[Path] = None) -> bool:
     """R35: the vendor fallback is the live representation, so no cleanup may dismiss or unlink it.
 
@@ -241,8 +247,7 @@ def fallback_protected(state_dir: Optional[Path] = None) -> bool:
     closes or a vendor session-terminal event unlinks it). Safe under the cache lock: Herdr liveness comes
     from the 0.5s memo only, which callers that may run while Herdr is dead warm before locking.
     """
-    directory = Path(state_dir) if state_dir is not None else get_state_dir()
-    if (directory / "DISABLED").exists() or (directory / "NO_HOOKS").exists():
+    if integration_off(state_dir):
         return True
     return not memoised_herdr_alive()
 
@@ -256,14 +261,29 @@ def warm_fallback_probe() -> None:
     is_herdr_alive()
 
 
-def _cancel_cleanups(data: dict, panes: Sequence[str]) -> VendorResolution:
-    """R35: drop the panes' pending cleanups without touching ``.vendor_active`` or queueing a dismissal."""
-    resolved = [pane for pane in dict.fromkeys(p for p in panes if p) if pane in pending_vendor_panes(data)]
-    for pane in resolved:
-        clear_pending_vendor_cleanup(data, pane)
-    if panes:
-        log_debug(f"Vendor fallback protected (Herdr dead / integration off): cleanup of {list(panes)} cancelled")
-    return VendorResolution(resolved_panes=tuple(resolved))
+def _cancel_cleanups(data: dict, panes: Sequence[str], keep_closed: frozenset = frozenset(),
+                     now: float = 0.0) -> VendorResolution:
+    """R35: drop the panes' pending cleanups without touching ``.vendor_active`` or queueing a dismissal.
+
+    R70: a cleanup owed by a pane CLOSE (``keep_closed``) is not dropped while Herdr is dead - it stays persisted,
+    not due until Herdr is alive again, so the closed pane's vendor entry is still dismissed after recovery
+    (the vendor fallback cannot represent a pane that no longer exists).
+    """
+    pending = pending_vendor_panes(data)
+    resolved, deferred = [], []
+    for pane in dict.fromkeys(p for p in panes if p):
+        if pane in keep_closed:
+            if pane not in _closed_panes(data):
+                stage_vendor_cleanup(data, pane, True, now)
+                deferred.append(pane)
+        elif pane in pending:
+            clear_pending_vendor_cleanup(data, pane)
+            resolved.append(pane)
+    if resolved:
+        log_debug(f"Vendor fallback protected (Herdr dead / integration off): cleanup of {resolved} cancelled")
+    if deferred:
+        log_debug(f"Herdr dead: vendor cleanup of closed pane(s) {deferred} kept owed until it recovers")
+    return VendorResolution(resolved_panes=tuple(resolved), deferred_panes=tuple(deferred))
 
 
 def resolve_vendor_cleanups(data: dict, panes: Sequence[str], now: float,
@@ -273,10 +293,11 @@ def resolve_vendor_cleanups(data: dict, panes: Sequence[str], now: float,
     A pane closed by this request (``closed_panes``, or a persisted ``is_pane_closed`` entry) marks its
     queued dismissal ``pane_closed``. While ``fallback_protected()`` the cleanups are cancelled instead (R35).
     """
-    if panes and fallback_protected():
-        return _cancel_cleanups(data, panes)
-    dismissals, unlink, resolved = [], [], []
     closed = _closed_panes(data) | frozenset(closed_panes)
+    if panes and fallback_protected():
+        keep = frozenset() if integration_off() else closed
+        return _cancel_cleanups(data, panes, keep_closed=keep, now=now)
+    dismissals, unlink, resolved = [], [], []
     for pane in dict.fromkeys(p for p in panes if p):
         if pane in pending_vendor_panes(data):
             clear_pending_vendor_cleanup(data, pane)

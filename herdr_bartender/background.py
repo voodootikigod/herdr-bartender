@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .boundedio import open_lock_file
 from . import clock, runtime
 from .bridge import check_bridge_health
 from .cache import BoundedSessionCache, CacheError, IntegrationDisabled
@@ -431,7 +432,7 @@ def _acquire_singleton(state_dir: Path) -> Optional[int]:
     """``reconciler.lock`` (LOCK_NB); None when another reconciler holds it (``reconciler.pending`` touched)."""
     lock_fd = None
     try:
-        lock_fd = os.open(str(state_dir / RECONCILER_LOCK_NAME), os.O_CREAT | os.O_RDWR, 0o600)
+        lock_fd = open_lock_file(state_dir / RECONCILER_LOCK_NAME)
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return lock_fd
     except OSError as exc:

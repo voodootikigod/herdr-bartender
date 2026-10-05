@@ -188,3 +188,4 @@ Status at the W5 gate:
 | R67 | Close replacement is write-then-remove | `tests.test_gate_round15.SpoolHardCapTests.test_failed_replacement_keeps_the_spooled_close` |
 | R68 | Rollback aborts before cleanup when event handlers outlive the drain | `tests.test_rollback.RollbackScriptTests.test_event_handler_that_never_ends_keeps_the_state` |
 | R69 | Cleanup budget covers lock waits; bounded hook rereads | `tests.test_gate_round21.*` (2 tests) |
+| R70 | Safe state writes; closed-pane vendor cleanup survives a Herdr outage | `tests.test_gate_round22.*` (4 tests) |

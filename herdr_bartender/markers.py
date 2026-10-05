@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 from . import clock
+from .boundedio import write_state_file
 from .log import log_debug, log_warning
 from .paths import ensure_private_dir, get_state_dir
 from .sanitize import get_hex_pane_id
@@ -28,8 +29,7 @@ def touch_pane_failed(pane_id: str):
     marker_gone = _unlink_quietly(panes_dir / hex_id)
     try:
         ensure_private_dir(panes_dir)
-        with open(panes_dir / f"{hex_id}.failed", "w", encoding="utf-8") as f:
-            f.write(str(int(clock.time())))
+        write_state_file(panes_dir / f"{hex_id}.failed", str(int(clock.time())).encode())
         return
     except Exception as exc:
         log_warning(f"Could not write failure flag for pane {pane_id!r}: {exc!r}")
@@ -64,7 +64,7 @@ def clear_pane_failed(pane_id: str):
 
 def touch_delivery_down():
     try:
-        (get_state_dir() / "DELIVERY_DOWN").touch(exist_ok=True)
+        write_state_file(get_state_dir() / "DELIVERY_DOWN")
     except Exception:
         pass
 
@@ -89,8 +89,7 @@ def touch_heartbeat():
     if is_disabled():
         return
     try:
-        marker = get_state_dir() / "plugin-active"
-        marker.touch(exist_ok=True)
+        write_state_file(get_state_dir() / "plugin-active")
     except Exception:
         pass
 
@@ -111,8 +110,7 @@ def touch_pane_marker(pane_id: str):
     try:
         panes_dir = ensure_private_dir(get_state_dir() / "panes")
         hex_id = get_hex_pane_id(pane_id)
-        with open(panes_dir / hex_id, "w", encoding="utf-8") as f:
-            f.write(str(int(clock.time())))
+        write_state_file(panes_dir / hex_id, str(int(clock.time())).encode())
         failed_path = panes_dir / f"{hex_id}.failed"
         if failed_path.exists():
             failed_path.unlink()

@@ -29,6 +29,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, List, Optional, Sequence
 
+from .boundedio import open_lock_file, write_state_file
 from .log import log_debug
 from .paths import PRIVATE_FILE_MODE, get_state_dir, launcher_path
 
@@ -111,7 +112,7 @@ def in_reconciler_loop() -> bool:
 
 def touch_reconciler_pending(state_dir: Optional[Path] = None) -> None:
     try:
-        (_state_dir(state_dir) / PENDING_FILE_NAME).touch(exist_ok=True)
+        write_state_file(_state_dir(state_dir) / PENDING_FILE_NAME)
     except OSError as exc:
         log_debug(f"Could not touch {PENDING_FILE_NAME}: {exc}")
 
@@ -120,7 +121,7 @@ def reconciler_running(state_dir: Optional[Path] = None) -> bool:
     """True while another process holds ``reconciler.lock`` (probed with LOCK_NB, released at once)."""
     lock_path = _state_dir(state_dir) / RECONCILER_LOCK_NAME
     try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, PRIVATE_FILE_MODE)
+        fd = open_lock_file(lock_path)
     except OSError as exc:
         log_debug(f"Reconciler lock probe failed ({exc}); assuming no reconciler runs")
         return False
