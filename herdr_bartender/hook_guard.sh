@@ -149,7 +149,7 @@ END {
             if [ "$_HB_HAS_PERL" -eq 1 ]; then
               # R41: a cooperative 1s deadline (select + sysread + syswrite, no signal handler): every chunk taken
               # from the pipe is written in full before the deadline is checked again, so a timeout never drops one.
-              perl -e 'use Time::HiRes qw(time); my $end = time + 1; my $in = ""; vec($in, 0, 1) = 1;
+              perl -e 'use Time::HiRes qw(time); my $end = time + 1; my $in = ""; vec($in, 0, 1) = 1; my $total = 0;
 sub splice_rest {
   my ($rest, $tmp) = ($_[0], $ARGV[0]); my $fifo = "$tmp.fifo"; my $data;
   open(my $kept, "<", $tmp); require POSIX; exit 1 unless POSIX::mkfifo($fifo, 0600);
@@ -168,6 +168,7 @@ while (1) {
   my $got = sysread(STDIN, my $buf, 65536);
   if (!defined $got) { next if $!{EINTR} || $!{EAGAIN}; exit 142 }
   last if $got == 0;
+  $total += $got; splice_rest(substr($buf, 0, $got)) if $total > 1048576;   # R85: capture at most 1 MiB
   for (my $off = 0; $off < $got; ) {
     my $put = syswrite(STDOUT, $buf, $got - $off, $off);
     if (!defined $put) { next if $!{EINTR}; splice_rest(substr($buf, $off, $got - $off)) }
@@ -215,6 +216,7 @@ def splice_rest(rest):
         pass
     os._exit(0)
 end = time.monotonic() + 1.0
+total = 0
 while True:
     left = end - time.monotonic()
     if left <= 0 or not select.select([0], [], [], left)[0]:
@@ -222,6 +224,9 @@ while True:
     chunk = os.read(0, 65536)
     if not chunk:
         break
+    total += len(chunk)
+    if total > 1048576:   # R85: capture at most 1 MiB; the rest is spliced through to the vendor
+        splice_rest(chunk)
     while chunk:
         try:
             chunk = chunk[os.write(1, chunk):]

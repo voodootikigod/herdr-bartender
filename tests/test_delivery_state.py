@@ -83,7 +83,7 @@ class ApplyDeliveryResultTests(SandboxTestCase):
         self.assertTrue(effects.evicted)
         self.assertIsNone(self.session())
         self.assertFalse((self.panes / self.hex).exists())
-        self.assertEqual(effects.orphans_to_remove, (self.sid_,))
+        self.assertEqual([sid for sid, _ in effects.orphans_to_remove], [self.sid_])
         self.assertEqual(self.data["tombstones"][PANE],
                          {"closed_at_ns": 4242, "closed_source_ts": 99.5, "last_source_timestamp": 98.0})
         self.assertNotIn(PANE, self.data["agent_exits"])

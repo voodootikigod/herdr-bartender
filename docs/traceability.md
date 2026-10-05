@@ -203,3 +203,4 @@ Status at the W5 gate:
 | R82 | Unreadable cache never counts as an empty, confirmed cleanup | `tests.test_gate_round34.*` (2 tests) |
 | R83 | Relevant closes evict irrelevant ones at the spool ceiling | `tests.test_gate_round15.RelevantCloseNeverLostTests.*` (3 tests) |
 | R84 | Directory fsync failure is a durability failure | `tests.test_gate_round36.*` (2 tests) |
+| R85 | Seq-aware orphan removals; 1 MiB guard capture bound with byte-exact splice | `tests.test_gate_round37.*` (4 tests) |

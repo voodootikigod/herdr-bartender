@@ -132,7 +132,7 @@ class StagedEffects:
 
     verdict: str
     orphans_to_export: Tuple[Tuple[str, dict], ...] = ()
-    orphans_to_remove: Tuple[str, ...] = ()
+    orphans_to_remove: Tuple[Tuple[str, int], ...] = ()   # R85: (session id, confirmed seq)
     vendor_cleanups: Tuple[dict, ...] = ()
     compensations: Tuple[dict, ...] = ()
     touch_pending: bool = False
@@ -416,7 +416,7 @@ def _apply_success(data: dict, session: dict, tx: Transmission, now: float, now_
     cleanups = (stage_vendor_cleanup(data, tx.pane_id, _pane_closed(session, tx), now),) if tx.pane_id else ()
     if evict:
         _evict(data, session, tx, now_ns)
-        effects = StagedEffects(EVICTED, orphans_to_remove=(tx.session_id,), vendor_cleanups=cleanups, evicted=True,
+        effects = StagedEffects(EVICTED, orphans_to_remove=((tx.session_id, tx.seq),), vendor_cleanups=cleanups, evicted=True,
                                 delivery_down=False)
     else:
         effects = StagedEffects(DELIVERED, vendor_cleanups=cleanups, delivery_down=False)

@@ -258,6 +258,15 @@ def _entry_seq(path: Path) -> int:
     return seq if isinstance(seq, int) and not isinstance(seq, bool) else 0
 
 
+def _journaled_newer_export(entry: Path, upto_seq: object) -> bool:
+    try:
+        current = jsonsafe.loads(read_regular_file(entry, JOURNAL_ENTRY_MAX_BYTES))
+    except (OSError, ValueError):
+        return False
+    return isinstance(current, dict) and current.get("op") == OP_EXPORT \
+        and _newer_than(current.get("session"), upto_seq)
+
+
 def _journal_op(orphan_path: Path, op: dict) -> bool:
     """Durably record ``op`` for the next lock holder; False when even that failed (or was refused).
 
@@ -276,6 +285,8 @@ def _journal_op(orphan_path: Path, op: dict) -> bool:
     try:
         with locked_directory(pending, JOURNAL_LOCK_SECONDS):
             current = pending / f"{name}.json"
+            if op["op"] == OP_REMOVE and _journaled_newer_export(current, op.get("upto_seq")):
+                return True   # R85: a journaled export of a later turn supersedes this removal; never overwrite it
             legacy = list(pending.glob(f"*{JOURNAL_KEY_MARK}{key}.json"))
             if not current.exists() and not legacy \
                     and sum(1 for _ in pending.glob("*.json")) >= JOURNAL_MAX_ENTRIES:
@@ -382,6 +393,14 @@ def exported_session_records(orphan_file: Optional[Path] = None) -> Dict[str, Li
     return out
 
 
+def _newer_than(record: object, upto_seq: object) -> bool:
+    """R85: ``record`` is an export of a LATER turn than a removal confirmed up to ``upto_seq`` (keep it)."""
+    if not isinstance(upto_seq, int) or isinstance(upto_seq, bool) or not isinstance(record, dict):
+        return False
+    seq = record.get("seq")
+    return isinstance(seq, int) and not isinstance(seq, bool) and seq > upto_seq
+
+
 def _apply_op(sessions: dict, op: dict) -> dict:
     """Pure: ``sessions`` with ``op`` applied (exports keep the newest ORPHAN_CAPACITY).
 
@@ -391,7 +410,7 @@ def _apply_op(sessions: dict, op: dict) -> dict:
     sid = op["sid"]
     others = {k: v for k, v in sessions.items() if k != sid}
     if op["op"] == OP_REMOVE:
-        return others
+        return sessions if _newer_than(sessions.get(sid), op.get("upto_seq")) else others
     merged = {**others, sid: op["session"]}
     if len(merged) > ORPHAN_CAPACITY:
         return dict(list(merged.items())[-ORPHAN_CAPACITY:])
@@ -460,12 +479,16 @@ def export_orphan_record(sid: str, session_dict: dict, orphan_file: Optional[Pat
     return _locked_or_journaled(orphan_file or get_orphan_path(), op, blocking)
 
 
-def remove_orphan_record(sid: str, orphan_file: Optional[Path] = None, blocking: bool = False) -> bool:
+def remove_orphan_record(sid: str, orphan_file: Optional[Path] = None, blocking: bool = False,
+                         upto_seq: Optional[int] = None) -> bool:
     """Drop ``sid`` from the orphan file; journaled like an export when it cannot run now (R10)."""
     orphan_path = orphan_file or get_orphan_path()
     if not orphan_path.exists() and not pending_dir_for(orphan_path).is_dir():
         return True
-    return _locked_or_journaled(orphan_path, {"op": OP_REMOVE, "sid": sid}, blocking)
+    op = {"op": OP_REMOVE, "sid": sid}
+    if upto_seq is not None:
+        op["upto_seq"] = upto_seq   # R85: removes only a record of a turn confirmed up to this seq
+    return _locked_or_journaled(orphan_path, op, blocking)
 
 
 def journal_orphan_exports(exports: Iterable[Tuple[str, dict]], orphan_file: Optional[Path] = None) -> None:
@@ -483,7 +506,7 @@ def journal_orphan_exports(exports: Iterable[Tuple[str, dict]], orphan_file: Opt
             raise OSError(f"orphan journal refused the export of {sid}")   # R78: the caller keeps it owed
 
 
-def run_orphan_io(exports: Iterable[Tuple[str, dict]], removals: Iterable[str], blocking: bool = False) -> None:
+def run_orphan_io(exports: Iterable[Tuple[str, dict]], removals: Iterable[object], blocking: bool = False) -> None:
     """Staged orphan exports, then removals, OUTSIDE the cache lock (Plan §1 L108); never raises.
 
     On the event path (``blocking=False``) each operation is bounded by the 50ms
@@ -492,8 +515,9 @@ def run_orphan_io(exports: Iterable[Tuple[str, dict]], removals: Iterable[str], 
     """
     for sid, record in exports:
         export_orphan_record(sid, record, blocking=blocking)
-    for sid in removals:
-        remove_orphan_record(sid, blocking=blocking)
+    for item in removals:
+        sid, upto = item if isinstance(item, tuple) else (item, None)
+        remove_orphan_record(sid, blocking=blocking, upto_seq=upto)
 
 
 def journal_waiting(orphan_path: Path) -> bool:
