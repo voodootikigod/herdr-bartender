@@ -34,7 +34,7 @@ from .intake import (
     session_matches_tab,
     session_matches_workspace,
 )
-from .log import log_debug
+from .log import log_debug, log_warning
 from .sanitize import format_agent_name
 
 TOMBSTONE_WINDOW_NS = 60_000_000_000
@@ -68,6 +68,7 @@ class _Gate:
     reason: Optional[str] = None          # drop reason, or None to continue
     pop_agent_exit: bool = False
     evictions: Tuple[str, ...] = ()        # Ended/salvaged records pruned to admit a new pane at the cap
+    warn: bool = False                     # log the drop as a WARNING (Plan §4.1 L109: 256-cap refusal)
 
 
 @dataclass(frozen=True)
@@ -266,6 +267,9 @@ def stage_status(data: dict, identity: Identity, event_data: Mapping, context: M
     gate = _gate_reason(data, sid, pane, event_data, arr_ns, src_ts, cached, herdr_alive, require_newer,
                         can_export_orphans, now_wall)
     if gate.reason:
+        if gate.warn:
+            log_warning(gate.reason)
+            return StatusStage(sid, None, gate.reason)
         return _drop(sid, gate.reason)
     admission = admit_status(event_data.get("agent_status"), event_data, context, identity, cached)
     if admission is None:
@@ -318,7 +322,7 @@ def _gate_reason(data: dict, sid: str, pane: str, event_data: Mapping, arr_ns: i
         return _Gate(exit_reason)
     evictions = _capacity_evictions(data["sessions"], sid, can_export_orphans, now_wall)
     if evictions is None:
-        return _Gate(f"Cache capacity limit of {SESSION_CAP} active sessions reached; refusing {sid}")
+        return _Gate(f"Cache capacity limit of {SESSION_CAP} active sessions reached; refusing {sid}", warn=True)
     if status_kind == "unknown":
         return _Gate(f"Debouncing transient unknown status for pane {pane}")
     return _Gate(None, pop_exit, evictions)

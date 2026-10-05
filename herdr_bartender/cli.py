@@ -39,6 +39,8 @@ EVENT_HANDLERS = {
         data, context, arrival_ns=runtime.PROCESS_ARRIVAL_TIME_NS),
 }
 
+LIVE_TEST_FLAGS = frozenset({"--live-test", "--test"})  # Plan §10.2 item 1; --test is the legacy alias
+
 STDIN_BUDGET_CAP = 0.3  # seconds; Herdr writes the envelope and closes stdin immediately
 STDIN_BUDGET_SHARE = 0.25  # never spend more than this share of the remaining process budget
 
@@ -137,9 +139,8 @@ def main(launched_at: Optional[Tuple[float, int]] = None):
     if "--unit-test" in args:
         sys.exit(run_unit_tests())
 
-    if "--test" in args:
-        run_live_test()
-        return
+    if LIVE_TEST_FLAGS & set(args):
+        sys.exit(run_live_test())
 
     if "--health" in args:
         h = check_bridge_health()

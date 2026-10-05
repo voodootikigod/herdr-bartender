@@ -48,7 +48,7 @@ class SpoolTests(SandboxTestCase):
 
     # -- envelope ---------------------------------------------------------------------
     def test_p10_envelope_is_r6_and_named_by_enqueue_time(self):
-        """R6 / Plan §4.3 L391: <enqueued_ns:020d>_<pid>_<monotonic_ns>.json holding exactly the R6 keys;
+        """Plan §10.1 #10 / R6 / §4.3 L391: <enqueued_ns:020d>_<pid>_<monotonic_ns>.json holding exactly the R6 keys;
         no generation (unknowable under contention); spool/ is 0700."""
         path = enqueue_spool(STATUS, {"pane_id": "w1:p1", "agent_status": "working"}, {"focused_pane_id": "w1:p1"},
                              arrival_ns=self.t0)
@@ -98,7 +98,7 @@ class SpoolTests(SandboxTestCase):
         self.assertEqual([e["state"] for e in self.bridge.events_for(self.sid(pane))], ["Waiting"])
 
     def test_p10_close_admission_ordering(self):
-        """Plan §4.3 L398: a spooled close predating the session's admission is discarded; a later one ends it
+        """Plan §10.1 #10 / §4.3 L398: a spooled close predating the session's admission is discarded; a later one ends it
         and records the tombstone."""
         pane = "w1:pCloseOrder"
         handle_agent_status_changed({"agent_status": "working", "pane_id": pane, "workspace_id": "w1", "agent": "claude"},

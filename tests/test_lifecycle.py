@@ -253,7 +253,7 @@ class BartenderResyncTests(LifecycleCase):
         self.assertEqual(data["last_bartender_start_time"], process.parse_lstart(DEFAULT_LSTART))
 
     def test_p21_old_bartender_still_alive_is_not_a_restart(self):
-        """Negative case: the recorded Bartender instance is alive with the same start time - no re-sync."""
+        """Plan §10.1 #21 negative case: the recorded Bartender instance is alive with the same start time - no re-sync."""
         old = self.add_fake_process("old-bartender", live=True)
         self._seed_resync_case(old, process.parse_lstart(DEFAULT_LSTART))
         self.reconcile()

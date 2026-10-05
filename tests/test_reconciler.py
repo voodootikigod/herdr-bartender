@@ -370,7 +370,7 @@ class DrainTests(LoopCase):
         self.assertEqual((record["delivery_status"], self.bridge.sessions[sid]["state"]), ("delivered", "Working"))
 
     def test_p54_vendor_cleanup_is_never_dropped_on_a_failed_send(self):
-        """Gap compensation-drain-loses-side-effects: an unconfirmed vendor dismissal stays queued (attempt counted)."""
+        """Plan §10.1 #54 (gap compensation-drain-loses-side-effects): an unconfirmed vendor dismissal stays queued (attempt counted)."""
         uuid = "vendor-uuid-drain-0001"
         vendor = pane_file(self.state_dir, "w1:pClean", ".vendor_active")
         vendor.parent.mkdir(parents=True, exist_ok=True)

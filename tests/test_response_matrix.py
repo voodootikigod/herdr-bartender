@@ -61,6 +61,7 @@ class MatrixCase(SandboxTestCase):
 
 class ResponseMatrixTests(MatrixCase):
     def test_p08_success_rows(self):
+        """Plan §10.1 #8: HTTP 200 ok:true confirms Waiting (delivered, marker) and Ended (evicted, marker gone)."""
         for kind in ("Waiting", "Ended"):
             with self.subTest(kind=kind):
                 pane = f"w1:pOk{kind}"
@@ -76,6 +77,8 @@ class ResponseMatrixTests(MatrixCase):
                     self.assertTrue(self._marker(pane).exists())
 
     def test_p08_non_retryable_rows(self):
+        """Plan §10.1 #8: 200 ok:false, 3xx and 4xx mark non_retryable_failed, touch .failed and drop the marker so
+        the vendor guard falls through; a rejected Ended is retried minimal and kept as an orphan."""
         for kind in ("Waiting", "Ended"):
             for row, (status, body, error) in NON_RETRYABLE.items():
                 with self.subTest(kind=kind, row=row):
@@ -97,6 +100,8 @@ class ResponseMatrixTests(MatrixCase):
                     self.bridge._scripted.clear()
 
     def test_p08_retryable_rows(self):
+        """Plan §10.1 #8 (complement): 5xx and network failures stay in_flight, touch .failed, and hand off to the
+        reconciler with no inline retry."""
         for kind in ("Waiting", "Ended"):
             for row, (status, body, error, delay) in RETRYABLE.items():
                 with self.subTest(kind=kind, row=row):
@@ -118,7 +123,7 @@ class ResponseMatrixTests(MatrixCase):
                         self.cache_mgr.save(data)
 
     def test_p08_rejection_lets_the_vendor_hook_fall_through(self):
-        """Plan §3.3: after a rejection the guard no longer suppresses the vendor hook for that pane."""
+        """Plan §10.1 #8 / §3.3: after a rejection the guard no longer suppresses the vendor hook for that pane."""
         pane = "w1:pGuard"
         self._admit(pane)
         self.bridge.enqueue(400)

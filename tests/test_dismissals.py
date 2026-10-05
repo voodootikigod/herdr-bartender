@@ -100,7 +100,7 @@ class CancellationTests(DismissalCase):
         self.assertIs(self.queued()[UUID]["pane_closed"], True)
 
     def test_p60_ttl_ended_dismissal_is_cancelled_when_vendor_fallback_returns(self):
-        """Plan §5.1 5b / #60 with R24 narrowed: a confirmed Ended that is NOT a pane/tab/workspace close (here a TTL
+        """Plan §10.1 #60 / §5.1 5b with R24 narrowed: a confirmed Ended that is NOT a pane/tab/workspace close (here a TTL
         expiry; the pane and a vendor CLI may live on) queues a dismissal that the pane-scoped triggers still cancel:
         once the vendor hook re-creates .vendor_active, the queued Ended for that vendor UUID is purged unsent."""
         seed(self.cache_mgr, {self.sid(PANE): session(PANE, "Working", now=self.clock.time() - 43201)})

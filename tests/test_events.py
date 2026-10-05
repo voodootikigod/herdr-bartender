@@ -123,7 +123,7 @@ class StatusEventTests(SandboxTestCase):
         self.assertEqual(self.bridge.history[-1]["agent"], "Claude (Herdr)")
 
     def test_p18_status_without_pane_id_never_uses_focused_pane(self):
-        """Plan §2.3 (gap pane-closed-context-leak): a status event without pane_id is dropped, not applied to the focused pane."""
+        """Plan §10.1 #18 / §2.3 (gap pane-closed-context-leak): a status event without pane_id is dropped, not applied to the focused pane."""
         handle_agent_status_changed({"agent_status": "working", "agent": "claude"},
                                     {"focused_pane_id": "w1:pFocused", "focused_pane_agent": "claude"}, bridge_url=self.mock_url)
         with self.cache_mgr as data:

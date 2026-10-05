@@ -1,3 +1,5 @@
+> Normative amendments: see docs/plan-resolutions.md, which overrides conflicting text in this document.
+
 # Herdr to Bartender Pro (Top Shelf) Integration Specification
 
 ## 1. Executive Summary
