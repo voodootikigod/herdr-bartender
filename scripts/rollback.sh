@@ -82,9 +82,10 @@ drain_event_handlers() {
   local ticks=0
   while pgrep -u "$(id -u)" -f "$EVENT_PATTERN" >/dev/null 2>&1; do
     if [ "$ticks" -ge "$EVENT_DRAIN_TICKS" ]; then
-      echo "Warning: herdr-bartender event handlers still running after 3s; keeping $STATE_DIR"
-      ERRORS=$((ERRORS + 1))
-      return
+      # R68: never run --cleanup (or remove state) under a live handler - it could recreate or mutate state after.
+      echo "Error: herdr-bartender event handlers still running after 3s; aborting before cleanup."
+      echo "Keeping $STATE_DIR/DISABLED active. Re-run this script once they have exited."
+      exit 1
     fi
     sleep 0.1
     ticks=$((ticks + 1))

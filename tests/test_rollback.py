@@ -264,6 +264,9 @@ class RollbackScriptTests(SandboxTestCase):
         self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
         self.assertIn("event handlers still running", res.stdout)
         self.assertTrue((self.state_dir / "DISABLED").exists())
+        self.assertEqual(self.log_lines("cleanup.log"), [], "R68: --cleanup never runs under a live event handler")
+        self.assertFalse(any("reconcile-background" in line for line in self.log_lines("pkill.log")),
+                         "R68: nothing after the drain runs")
 
     def test_state_dir_follows_xdg_rule(self):
         """Plan §2.2: without HERDR_PLUGIN_STATE_DIR the script uses $XDG_STATE_HOME/herdr/plugins/herdr-bartender."""
