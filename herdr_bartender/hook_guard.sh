@@ -301,8 +301,26 @@ while True:
         _HB_CAPTURE_ERR=1
       fi
 
+      # R74: a genuine .vendor_active is only ever a small regular file written by mktemp + mv. A symlink, a
+      # non-regular entry or anything over 4 KiB is removed (rm never follows); an entry rm cannot remove (a
+      # directory) blocks every .vendor_active write and simply passes through.
+      _HB_VA_BLOCKED=0
+      if [ -L "$_HB_VENDOR_ACTIVE" ] || { [ -e "$_HB_VENDOR_ACTIVE" ] && [ ! -f "$_HB_VENDOR_ACTIVE" ]; }; then
+        rm -f "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
+      elif [ -f "$_HB_VENDOR_ACTIVE" ]; then
+        _HB_VA_SIZE=$(wc -c < "$_HB_VENDOR_ACTIVE" 2>/dev/null | tr -d ' \t') || _HB_VA_SIZE=""
+        case "$_HB_VA_SIZE" in ''|*[!0-9]*) _HB_VA_SIZE=99999 ;; esac
+        if [ "$_HB_VA_SIZE" -gt 4096 ]; then
+          rm -f "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
+        fi
+      fi
+      if [ -L "$_HB_VENDOR_ACTIVE" ] || { [ -e "$_HB_VENDOR_ACTIVE" ] && [ ! -f "$_HB_VENDOR_ACTIVE" ]; }; then
+        _HB_VA_BLOCKED=1
+      fi
+
       _HB_VA_HAS_UUID=0
-      if [ -s "$_HB_VENDOR_ACTIVE" ] && grep -m1 -Eq '\{"vendor_session_id":' "$_HB_VENDOR_ACTIVE" 2>/dev/null; then
+      if [ "$_HB_VA_BLOCKED" -eq 0 ] && [ -s "$_HB_VENDOR_ACTIVE" ] \
+         && grep -m1 -Eq '\{"vendor_session_id":' "$_HB_VENDOR_ACTIVE" 2>/dev/null; then
         _HB_VA_HAS_UUID=1
       fi
 
@@ -340,10 +358,8 @@ while True:
           _HB_VA_TMP=$(mktemp "$_HB_STATE_HOME/panes/.va.tmp.XXXXXX" 2>/dev/null || true)
           if [ -n "$_HB_VA_TMP" ]; then
             printf '{"vendor_session_id":"%s"}' "$_HB_VENDOR_SID" > "$_HB_VA_TMP" 2>/dev/null || true
-            mv -f "$_HB_VA_TMP" "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
-          else
-            printf '{"vendor_session_id":"%s"}' "$_HB_VENDOR_SID" > "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
-          fi
+            mv -f "$_HB_VA_TMP" "$_HB_VENDOR_ACTIVE" 2>/dev/null || rm -f "$_HB_VA_TMP" 2>/dev/null || true
+          fi   # R74: no direct (symlink-following) write when mktemp fails: pass through unrecorded
           _HB_VA_HAS_UUID=1
         fi
 
@@ -360,10 +376,8 @@ while True:
             _HB_VA_TMP=$(mktemp "$_HB_STATE_HOME/panes/.va.tmp.XXXXXX" 2>/dev/null || true)
             if [ -n "$_HB_VA_TMP" ]; then
               printf '{"vendor_session_id":"%s"}' "$_HB_VENDOR_SID" > "$_HB_VA_TMP" 2>/dev/null || true
-              mv -f "$_HB_VA_TMP" "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
-            else
-              printf '{"vendor_session_id":"%s"}' "$_HB_VENDOR_SID" > "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
-            fi
+              mv -f "$_HB_VA_TMP" "$_HB_VENDOR_ACTIVE" 2>/dev/null || rm -f "$_HB_VA_TMP" 2>/dev/null || true
+            fi   # R74: no direct (symlink-following) write when mktemp fails: pass through unrecorded
           fi
         else
           # Bare touch (_HB_VA_HAS_UUID -eq 0)
@@ -383,22 +397,25 @@ while True:
         exit 0
       else
         mkdir -m 700 -p "$_HB_STATE_HOME/panes" 2>/dev/null || true
-        if [ -n "$_HB_VENDOR_SID" ]; then
+        if [ "$_HB_VA_BLOCKED" -eq 1 ]; then
+          : # R74: an entry rm could not remove sits at .vendor_active: pass through unrecorded
+        elif [ -n "$_HB_VENDOR_SID" ]; then
           _HB_VA_TMP=$(mktemp "$_HB_STATE_HOME/panes/.va.tmp.XXXXXX" 2>/dev/null || true)
           if [ -n "$_HB_VA_TMP" ]; then
             printf '{"vendor_session_id":"%s"}' "$_HB_VENDOR_SID" > "$_HB_VA_TMP" 2>/dev/null || true
-            mv -f "$_HB_VA_TMP" "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
-          else
-            printf '{"vendor_session_id":"%s"}' "$_HB_VENDOR_SID" > "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
-          fi
+            mv -f "$_HB_VA_TMP" "$_HB_VENDOR_ACTIVE" 2>/dev/null || rm -f "$_HB_VA_TMP" 2>/dev/null || true
+          fi   # R74: no direct (symlink-following) write when mktemp fails: pass through unrecorded
         else
-          touch "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
+          _HB_VA_TMP=$(mktemp "$_HB_STATE_HOME/panes/.va.tmp.XXXXXX" 2>/dev/null || true)
+          if [ -n "$_HB_VA_TMP" ]; then   # R74: a bare record via mktemp + mv, never a symlink-following touch
+            mv -f "$_HB_VA_TMP" "$_HB_VENDOR_ACTIVE" 2>/dev/null || rm -f "$_HB_VA_TMP" 2>/dev/null || true
+          fi
         fi
       fi
 
 
       # Refresh only (-c never creates): Python may retire .vendor_active between the test and the touch.
-      if [ "$_HB_IS_SESSION_TERMINAL" -eq 0 ] && [ -f "$_HB_VENDOR_ACTIVE" ]; then
+      if [ "$_HB_IS_SESSION_TERMINAL" -eq 0 ] && [ -f "$_HB_VENDOR_ACTIVE" ] && [ ! -L "$_HB_VENDOR_ACTIVE" ]; then
         touch -c "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
       fi
       if [ -n "$_HB_GUARD_TMP" ] && [ -f "$_HB_GUARD_TMP" ]; then
@@ -410,7 +427,8 @@ while True:
             _HB_IS_SESSION_TERMINAL _HB_IS_TURN_TERMINAL _HB_VENDOR_SID _HB_VA_HAS_UUID \
             _HB_HERDR_HEALTHY _HB_MARKER_MTIME _HB_MARKER_AGE _HB_NOW_TIME _HB_OLD_UMASK _HB_FIRST_LINE \
             _HB_READ_STATUS _HB_RAW_SID _HB_VA_TMP _HB_CAPTURE_ERR _HB_GUARD_TMP _HB_SPLICE_FIFO \
-            _HB_ARGV_IS_JSON _HB_ARGV_SID _HB_AWK _HB_CLASS _HB_CLASSIFY_ERR _HB_HAS_PERL _HB_DEADLINE
+            _HB_ARGV_IS_JSON _HB_ARGV_SID _HB_AWK _HB_CLASS _HB_CLASSIFY_ERR _HB_HAS_PERL _HB_DEADLINE \
+            _HB_VA_SIZE _HB_VA_BLOCKED
     fi
   fi
 fi

@@ -520,6 +520,10 @@ class HookGuardHardeningTests(_GuardCase):
                 self.assertEqual(res.returncode, 0, res.stderr)
                 self.assertIn("UMASK=0022", res.stdout, "caller umask must be restored before the vendor body")
                 _, va = self.paths(pane)
+                if label == "uuid-printf-fallback":
+                    # R74: with mktemp failing there is no direct (symlink-following) write: nothing is recorded.
+                    self.assertFalse(os.path.lexists(va), "no fallback write when mktemp fails")
+                    continue
                 self.assertTrue(va.exists())
                 self.assertEqual(file_mode(va), 0o600, f"{label}: .vendor_active must be 0600")
 
