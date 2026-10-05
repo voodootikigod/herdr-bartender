@@ -375,7 +375,7 @@ def cleanup_vendor_active(pane_id: str, raw_pane_id: Optional[str] = None, is_pa
             resolution = resolve_vendor_cleanups(data, (pane_id,), clock.time(),
                                                  closed_panes=(pane_id,) if is_pane_closed else ())
             cache_mgr.save(data)
-            resolution.commit()
+        resolution.commit()   # R88: vendor-file I/O only after the lock is released (and only after the save)
     except IntegrationDisabled:
         log_debug(f"DISABLED: vendor cleanup for {pane_id} skipped")
         return

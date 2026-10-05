@@ -111,7 +111,7 @@ def _settle_locked(cache_mgr: BoundedSessionCache, claim: Claim, sent: Sent
             journaled = journal_owed_exports(effects, data)   # durable before the save marks them orphaned_ended
             cache_mgr.save(data)
             commit_delivery_down(effects)   # a reconnection clears DELIVERY_DOWN only once its re-sync is saved
-        vendor.commit()
+    vendor.commit()   # R88: vendor-file I/O only after the lock is released (and only after the save)
     # R52: an owed export that could not be journaled leaves the record flagged; a reconciler pass re-mirrors it.
     unmirrored = bool(effects.orphans_to_export) and not journaled
     post = PostLock(effects.compensations, vendor.dismissals,

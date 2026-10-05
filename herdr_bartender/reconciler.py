@@ -119,7 +119,7 @@ def queue_pending_vendor_cleanups(cache_mgr: BoundedSessionCache) -> Tuple[str, 
         resolution = resolve_vendor_cleanups(data, pending_vendor_panes(data), clock.time())
         if resolution.changed:
             cache_mgr.save(data)
-        resolution.commit()
+    resolution.commit()   # R88: vendor-file I/O only after the lock is released (and only after the save)
     return resolution.dismissals
 
 

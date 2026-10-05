@@ -143,7 +143,9 @@ def run_step_a(cache_mgr: BoundedSessionCache, stage: Stage, *, policy: SendPoli
         if batch.needs_save or staged.mutated or vendor.changed:
             cache_mgr.save(data)
             batch.commit()
-        vendor.commit()  # only once the queued dismissals are saved (a failed save raised above)
         live = has_live_sessions(data) or has_owed_root_work(data)   # R78: owed work keeps the watchdog too
+    # R88: retire .vendor_active files outside the cache lock - only once the queued dismissals are saved (a failed
+    # save raised out of the block above); the retirement is claim-and-verify, so it needs no lock.
+    vendor.commit()
     hand_off = bool(batch.staged_sessions) or plan.deferred or plan.overflow
     return StepAResult(plan.claims, hand_off, live, staged.orphan_exports, vendor.dismissals)
