@@ -184,3 +184,4 @@ Status at the W5 gate:
 | R63 | Bounded `.vendor_active` read | `tests.test_gate_round15.VendorReadBoundTests.*` (2 tests) |
 | R64 | Strict capped spool/results directories; non-blocking bounded reads | `tests.test_gate_round16.*` (5 tests: concurrent writers stop at the cap, FIFO envelope, results cap, FIFO and symlinked `.vendor_active`) |
 | R65 | Checked size equals written size; bounded state-file reads | `tests.test_gate_round17.*` (4 tests) |
+| R66 | Keyed close envelopes: never pruned, newest per container, bounded distinct containers | `tests.test_gate_round15.SpoolHardCapTests.*` (6 tests), `tests.test_gate_round16.StrictSpoolCeilingTests.test_concurrent_writers_never_exceed_the_close_ceiling` |

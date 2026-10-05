@@ -117,8 +117,8 @@ def _count_json(directory: Path) -> int:
 
 
 @contextmanager
-def capped_directory(directory: Path, cap: int, timeout: float = 0.2) -> Iterator[None]:
-    """Hold ``<directory>/.lock`` while the body writes one file; raises DirectoryFull at the ceiling."""
+def locked_directory(directory: Path, timeout: float = 0.2) -> Iterator[None]:
+    """Hold ``<directory>/.lock`` (exclusive, bounded wait); raises DirectoryFull(EAGAIN) when it stays busy."""
     fd = os.open(str(directory / LOCK_NAME), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
                  PRIVATE_FILE_MODE)
     try:
@@ -131,9 +131,16 @@ def capped_directory(directory: Path, cap: int, timeout: float = 0.2) -> Iterato
                 if clock.monotonic() >= give_up_at:
                     raise DirectoryFull(errno.EAGAIN, "directory lock busy", str(directory))
                 clock.sleep(LOCK_RETRY_INTERVAL)
+        yield
+    finally:
+        os.close(fd)   # releases the flock
+
+
+@contextmanager
+def capped_directory(directory: Path, cap: int, timeout: float = 0.2) -> Iterator[None]:
+    """Hold ``<directory>/.lock`` while the body writes one file; raises DirectoryFull at the ceiling."""
+    with locked_directory(directory, timeout):
         count = _count_json(directory)
         if count >= cap:
             raise DirectoryFull(errno.ENOSPC, f"{count} files at the {cap}-file ceiling", str(directory))
         yield
-    finally:
-        os.close(fd)   # releases the flock

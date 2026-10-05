@@ -2,7 +2,7 @@
 
 * ``defer_event()``: the event path could not take (or save) the cache lock. It
   writes an R6 envelope to ``spool/<enqueued_ns:020d>_<pid>_<monotonic_ns>.json``
-  (atomic rename; at most 100 files, close envelopes never pruned; R62: new envelopes refused past 500 files or 256 KiB), flags the
+  (atomic rename; at most 100 status files, oldest pruned; R66: close envelopes are never pruned - the newest close per container replaces older ones, up to 4096 distinct containers; 256 KiB per envelope), flags the
   reconciler and returns, so the caller exits 0 without touching the cache.
 * ``replay_spool_locked(data)``: Step A, while the caller holds the cache lock.
   Up to 16 envelopes in filename (FIFO) order are staged into ``data`` with the
@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import time  # real monotonic_ns keeps spool filenames unique under a fake clock
 from dataclasses import dataclass
@@ -22,17 +24,20 @@ from typing import Callable, List, Optional, Tuple
 
 from . import clock
 from .cache import BoundedSessionCache
-from .boundedio import capped_lock_timeout
+from .boundedio import capped_lock_timeout, locked_directory
 from .envelopes import (
+    CLOSE_EVENTS,
+    MAX_ENVELOPE_BYTES,
     build_envelope,
     is_close_envelope,
     quarantine,
     read_json,
+    serialize_json,
     unlink_files,
     validate_envelope,
-    write_json_capped,
+    write_bytes_atomic,
 )
-from .intake import PANE_CLOSED, STATUS_EVENT, container_id, resolve_identity
+from .intake import PANE_CLOSED, STATUS_EVENT, TAB_CLOSED, WORKSPACE_CLOSED, container_id, resolve_identity
 from .log import log_debug, log_warning
 from .paths import ensure_private_dir, get_state_dir
 from .process import is_herdr_alive, memoised_herdr_alive
@@ -41,7 +46,13 @@ from .markers import remove_pane_marker
 from .staging import stage_container_close, stage_pane_close_result, stage_status
 
 SPOOL_CAP = 100
-SPOOL_HARD_CAP = 500           # R62: close envelopes are never pruned, so new ones stop here instead
+CLOSE_HARD_CAP = 4096          # R66: distinct containers with a pending close (newest close per container kept)
+CLOSE_MARK = "_c"               # keyed close envelopes: <enqueued_ns>_<pid>_<mono>_c<key>.json
+CLOSE_KEY_HEX = 32
+CLOSE_FIELD_MAX_CHARS = 1024
+CLOSE_DATA_KEYS = ("pane_id", "workspace_id", "tab_id", "agent", "agent_status", "state", "timestamp", "title", "cwd")
+EXIT_CONTEXT_KEYS = ("focused_pane_id", "focused_pane_agent", "focused_pane_cwd", "workspace_id", "workspace_cwd",
+                     "workspace_label", "tab_id")
 REPLAY_BATCH = 16
 WORKSPACE_ENV = "HERDR_WORKSPACE_ID"
 
@@ -82,9 +93,40 @@ def _with_env_workspace(event_data: dict) -> dict:
     return dict(event_data)
 
 
+def _is_keyed_close(path: Path) -> bool:
+    return CLOSE_MARK in path.stem
+
+
+def _close_key(event_name: str, event_data: dict) -> str:
+    """R66: one key per closed container; a newer close for it supersedes (replaces) the spooled one."""
+    if event_name == TAB_CLOSED:
+        ids = (event_data.get("tab_id"),)
+    elif event_name == WORKSPACE_CLOSED:
+        ids = (event_data.get("workspace_id"),)
+    else:   # pane.closed or an agent exit (a status event): keyed by pane, in separate namespaces
+        ids = (event_data.get("pane_id"), event_data.get("workspace_id"))
+    raw = json.dumps([event_name, *[i if isinstance(i, str) else None for i in ids]])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:CLOSE_KEY_HEX]
+
+
+def _trim(value: object) -> object:
+    return value[:CLOSE_FIELD_MAX_CHARS] if isinstance(value, str) else value
+
+
+def _slim_close(event_name: str, event_data: dict, context: dict) -> Tuple[dict, dict]:
+    """R66: a close envelope keeps only the fields its replay reads, each bounded, so it stays a few KiB."""
+    data = {k: _trim(event_data[k]) for k in CLOSE_DATA_KEYS if k in event_data}
+    if event_name in CLOSE_EVENTS:
+        return data, {}   # container closes never consult the context
+    return data, {k: _trim(context[k]) for k in EXIT_CONTEXT_KEYS if k in context}
+
+
 def _make_room(directory: Path) -> None:
-    """Keep at most SPOOL_CAP - 1 envelopes before a write; only the oldest non-close ones are dropped."""
-    files = sorted(p for p in directory.glob("*.json") if p.is_file())
+    """Keep at most SPOOL_CAP - 1 status envelopes before a write; only the oldest status ones are dropped.
+
+    Keyed close envelopes are never pruned (they have their own ceiling); an unkeyed legacy close is kept too.
+    """
+    files = sorted(p for p in directory.glob("*.json") if p.is_file() and not _is_keyed_close(p))
     excess = len(files) - (SPOOL_CAP - 1)
     for path in files:
         if excess <= 0:
@@ -101,17 +143,43 @@ def _make_room(directory: Path) -> None:
         excess -= 1
 
 
+def _replace_spooled_close(directory: Path, key: str) -> None:
+    """Under the spool lock: drop older envelopes for the same container (the new one supersedes them)."""
+    for older in directory.glob(f"*{CLOSE_MARK}{key}.json"):
+        unlink_files([older])
+    if sum(1 for p in directory.glob("*.json") if _is_keyed_close(p)) >= CLOSE_HARD_CAP:
+        raise SpoolWriteError(f"{CLOSE_HARD_CAP} distinct container closes already awaiting replay")
+
+
 def enqueue_spool(event_name: str, event_data: dict, context: dict, arrival_ns: Optional[int] = None,
                   state_dir: Optional[Path] = None) -> Path:
-    """Write one R6 envelope atomically; raises SpoolWriteError."""
+    """Write one R6 envelope atomically; raises SpoolWriteError.
+
+    R66: status envelopes are capped at SPOOL_CAP (oldest pruned). A close is never pruned and never lost to the
+    status cap: a newer close for the same container replaces the spooled one, and distinct pending containers are
+    bounded by CLOSE_HARD_CAP (far beyond what Herdr can hold open).
+    """
     try:
         directory = spool_dir(state_dir)
-        _make_room(directory)
         enqueued_ns = clock.time_ns()
-        env = build_envelope(event_name, _with_env_workspace(event_data if isinstance(event_data, dict) else {}),
-                             context, arrival_ns or enqueued_ns, enqueued_ns)
-        path = directory / f"{enqueued_ns:020d}_{os.getpid()}_{time.monotonic_ns()}.json"
-        write_json_capped(directory, path, env, SPOOL_HARD_CAP, capped_lock_timeout())
+        event_data = _with_env_workspace(event_data if isinstance(event_data, dict) else {})
+        context = context if isinstance(context, dict) else {}
+        env = build_envelope(event_name, event_data, context, arrival_ns or enqueued_ns, enqueued_ns)
+        stem = f"{enqueued_ns:020d}_{os.getpid()}_{time.monotonic_ns()}"
+        with locked_directory(directory, capped_lock_timeout()):
+            if is_close_envelope(env):
+                key = _close_key(event_name, event_data)
+                env = build_envelope(event_name, *_slim_close(event_name, event_data, context),
+                                     env["arrival_ns"], enqueued_ns)
+                _replace_spooled_close(directory, key)
+                path = directory / f"{stem}{CLOSE_MARK}{key}.json"
+            else:
+                _make_room(directory)
+                path = directory / f"{stem}.json"
+            data = serialize_json(env)
+            if len(data) > MAX_ENVELOPE_BYTES:
+                raise SpoolWriteError(f"envelope too large ({len(data)} bytes > {MAX_ENVELOPE_BYTES})")
+            write_bytes_atomic(path, data)
         return path
     except (OSError, TypeError, ValueError) as e:
         raise SpoolWriteError(f"could not spool {event_name}: {e}") from e

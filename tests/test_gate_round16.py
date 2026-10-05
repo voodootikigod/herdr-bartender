@@ -16,13 +16,14 @@ from tests.support import REPO_ROOT, SandboxTestCase
 from tests.support.nonblocking import call_without_blocking
 
 WRITER = """
+import os
 import sys
 sys.path.insert(0, sys.argv[1])
 from herdr_bartender.spool import SpoolWriteError, enqueue_spool
 ok = 0
 for n in range(int(sys.argv[2])):
     try:
-        enqueue_spool("pane.closed", {"pane_id": "w1:p%d" % n, "workspace_id": "w1"}, {})
+        enqueue_spool("pane.closed", {"pane_id": "w1:p%d_%d" % (os.getpid(), n), "workspace_id": "w1"}, {})
         ok += 1
     except SpoolWriteError:
         pass
@@ -31,15 +32,15 @@ print(ok)
 
 
 class StrictSpoolCeilingTests(SandboxTestCase):
-    def test_concurrent_writers_never_exceed_the_hard_cap(self):
-        """R64: count-then-write is serialised by spool/.lock, so racing writers stop exactly at the ceiling."""
+    def test_concurrent_writers_never_exceed_the_close_ceiling(self):
+        """R64/R66: count-then-write is serialised by spool/.lock, so racing writers stop exactly at the ceiling."""
         directory = spool_dir()
-        for n in range(spool.SPOOL_HARD_CAP - 20):
-            enqueue_spool("pane.closed", {"pane_id": f"w1:q{n}", "workspace_id": "w1"}, {})
+        for n in range(spool.CLOSE_HARD_CAP - 20):   # pre-filled distinct pending closes
+            (directory / f"{n:020d}_1_1{spool.CLOSE_MARK}{n:032x}.json").write_text("{}")
         procs = [subprocess.Popen([sys.executable, "-c", WRITER, str(REPO_ROOT), "15"], stdout=subprocess.PIPE,
                                   env=os.environ.copy()) for _ in range(6)]
-        written = sum(int(p.communicate(timeout=60)[0] or 0) for p in procs)
-        self.assertEqual(len(list(directory.glob("*.json"))), spool.SPOOL_HARD_CAP)
+        written = sum(int(p.communicate(timeout=120)[0] or 0) for p in procs)
+        self.assertEqual(len(list(directory.glob("*.json"))), spool.CLOSE_HARD_CAP)
         self.assertEqual(written, 20, "exactly the remaining room was written")
 
     def test_planted_fifo_in_spool_is_not_read_blocking(self):
