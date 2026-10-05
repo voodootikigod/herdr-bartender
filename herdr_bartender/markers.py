@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from . import clock
-from .boundedio import write_state_file
+from .boundedio import NotRegularFile, refresh_regular_file, write_state_file
 from .log import log_debug, log_warning
 from .paths import ensure_private_dir, get_state_dir
 from .sanitize import get_hex_pane_id
@@ -133,11 +133,13 @@ def refresh_pane_marker(pane_id: str) -> bool:
         hex_id = get_hex_pane_id(pane_id)
         if (panes_dir / f"{hex_id}.failed").exists():
             return False
+        marker = panes_dir / hex_id
         try:
-            os.utime(panes_dir / hex_id, None)
-        except FileNotFoundError:
+            return refresh_regular_file(marker)   # R73: never follows a symlink or touches another file
+        except NotRegularFile as exc:
+            log_warning(f"Removing a non-regular pane marker for {pane_id!r} ({exc}); vendor hooks fall through")
+            _unlink_quietly(marker)
             return False
-        return True
     except OSError as exc:
         log_debug(f"Heartbeat could not refresh the marker of {pane_id!r}: {exc}")
         return False

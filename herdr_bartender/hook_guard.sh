@@ -307,7 +307,12 @@ while True:
       fi
 
       _HB_HERDR_HEALTHY=0
-      if [ ! -f "$_HB_STATE_HOME/DISABLED" ] && [ ! -f "$_HB_STATE_HOME/DELIVERY_DOWN" ] && [ -f "$_HB_PANE_MARKER" ] && [ ! -f "${_HB_PANE_MARKER}.failed" ]; then
+      # R73: a flag counts as set if ANY entry exists at its path (a planted or dangling symlink fails open); the
+      # marker must be a regular file, never a symlink (its target's mtime proves nothing about Herdr).
+      if [ ! -e "$_HB_STATE_HOME/DISABLED" ] && [ ! -L "$_HB_STATE_HOME/DISABLED" ] \
+         && [ ! -e "$_HB_STATE_HOME/DELIVERY_DOWN" ] && [ ! -L "$_HB_STATE_HOME/DELIVERY_DOWN" ] \
+         && [ -f "$_HB_PANE_MARKER" ] && [ ! -L "$_HB_PANE_MARKER" ] \
+         && [ ! -e "${_HB_PANE_MARKER}.failed" ] && [ ! -L "${_HB_PANE_MARKER}.failed" ]; then
         _HB_MARKER_MTIME=$(stat -c %Y "$_HB_PANE_MARKER" 2>/dev/null) || _HB_MARKER_MTIME=$(stat -f %m "$_HB_PANE_MARKER" 2>/dev/null) || _HB_MARKER_MTIME=0
         case "$_HB_MARKER_MTIME" in ''|*[!0-9]*) _HB_MARKER_MTIME=0 ;; esac
         _HB_NOW_TIME=$(date +%s 2>/dev/null) || _HB_NOW_TIME=0

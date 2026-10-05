@@ -137,6 +137,27 @@ def write_state_file(path: Path, data: bytes = b"") -> None:
         os.close(fd)
 
 
+def refresh_regular_file(path: Path) -> bool:
+    """R73: bump an existing regular file's mtime through a no-follow fd; False when it does not exist.
+
+    Raises NotRegularFile for a symlink, FIFO, device or directory (the caller decides what to do with it).
+    """
+    try:
+        fd = _open_no_follow(path, os.O_WRONLY | os.O_NONBLOCK | _NOFOLLOW, PRIVATE_FILE_MODE)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        if exc.errno == errno.ENXIO:   # a FIFO with no reader
+            raise NotRegularFile(errno.ENXIO, "not a regular file", str(path)) from exc
+        raise
+    try:
+        _require_regular(fd, path)
+        os.utime(fd)
+    finally:
+        os.close(fd)
+    return True
+
+
 def open_exclusive_tmp(path: Path, mode: int = PRIVATE_FILE_MODE) -> int:
     """R70: create a predictable temp file with O_EXCL (a stale or planted path - symlink included - is unlinked,
     never followed, then created afresh); returns a write fd."""
