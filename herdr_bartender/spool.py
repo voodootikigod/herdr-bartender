@@ -43,6 +43,7 @@ from .paths import ensure_private_dir, get_state_dir
 from .process import is_herdr_alive, memoised_herdr_alive
 from .handoff import ensure_reconciler_running, touch_reconciler_pending
 from .markers import remove_pane_marker
+from .spool_overflow import close_is_relevant, evictable_close, live_targets
 from .staging import stage_container_close, stage_pane_close_result, stage_status
 
 SPOOL_CAP = 100
@@ -147,12 +148,26 @@ def _spooled_closes(directory: Path, key: str) -> List[Path]:
     return list(directory.glob(f"*{CLOSE_MARK}{key}.json"))
 
 
-def _require_close_room(directory: Path, superseded: List[Path]) -> None:
-    """Under the spool lock: a known container always has room (it replaces itself); a new one needs a slot."""
+def _require_close_room(directory: Path, superseded: List[Path], event_name: str, event_data: dict) -> None:
+    """Under the spool lock: a known container always has room (it replaces itself); a new one needs a slot.
+
+    R83: at the ceiling, a close that can still end something evicts the oldest spooled close that cannot; only a
+    close whose replay would be a no-op is refused.
+    """
     if superseded:
         return
-    if sum(1 for p in directory.glob("*.json") if _is_keyed_close(p)) >= CLOSE_HARD_CAP:
-        raise SpoolWriteError(f"{CLOSE_HARD_CAP} distinct container closes already awaiting replay")
+    keyed = [p for p in directory.glob("*.json") if _is_keyed_close(p)]
+    if len(keyed) < CLOSE_HARD_CAP:
+        return
+    statuses = [p for p in directory.glob("*.json") if not _is_keyed_close(p)]
+    targets = live_targets(directory.parent, statuses)
+    if not close_is_relevant(event_name, event_data, targets):
+        raise SpoolWriteError(f"{CLOSE_HARD_CAP} closes awaiting replay; this one targets nothing cached (no-op)")
+    victim = evictable_close(keyed, targets)
+    if victim is None:
+        raise SpoolWriteError(f"{CLOSE_HARD_CAP} distinct container closes awaiting replay, all still relevant")
+    log_warning(f"Close spool at capacity; dropping {victim.name}, whose replay could end nothing")
+    unlink_files([victim])
 
 
 def enqueue_spool(event_name: str, event_data: dict, context: dict, arrival_ns: Optional[int] = None,
@@ -177,7 +192,7 @@ def enqueue_spool(event_name: str, event_data: dict, context: dict, arrival_ns: 
                 env = build_envelope(event_name, *_slim_close(event_name, event_data, context),
                                      env["arrival_ns"], enqueued_ns)
                 superseded = _spooled_closes(directory, key)
-                _require_close_room(directory, superseded)
+                _require_close_room(directory, superseded, event_name, event_data)
                 path = directory / f"{stem}{CLOSE_MARK}{key}.json"
             else:
                 _make_room(directory)

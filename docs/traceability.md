@@ -201,3 +201,4 @@ Status at the W5 gate:
 | R80 | Journal supersession independent of wall-clock names | `tests.test_gate_round30.JournalBoundTests.test_newer_op_wins_even_when_the_clock_stepped_back` |
 | R81 | One atomically replaced journal file per session; causal `jseq` replay order | `tests.test_gate_round30.JournalCausalOrderTests.*` (2 tests), `tests.test_orphan_journal.OrphanCapacityTests.test_journal_fold_respects_the_256_cap` |
 | R82 | Unreadable cache never counts as an empty, confirmed cleanup | `tests.test_gate_round34.*` (2 tests) |
+| R83 | Relevant closes evict irrelevant ones at the spool ceiling | `tests.test_gate_round15.RelevantCloseNeverLostTests.*` (3 tests) |

@@ -72,6 +72,44 @@ class SpoolHardCapTests(SandboxTestCase):
         self.assertEqual(self.spooled(), [])
 
 
+class RelevantCloseNeverLostTests(SandboxTestCase):
+    """R83: at the close ceiling, a close that can still end a cached session evicts one that cannot."""
+
+    def spooled(self):
+        return sorted((self.state_dir / "spool").glob("*.json"))
+
+    def setUp(self):
+        super().setUp()
+        import time as _time
+        from tests.support.reconciler_fixtures import seed, session
+        seed(self.cache_mgr, {self.sid("w1:pLive"): dict(session("w1:pLive", "Working", seq=2, now=_time.time()),
+                                                         tab_id="w1:tLive", workspace_id="w1")})
+
+    def test_relevant_close_evicts_an_irrelevant_one(self):
+        with mock.patch.object(spool, "CLOSE_HARD_CAP", 3):
+            stale = [enqueue_spool("pane.closed", {"pane_id": f"w9:gone{n}", "workspace_id": "w9"}, {})
+                     for n in range(3)]
+            path = enqueue_spool("pane.closed", {"pane_id": "w1:pLive", "workspace_id": "w1"}, {})
+        self.assertIn(path, self.spooled(), "the close that ends a cached session is kept")
+        self.assertEqual(len(self.spooled()), 3, "the ceiling still holds")
+        self.assertFalse(stale[0].exists(), "the oldest close that targets nothing was evicted")
+
+    def test_relevant_tab_close_evicts_too(self):
+        with mock.patch.object(spool, "CLOSE_HARD_CAP", 2):
+            for n in range(2):
+                enqueue_spool("pane.closed", {"pane_id": f"w9:gone{n}", "workspace_id": "w9"}, {})
+            path = enqueue_spool("tab.closed", {"tab_id": "w1:tLive", "workspace_id": "w1"}, {})
+        self.assertIn(path, self.spooled())
+
+    def test_irrelevant_close_is_refused_at_the_ceiling(self):
+        with mock.patch.object(spool, "CLOSE_HARD_CAP", 2):
+            for n in range(2):
+                enqueue_spool("pane.closed", {"pane_id": f"w9:gone{n}", "workspace_id": "w9"}, {})
+            with self.assertRaises(SpoolWriteError):
+                enqueue_spool("pane.closed", {"pane_id": "w8:other", "workspace_id": "w8"}, {})
+        self.assertEqual(len(self.spooled()), 2)
+
+
 class VendorReadBoundTests(SandboxTestCase):
     """R63: a .vendor_active larger than any real record is unreadable (never retired), and never read whole."""
 
