@@ -136,7 +136,9 @@ def _overall(checks: Tuple[HookCheck, ...], opted_in: bool) -> str:
         return STATUS_NOT_INSTALLED
     if any(c.status in (HOOK_MALFORMED, HOOK_UNREADABLE) for c in checks):
         return STATUS_NEEDS_REVIEW
-    if any(c.needs_patch and not c.allowlisted for c in checks):
+    # R61: a current guard is not proof of approved content - every guarded or patchable hook's guard-free bytes
+    # must still match its own allowlist entry, or the operator reviews it.
+    if any((c.needs_patch or c.status == HOOK_INTACT) and not c.allowlisted for c in checks):
         return STATUS_NEEDS_REVIEW
     return STATUS_NEEDS_PATCH if any(c.needs_patch for c in checks) else STATUS_INTACT
 

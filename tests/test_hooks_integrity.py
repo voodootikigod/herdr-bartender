@@ -115,6 +115,27 @@ class CheckHookIntegrityTests(_IntegrityCase):
                     write_allowlist(self.state_dir, allowlist)
                 self.assertEqual(check_hook_integrity().status, STATUS_NEEDS_REVIEW)
 
+    def test_current_guard_over_modified_vendor_code_needs_review(self):
+        """R61 (gate round 14): a hook whose guard block is current but whose guard-free vendor code no longer
+        matches its allowlisted SHA was reported intact, skipping HOOK_NEEDS_REVIEW and the alert. It needs review,
+        and the reconciler step flags it without rewriting the hook."""
+        paths = self.seed_installed()
+        hook = paths[CLAUDE_HOOK]
+        tampered = hook.read_bytes() + b"echo 'injected after install'\n"
+        hook.write_bytes(tampered)
+        result = check_hook_integrity()
+        self.assertEqual(result.status, STATUS_NEEDS_REVIEW)
+        repaired = call_quietly(repair_hooks_if_allowlisted)[0]
+        self.assertTrue(repaired.review_flagged)
+        self.assertTrue(self.hnr.exists())
+        self.assertEqual(hook.read_bytes(), tampered, "never rewritten")
+
+    def test_current_guard_without_allowlist_entry_needs_review(self):
+        """R61: a current guard with no allowlist entry for that hook is not proof of approved content."""
+        self.seed_installed()
+        write_allowlist(self.state_dir, {CODEX_HOOK: KNOWN[CODEX_HOOK]})
+        self.assertEqual(check_hook_integrity().status, STATUS_NEEDS_REVIEW)
+
     def test_malformed_markers_need_review(self):
         """Plan §9.1 (gap marker-count-validation): duplicated markers in a hook force review in the reconciler."""
         paths = self.seed_installed()
