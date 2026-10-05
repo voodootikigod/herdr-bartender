@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Mapping, Optional, Tuple
 
 from . import clock
 from .cache import ORPHAN_MIRROR_OWED, BoundedSessionCache, IntegrationDisabled
@@ -45,7 +45,7 @@ from .lifecycle import (
 )
 from .log import log_debug, log_warning
 from .markers import remove_pane_marker
-from .orphans import export_orphan_record, journaled_export_sids, orphan_pane_ids, read_orphan_sids
+from .orphans import export_orphan_record, exported_session_records, journaled_export_records, orphan_pane_ids
 from .process import own_start_time
 from .sender import (
     BACKGROUND_POLICY,
@@ -161,9 +161,10 @@ def evict_exported_sessions(cache_mgr: BoundedSessionCache, exports, reason: str
     journal (an earlier pass could not write the file) is not exported again until the journal is folded: a
     persistent orphan-file error never journals the same export every pass.
     """
-    waiting = journaled_export_sids()
+    waiting = journaled_export_records()
     exported = [(sid, record) for sid, record in exports
-                if sid not in waiting and export_orphan_record(sid, orphan_record(record), blocking=True)]
+                if not _holds_export(waiting, sid, record)
+                and export_orphan_record(sid, orphan_record(record), blocking=True)]
     if len(exported) != len(exports):
         log_warning(f"{len(exports) - len(exported)} {reason} export(s) not written; kept for the next pass")
     if not exported:
@@ -174,6 +175,12 @@ def evict_exported_sessions(cache_mgr: BoundedSessionCache, exports, reason: str
     return evicted
 
 
+def _holds_export(exported: Mapping[str, List[dict]], sid: str, record: Mapping) -> bool:
+    """R77: a durable export of THIS record (same seq and desired state), not merely of the same session id."""
+    wanted = orphan_record(record)
+    return any(same_record(candidate, wanted) for candidate in exported.get(sid, ()))
+
+
 def remirror_owed_sessions(cache_mgr: BoundedSessionCache, owed: Exports) -> Tuple[str, ...]:
     """R52: make each owed orphan export durable (blocking, bounded: R10), then clear ``ORPHAN_MIRROR_OWED`` on the
     records that did not move on meanwhile, so the cap may prune them again.
@@ -181,12 +188,12 @@ def remirror_owed_sessions(cache_mgr: BoundedSessionCache, owed: Exports) -> Tup
     An export already waiting in the journal is durable as it is (no rewrite every pass while the orphan file stays
     unwritable); one written to the file or journaled now counts too. Nothing durable: the flag stays.
     """
-    waiting = journaled_export_sids()
+    waiting = journaled_export_records()
     for sid, record in owed:
-        if sid not in waiting:
+        if not _holds_export(waiting, sid, record):
             export_orphan_record(sid, orphan_record(record), blocking=True)
-    exported = read_orphan_sids() | journaled_export_sids()
-    durable = [(sid, record) for sid, record in owed if sid in exported]
+    exported = exported_session_records()
+    durable = [(sid, record) for sid, record in owed if _holds_export(exported, sid, record)]
     if not durable:
         log_warning(f"{len(owed)} orphan export(s) still not durable; their records stay out of the cap prune")
         return ()

@@ -265,6 +265,32 @@ def journaled_export_sids(orphan_file: Optional[Path] = None) -> FrozenSet[str]:
     return frozenset(op["sid"] for op in ops if op.get("op") == OP_EXPORT)
 
 
+def journaled_export_records(orphan_file: Optional[Path] = None) -> Dict[str, List[dict]]:
+    """R77: the session records each journaled export carries, by session id (several per id are possible)."""
+    out: Dict[str, List[dict]] = {}
+    for op in _load_journal(orphan_file or get_orphan_path()).ops:
+        if op.get("op") == OP_EXPORT and isinstance(op.get("session"), dict):
+            out.setdefault(op["sid"], []).append(op["session"])
+    return out
+
+
+def exported_session_records(orphan_file: Optional[Path] = None) -> Dict[str, List[dict]]:
+    """R77: every durable exported record (orphan file + journal), by session id; lock-free and read-only.
+
+    Callers must match the RECORD (seq, desired state), not just the id: session ids are deterministic per
+    host/pane, so an earlier turn's export can carry the same id.
+    """
+    orphan_path = orphan_file or get_orphan_path()
+    out = journaled_export_records(orphan_path)
+    try:
+        for sid, record in read_orphan_records(orphan_path).items():
+            if isinstance(record, dict):
+                out.setdefault(sid, []).append(record)
+    except OrphanFileError as e:
+        log_debug(f"Orphan file not readable for its records: {e}")
+    return out
+
+
 def _apply_op(sessions: dict, op: dict) -> dict:
     """Pure: ``sessions`` with ``op`` applied (exports keep the newest ORPHAN_CAPACITY).
 
