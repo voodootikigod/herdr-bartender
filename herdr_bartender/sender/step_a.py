@@ -19,11 +19,13 @@ performs the single reconciler hand-off after the lock is released.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional, Sequence, Tuple
 
 from .. import clock
 from ..cache import BoundedSessionCache, CacheError
-from ..orphans import journal_orphan_exports
+from ..orphans import journal_orphan_exports, pending_dir_for
+from ..paths import get_orphan_path
 from ..process import memoised_herdr_alive, memoised_instance_alive
 from ..spool import replay_spool_locked
 from ..vendor import pending_vendor_panes, resolve_vendor_cleanups
@@ -80,6 +82,28 @@ def has_live_sessions(data: dict) -> bool:
                for rec in data.get("sessions", {}).values())
 
 
+OWED_ROOT_KEYS = ("pending_compensations", "pending_vendor_cleanups", "dismissed_vendor_uuids")
+OWED_DIRS = ("results", "spool")
+
+
+def has_owed_root_work(data: dict) -> bool:
+    """R78: owed sends/cleanups recorded in the cache root (a pure check, safe under the cache lock)."""
+    return any(data.get(key) for key in OWED_ROOT_KEYS)
+
+
+def has_owed_work(data: dict, state_dir) -> bool:
+    """R78: persisted work only the reconciler finishes - owed sends and cleanups in the cache root, or files
+    waiting in results/, spool/ or the orphan journal. A crash after saving them must not strand them."""
+    if has_owed_root_work(data):
+        return True
+    for name in OWED_DIRS:
+        directory = Path(state_dir) / name
+        if directory.is_dir() and any(directory.glob("*.json")):
+            return True
+    journal = pending_dir_for(get_orphan_path())
+    return journal.is_dir() and any(journal.glob("*.json"))
+
+
 def claim_targets(targets: Sequence[Target], now_wall: float, limit: Optional[int], arrival_ns: Optional[int],
                   instance_alive: InstanceAlive = memoised_instance_alive) -> ClaimPlan:
     """Lease evaluation for each target (under the lock): claim, defer, or release as overflow."""
@@ -120,6 +144,6 @@ def run_step_a(cache_mgr: BoundedSessionCache, stage: Stage, *, policy: SendPoli
             cache_mgr.save(data)
             batch.commit()
         vendor.commit()  # only once the queued dismissals are saved (a failed save raised above)
-        live = has_live_sessions(data)
+        live = has_live_sessions(data) or has_owed_root_work(data)   # R78: owed work keeps the watchdog too
     hand_off = bool(batch.staged_sessions) or plan.deferred or plan.overflow
     return StepAResult(plan.claims, hand_off, live, staged.orphan_exports, vendor.dismissals)

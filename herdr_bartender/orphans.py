@@ -13,6 +13,7 @@ Replay (``--replay-orphans`` and the reconciler's automatic replay) lives in ``r
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import itertools
 import json
 import os
@@ -20,6 +21,8 @@ from pathlib import Path
 from typing import Dict, FrozenSet, Iterable, List, NamedTuple, Optional, Tuple
 
 from .boundedio import (
+    DirectoryFull,
+    locked_directory,
     JOURNAL_ENTRY_MAX_BYTES,
     ORPHAN_FILE_MAX_BYTES,
     UnusableFile,
@@ -29,7 +32,7 @@ from .boundedio import (
 )
 from . import clock, jsonsafe
 from .envelopes import quarantine
-from .log import log_debug
+from .log import log_debug, log_warning
 from .paths import PRIVATE_FILE_MODE, ensure_private_dir, get_orphan_path
 from .handoff import in_reconciler_loop, touch_reconciler_pending
 
@@ -188,10 +191,16 @@ def pending_dir_for(orphan_path: Path) -> Path:
     return orphan_path.with_name(orphan_path.name + ".pending")
 
 
-def _journal_op(orphan_path: Path, op: dict) -> bool:
-    """Durably record ``op`` for the next lock holder; False when even that failed."""
-    pending = ensure_private_dir(pending_dir_for(orphan_path))
-    name = f"{clock.time_ns():020d}-{os.getpid()}-{next(_JOURNAL_SEQ):06d}-{os.urandom(3).hex()}"
+JOURNAL_MAX_ENTRIES = 1024   # R78: distinct sessions with a journaled op (one entry each, the newest)
+JOURNAL_KEY_MARK = "-k"
+JOURNAL_LOCK_SECONDS = 0.05
+
+
+def _journal_key(sid: str) -> str:
+    return hashlib.sha256(sid.encode("utf-8")).hexdigest()[:32]
+
+
+def _write_journal_entry(pending: Path, name: str, op: dict) -> Path:
     tmp_path, final_path = pending / f".{name}.tmp", pending / f"{name}.json"
     fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, PRIVATE_FILE_MODE)
     try:
@@ -206,6 +215,34 @@ def _journal_op(orphan_path: Path, op: dict) -> bool:
             os.close(fd)
         tmp_path.unlink(missing_ok=True)
         raise
+    return final_path
+
+
+def _journal_op(orphan_path: Path, op: dict) -> bool:
+    """Durably record ``op`` for the next lock holder; False when even that failed (or was refused).
+
+    R78: one entry per session - only the newest op for a session id matters when replayed (an export replaces
+    the record, a remove drops it) - so a new op supersedes the older entries of the same session, which are
+    removed only once the new one is durable. Under ``pending/.lock`` the journal holds at most
+    JOURNAL_MAX_ENTRIES entries; past that (or with the lock busy) the op is refused and the caller keeps the
+    record owed in the cache.
+    """
+    pending = ensure_private_dir(pending_dir_for(orphan_path))
+    key = _journal_key(op["sid"])
+    name = f"{clock.time_ns():020d}-{os.getpid()}-{next(_JOURNAL_SEQ):06d}-{os.urandom(3).hex()}{JOURNAL_KEY_MARK}{key}"
+    try:
+        with locked_directory(pending, JOURNAL_LOCK_SECONDS):
+            older = sorted(pending.glob(f"*{JOURNAL_KEY_MARK}{key}.json"))
+            if not older and sum(1 for _ in pending.glob("*.json")) >= JOURNAL_MAX_ENTRIES:
+                log_warning(f"Orphan journal full ({JOURNAL_MAX_ENTRIES} sessions); {op['sid']} stays owed in the cache")
+                return False
+            final_path = _write_journal_entry(pending, name, op)
+            for path in older:
+                if path.name < final_path.name:
+                    path.unlink(missing_ok=True)
+    except DirectoryFull as exc:
+        log_debug(f"Orphan journal busy ({exc}); {op['sid']} stays owed in the cache")
+        return False
     fsync_directory(pending)
     if not in_reconciler_loop():   # the reconciler folds the journal every pass: no wake-up for its own entries
         touch_reconciler_pending()
@@ -377,7 +414,8 @@ def journal_orphan_exports(exports: Iterable[Tuple[str, dict]], orphan_file: Opt
     """
     orphan_path = orphan_file or get_orphan_path()
     for sid, record in exports:
-        _journal_op(orphan_path, {"op": OP_EXPORT, "sid": sid, "session": record})
+        if not _journal_op(orphan_path, {"op": OP_EXPORT, "sid": sid, "session": record}):
+            raise OSError(f"orphan journal refused the export of {sid}")   # R78: the caller keeps it owed
 
 
 def run_orphan_io(exports: Iterable[Tuple[str, dict]], removals: Iterable[str], blocking: bool = False) -> None:

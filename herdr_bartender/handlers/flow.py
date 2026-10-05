@@ -35,6 +35,7 @@ from ..sender import (
     dismiss_vendors,
     finish,
     has_live_sessions,
+    has_owed_work,
     run_step_a,
     warm_step_a_probes,
 )
@@ -46,12 +47,15 @@ Prepare = Callable[[], Optional[Stage]]
 
 
 def _watchdog_check_without_step_a(policy: SendPolicy) -> None:
-    """Plan §4.3 L568 for an event ignored at intake: ensure the reconciler while a live session is cached.
+    """Plan §4.3 L568 for an event ignored at intake: ensure the reconciler while a live session is cached, or
+    (R78) while persisted owed work waits - a crash between a save and its hand-off must not strand it.
 
     The lock-free peek only decides whether to make sure the (singleton) reconciler runs;
     no cache state is changed from it.
     """
-    if has_live_sessions(peek_cache(get_state_dir())):
+    state_dir = get_state_dir()
+    data = peek_cache(state_dir)
+    if has_live_sessions(data) or has_owed_work(data, state_dir):
         policy.ensure_watchdog()
 
 

@@ -42,6 +42,7 @@ from .step_a import (
     Target,
     claim_targets,
     has_live_sessions,
+    has_owed_work,
     run_step_a,
 )
 from .step_b import CriticalSectionViolation, Sent, ensure_outside_critical_section, transmit
@@ -80,6 +81,6 @@ __all__ = [
     "LEASE_GRACE_SECONDS", "LEASE_SECONDS", "PostLock", "SendPolicy", "Sent", "Stage", "Staged", "StepAResult", "Target",
     "claim_lease", "claim_targets", "cleanup_budget", "cleanup_policy", "compensate", "deliver_claim",
     "dismiss_vendors",
-    "ensure_outside_critical_section", "finish", "has_live_sessions", "lease_active_elsewhere", "release_lease",
+    "ensure_outside_critical_section", "finish", "has_live_sessions", "has_owed_work", "lease_active_elsewhere", "release_lease",
     "run_post_lock", "run_step_a", "settle", "transmit", "warm_step_a_probes",
 ]

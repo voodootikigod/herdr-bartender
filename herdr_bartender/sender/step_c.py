@@ -41,7 +41,7 @@ from ..vendor import resolve_vendor_cleanups, warm_fallback_probe
 from ..watchdog import deferred_exit
 from .lease import Claim, owns_lease, release_lease
 from .policy import SendPolicy
-from .step_a import has_live_sessions
+from .step_a import has_live_sessions, has_owed_root_work
 from .step_b import Sent
 
 UNSENT = "unsent"
@@ -106,7 +106,7 @@ def _settle_locked(cache_mgr: BoundedSessionCache, claim: Claim, sent: Sent
     with cache_mgr as data:
         effects, changed = _apply(data, claim, sent, now, now_ns)
         vendor = resolve_vendor_cleanups(data, _vendor_panes(effects), now)
-        live = has_live_sessions(data)
+        live = has_live_sessions(data) or has_owed_root_work(data)   # R78: owed work keeps the watchdog too
         if changed or vendor.changed:
             journaled = journal_owed_exports(effects, data)   # durable before the save marks them orphaned_ended
             cache_mgr.save(data)
