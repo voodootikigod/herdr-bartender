@@ -305,6 +305,30 @@ while True:
       # without following symlinks or blocking, and at most 4097 bytes (exit 0 read, 1 missing, 3 unusable: a
       # symlink, non-regular or over 4 KiB). An unusable entry is removed (rm never follows); one rm cannot remove
       # (a directory) blocks every .vendor_active write and simply passes through. Decisions use the bytes read.
+      # R76: retire .vendor_active by CLAIMING it first (rename to a private name, which never follows a symlink),
+      # then deciding from what was claimed: a record another hook created after our snapshot (a non-empty file
+      # when retiring a bare touch; a small regular file when retiring an unusable entry) is put back, never lost.
+      _hb_retire_va() {
+        _HB_VA_CLAIM=$(mktemp -u "$_HB_STATE_HOME/panes/.va.claim.XXXXXX" 2>/dev/null) || return 0
+        [ -n "$_HB_VA_CLAIM" ] || return 0
+        mv -f "$_HB_VENDOR_ACTIVE" "$_HB_VA_CLAIM" 2>/dev/null || return 0
+        _HB_VA_KEEP=0
+        if [ ! -L "$_HB_VA_CLAIM" ] && [ -f "$_HB_VA_CLAIM" ]; then
+          if [ "$1" = bare ]; then
+            if [ -s "$_HB_VA_CLAIM" ]; then _HB_VA_KEEP=1; fi
+          else
+            _HB_VA_N=$(head -c 4097 "$_HB_VA_CLAIM" 2>/dev/null | wc -c | tr -d ' \t') || _HB_VA_N=4097
+            case "$_HB_VA_N" in ''|*[!0-9]*) _HB_VA_N=4097 ;; esac
+            if [ "$_HB_VA_N" -le 4096 ]; then _HB_VA_KEEP=1; fi
+          fi
+        fi
+        if [ "$_HB_VA_KEEP" -eq 1 ] && [ ! -e "$_HB_VENDOR_ACTIVE" ] && [ ! -L "$_HB_VENDOR_ACTIVE" ]; then
+          mv -f "$_HB_VA_CLAIM" "$_HB_VENDOR_ACTIVE" 2>/dev/null || rm -f "$_HB_VA_CLAIM" 2>/dev/null || true
+        else
+          rm -f "$_HB_VA_CLAIM" 2>/dev/null || true
+        fi
+        return 0
+      }
       _HB_VA_BLOCKED=0
       _HB_VA_CONTENT=""
       if [ "$_HB_HAS_PERL" -eq 1 ]; then
@@ -347,9 +371,14 @@ sys.stdout.buffer.write(b)' "$_HB_VENDOR_ACTIVE" 2>/dev/null); then
         0|1) ;;
         *)
           _HB_VA_CONTENT=""
-          rm -f "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
-          if [ -L "$_HB_VENDOR_ACTIVE" ] || [ -e "$_HB_VENDOR_ACTIVE" ]; then
-            _HB_VA_BLOCKED=1
+          if [ -d "$_HB_VENDOR_ACTIVE" ] && [ ! -L "$_HB_VENDOR_ACTIVE" ]; then
+            _HB_VA_BLOCKED=1   # never move or delete a directory: pass through
+          else
+            _hb_retire_va unusable
+            _HB_VA_STATE=1
+            if [ -L "$_HB_VENDOR_ACTIVE" ] || { [ -e "$_HB_VENDOR_ACTIVE" ] && [ ! -f "$_HB_VENDOR_ACTIVE" ]; }; then
+              _HB_VA_BLOCKED=1
+            fi
           fi
           ;;
       esac
@@ -388,7 +417,7 @@ sys.stdout.buffer.write(b)' "$_HB_VENDOR_ACTIVE" 2>/dev/null); then
       if [ "$_HB_IS_SESSION_TERMINAL" -eq 1 ]; then
         rm -f "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
         : # pass through to vendor script
-      elif [ -f "$_HB_VENDOR_ACTIVE" ]; then
+      elif [ "$_HB_VA_STATE" -eq 0 ] && [ "$_HB_VA_BLOCKED" -eq 0 ]; then   # R76: the snapshot, not a re-check
         # Upgrade bare touch to UUID record if UUID is now available
         if [ "$_HB_VA_HAS_UUID" -eq 0 ] && [ -n "$_HB_VENDOR_SID" ]; then
           _HB_VA_TMP=$(mktemp "$_HB_STATE_HOME/panes/.va.tmp.XXXXXX" 2>/dev/null || true)
@@ -418,7 +447,8 @@ sys.stdout.buffer.write(b)' "$_HB_VENDOR_ACTIVE" 2>/dev/null); then
         else
           # Bare touch (_HB_VA_HAS_UUID -eq 0)
           if [ "$_HB_CAPTURE_ERR" -eq 0 ] && [ "$_HB_HERDR_HEALTHY" -eq 1 ]; then
-            rm -f "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
+            _hb_retire_va bare
+            unset -f _hb_retire_va 2>/dev/null || true
             if [ -n "$_HB_GUARD_TMP" ] && [ -f "$_HB_GUARD_TMP" ]; then
               rm -f "$_HB_GUARD_TMP" 2>/dev/null || true
             fi
@@ -464,7 +494,8 @@ sys.stdout.buffer.write(b)' "$_HB_VENDOR_ACTIVE" 2>/dev/null); then
             _HB_HERDR_HEALTHY _HB_MARKER_MTIME _HB_MARKER_AGE _HB_NOW_TIME _HB_OLD_UMASK _HB_FIRST_LINE \
             _HB_READ_STATUS _HB_RAW_SID _HB_VA_TMP _HB_CAPTURE_ERR _HB_GUARD_TMP _HB_SPLICE_FIFO \
             _HB_ARGV_IS_JSON _HB_ARGV_SID _HB_AWK _HB_CLASS _HB_CLASSIFY_ERR _HB_HAS_PERL _HB_DEADLINE \
-            _HB_VA_BLOCKED _HB_VA_CONTENT _HB_VA_STATE
+            _HB_VA_BLOCKED _HB_VA_CONTENT _HB_VA_STATE _HB_VA_CLAIM _HB_VA_KEEP _HB_VA_N
+      unset -f _hb_retire_va 2>/dev/null || true
     fi
   fi
 fi

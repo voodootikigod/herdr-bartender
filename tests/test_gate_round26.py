@@ -68,5 +68,26 @@ class GuardSingleBoundedReadTests(_GuardCase):
         self.assertEqual(json.loads(va.read_text()), {"vendor_session_id": SID}, "the UUID record is still honoured")
 
 
+class GuardRetireRaceTests(_GuardCase):
+    def test_record_created_after_the_snapshot_is_never_deleted(self):
+        """R76: retiring a bare touch claims it first and puts back a record another hook wrote after our read."""
+        import shutil
+        pane = "w1:pVaRace"
+        self.fresh_marker(pane)                       # Herdr healthy: a non-terminal event retires the bare touch
+        _, va = self.paths(pane)
+        va.write_text("")                             # the bare touch our snapshot sees
+        real_mktemp = shutil.which("mktemp")
+        record = json.dumps({"vendor_session_id": SID})
+        make_shim(self.shim_bin, "mktemp",
+                  'case "$*" in *.va.claim.*) printf %s \'' + record + '\' > "' + str(va) + '" ;; esac\n'
+                  f'exec "{real_mktemp}" "$@"')
+        script = self.script("guard-va-race.sh", 'echo "PASSTHROUGH"')
+        res = run_guard(script, "Working", env_extra={"HERDR_PANE_ID": pane, "PATH": path_with(self.shim_bin)})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(va.exists(), "the concurrently written UUID record survives")
+        self.assertEqual(json.loads(va.read_text()), {"vendor_session_id": SID})
+        self.assertEqual(list(va.parent.glob(".va.claim.*")), [], "no claim file is left behind")
+
+
 if __name__ == "__main__":
     unittest.main()

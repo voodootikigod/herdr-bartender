@@ -194,3 +194,4 @@ Status at the W5 gate:
 | R73 | No-follow marker heartbeat; guard ignores symlinked markers, flags fail open on any entry | `tests.test_gate_round25.*` (3 tests) |
 | R74 | Guard normalizes `.vendor_active` (no symlink, regular, <= 4 KiB, mktemp+mv writes only) | `tests.test_gate_round26.*` (3 tests), `tests.test_hooks_guard.HookGuardHardeningTests.test_r16_guard_writes_under_umask_077_and_restores` |
 | R75 | Guard reads `.vendor_active` once, bounded and no-follow | `tests.test_gate_round26.GuardSingleBoundedReadTests.test_vendor_active_is_read_once_bounded_without_wc` |
+| R76 | Guard decides from its snapshot; retire-by-claim never deletes a concurrent record | `tests.test_gate_round26.GuardRetireRaceTests.test_record_created_after_the_snapshot_is_never_deleted` |
