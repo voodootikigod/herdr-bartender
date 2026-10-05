@@ -17,6 +17,7 @@ from typing import Dict, Tuple
 
 from .boundedio import HOOK_SCRIPT_MAX_BYTES, SMALL_STATE_MAX_BYTES, open_lock_file, read_regular_file
 from . import jsonsafe
+from .atomic_swap import exchange
 from .log import log_warning
 
 BASH_CHECK_TIMEOUT_SECONDS = 10.0
@@ -67,9 +68,24 @@ def atomic_replace_hook(hook: Path, new_content: bytes, mode: int, expected: byt
             raise HookWriteError(f"Syntax validation failed for {hook.name}: {err}")
         if read_regular_file(hook, HOOK_SCRIPT_MAX_BYTES, follow_symlinks=True) != expected:   # R69: bounded
             raise HookWriteError(f"Aborting patch for {hook.name}: file modified on disk during patch preparation")
-        os.replace(tmp_path, hook)
+        _swap_in(tmp_path, hook, expected)
     finally:
         _unlink_quietly(tmp_path)
+
+
+def _swap_in(tmp_path: Path, hook: Path, expected: bytes) -> None:
+    """R71: atomically swap the new hook in, then check what was displaced; a vendor update that landed after
+    the check is swapped back (theirs wins). Without an atomic exchange, fall back to ``os.replace``."""
+    if not exchange(tmp_path, hook):
+        os.replace(tmp_path, hook)   # no exchange on this platform/filesystem: compare-then-replace
+        return
+    try:
+        displaced = read_regular_file(tmp_path, HOOK_SCRIPT_MAX_BYTES, follow_symlinks=True)
+    except OSError:
+        displaced = None
+    if displaced != expected:
+        exchange(tmp_path, hook)   # put the vendor's concurrent update back
+        raise HookWriteError(f"Aborting patch for {hook.name}: vendor updated it during the patch; kept theirs")
 
 
 def write_private_atomic(path: Path, data: bytes, mode: int = 0o600) -> None:

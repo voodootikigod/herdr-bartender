@@ -27,6 +27,7 @@ from typing import Optional, Tuple
 
 from . import jsonsafe, process, runtime
 from .config import DEFAULT_HOST, get_bridge_url
+from .deadline_http import DeadlineHTTPHandler
 from .log import log_debug
 
 OUTCOME_SUCCESS = "success"
@@ -123,8 +124,9 @@ def build_bridge_opener() -> urllib.request.OpenerDirector:
 
     ``ProxyHandler({})`` replaces the default handler that reads HTTP(S)_PROXY /
     ALL_PROXY, so bridge traffic stays on loopback whatever the environment says.
+    ``DeadlineHTTPHandler`` bounds the whole exchange by one deadline (R71), not each socket operation.
     """
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler(), DeadlineHTTPHandler())
 
 
 _OPENER = build_bridge_opener()
