@@ -25,10 +25,12 @@ Exit codes:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Tuple
 
-from . import clock, runtime
-from .cache import UNBOUNDED_LOCK_TIMEOUT, BoundedSessionCache, CacheError
+from . import clock, jsonsafe, runtime
+from .boundedio import CACHE_MAX_BYTES, read_regular_file
+from .cache import CACHE_FILE_NAME, UNBOUNDED_LOCK_TIMEOUT, BoundedSessionCache, CacheError
 from .delivery_state import journal_exports_before_save
 from .lifecycle import expire_session, orphan_record, sendable
 from .log import log_debug, log_warning
@@ -197,7 +199,10 @@ def _leftovers(cache_mgr: BoundedSessionCache, progress: _Progress) -> _Leftover
         return _leftovers_locked(cache_mgr, progress)
     except CacheError as exc:
         log_warning(f"--cleanup could not record failure state ({exc}); exporting from the last saved cache")
-        return _sort_leftovers(peek_cache(cache_mgr.state_dir).get("sessions") or {}, progress, None)
+        sessions = _peek_sessions(cache_mgr.state_dir)
+        if sessions is None:   # R82: an unreadable cache confirms nothing: every targeted session stays unconfirmed
+            return _Leftovers(others=tuple(progress.targeted))
+        return _sort_leftovers(sessions, progress, None)
 
 
 def _orphan_wait(deadline: float) -> float:
@@ -230,10 +235,27 @@ def _fold_deferred_confirmations(cache_mgr: BoundedSessionCache) -> None:
             return
 
 
+def _peek_sessions(state_dir) -> Optional[dict]:
+    """R82: the cached sessions from a lock-free read; {} only when there is no cache file at all, None when one
+    exists but cannot be read or understood (unlike ``peek_cache``, which reads both as empty)."""
+    cache_file = Path(state_dir) / CACHE_FILE_NAME
+    try:
+        data = jsonsafe.loads(read_regular_file(cache_file, CACHE_MAX_BYTES))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return None
+    sessions = data.get("sessions") if isinstance(data, dict) else None
+    return sessions if isinstance(sessions, dict) else None
+
+
 def _unstaged_exit(state_dir, deadline: float) -> int:
     """R69: the cache could not be locked to stage the Endeds within the budget - export every cached session
     from a lock-free snapshot (unconfirmed, exit 2), or exit 0 when there is nothing to clean."""
-    sessions = peek_cache(state_dir).get("sessions") or {}
+    sessions = _peek_sessions(state_dir)
+    if sessions is None:   # R82: present but unreadable - never "nothing to clean" (rollback would delete it)
+        log_warning("--cleanup could not lock or read the cache; nothing is confirmed (state kept)")
+        return EXIT_UNCONFIRMED
     exports = tuple((sid, orphan_record(rec)) for sid, rec in sessions.items() if isinstance(rec, dict))
     if not exports:
         return EXIT_OK
