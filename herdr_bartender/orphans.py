@@ -139,17 +139,25 @@ def read_orphan_sids(orphan_file: Optional[Path] = None) -> FrozenSet[str]:
         return frozenset()
 
 
+class DurabilityError(OSError):
+    """A rename could not be made durable (its directory could not be fsynced)."""
+
+
 def fsync_directory(directory: Path) -> None:
-    """Make a rename inside ``directory`` durable (a filesystem refusing a directory fsync is logged, not fatal)."""
+    """Make a rename inside ``directory`` durable; raises DurabilityError when it cannot be (R84).
+
+    Durability is the whole point of the orphan file and its journal (the cache prunes a terminal record only
+    once its export is durable), so a directory that cannot be fsynced is a failure, never a silent success:
+    the caller then keeps the record owed in the cache.
+    """
     try:
         fd = os.open(str(directory), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     except OSError as exc:
-        log_debug(f"Could not open {directory} to fsync it: {exc}")
-        return
+        raise DurabilityError(exc.errno, f"could not open {directory} to fsync it: {exc}") from exc
     try:
         os.fsync(fd)
     except OSError as exc:
-        log_debug(f"Directory fsync of {directory} not supported: {exc}")
+        raise DurabilityError(exc.errno, f"directory fsync of {directory} failed: {exc}") from exc
     finally:
         os.close(fd)
 
