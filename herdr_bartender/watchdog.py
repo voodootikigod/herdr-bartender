@@ -99,14 +99,24 @@ def deferred_exit() -> Iterator[None]:
     Wrap work that must not be cut short: taking the cache lock and then either
     saving or spooling the event, or applying / persisting a delivery result. Inside
     it the handler only sets the flag. Leaving the block normally then honours a
-    passed deadline (reconciler hand-off, exit 0); an exception propagates unchanged.
+    passed deadline (reconciler hand-off, exit 0); an exception propagates unchanged, after the hand-off
+    when the deadline passed too (R87).
     """
     outer = runtime.IN_DEFER_SECTION
     runtime.IN_DEFER_SECTION = True
     try:
         yield
-    finally:
+    except BaseException:
         runtime.IN_DEFER_SECTION = outer
+        # R87: a deadline that passed while the block was unwinding still gets its reconciler hand-off (so the
+        # work is preserved); the exception itself propagates unchanged.
+        if runtime.PENDING_WATCHDOG_EXIT and not _exit_deferred():
+            try:
+                hand_off_to_reconciler()
+            except Exception as exc:   # never mask the original exception
+                log_debug(f"Watchdog hand-off during an exception failed: {exc!r}")
+        raise
+    runtime.IN_DEFER_SECTION = outer
     honor_pending_exit()
 
 

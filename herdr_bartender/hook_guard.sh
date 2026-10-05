@@ -1,5 +1,5 @@
 # BEGIN HERDR-BARTENDER DEDUP GUARD
-if [ -n "${HERDR_PANE_ID:-}" ]; then
+if [ -n "${HERDR_PANE_ID:-}" ] && [ -z "${_HB_SPLICED:-}" ]; then
   if printf '%s' "$HERDR_PANE_ID" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_:-]{1,48}$'; then
     _HB_CANONICAL_PANE=""
     if printf '%s' "$HERDR_PANE_ID" | grep -q ':'; then
@@ -255,6 +255,16 @@ while True:
                   exec < "$_HB_SPLICE_FIFO" || true
                   rm -f "$_HB_SPLICE_FIFO" 2>/dev/null || true
                 else
+                  # R87: no FIFO (disk/inode exhaustion). POSIX sh has no process substitution, so re-run this hook
+                  # with stdin = captured prefix + the rest of stdin through a pipe; _HB_SPLICED makes the re-run skip
+                  # the guard (and is cleared before its vendor body). Last resort: the prefix alone, never nothing.
+                  if [ -x "$0" ] && [ -f "$0" ]; then
+                    umask "$_HB_OLD_UMASK" 2>/dev/null || true
+                    { cat "$_HB_GUARD_TMP" 2>/dev/null; rm -f "$_HB_GUARD_TMP" 2>/dev/null; exec cat <&9 9<&-; } 9<&0 \
+                      | _HB_SPLICED=1 "$0" "$@"
+                    exit $?
+                  fi
+                  exec < "$_HB_GUARD_TMP" 2>/dev/null || true
                   rm -f "$_HB_GUARD_TMP" 2>/dev/null || true
                 fi
                 _HB_GUARD_TMP=""
@@ -524,4 +534,5 @@ if stat.S_ISREG(os.fstat(fd).st_mode):
     fi
   fi
 fi
+unset _HB_SPLICED 2>/dev/null || true
 # END HERDR-BARTENDER DEDUP GUARD

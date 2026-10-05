@@ -205,3 +205,4 @@ Status at the W5 gate:
 | R84 | Directory fsync failure is a durability failure | `tests.test_gate_round36.*` (2 tests) |
 | R85 | Seq-aware orphan removals; 1 MiB guard capture bound with byte-exact splice | `tests.test_gate_round37.*` (4 tests) |
 | R86 | Claim-and-link hook replacement without atomic exchange | `tests.test_gate_round38.*` (3 tests) |
+| R87 | Watchdog hand-off during exceptions; FIFO-less byte-exact splice (bash and dash) | `tests.test_gate_round39.*` (2 tests) |
