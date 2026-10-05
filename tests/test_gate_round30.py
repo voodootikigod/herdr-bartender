@@ -58,6 +58,38 @@ class JournalBoundTests(SandboxTestCase):
         self.assertNotIn("herdr:h:w1:pC9", journaled_export_records())
 
 
+class JournalCausalOrderTests(SandboxTestCase):
+    """R81: one atomically replaced file per session plus a lock-ordered sequence number: no crash or clock step can
+    make an older op replay after a newer one."""
+
+    def setUp(self):
+        super().setUp()
+        self.orphan = get_orphan_path()
+        self.pending = pending_dir_for(self.orphan)
+
+    def test_crash_leftover_older_format_entry_replays_first(self):
+        sid = "herdr:h:w1:pCrash"
+        key = orphans._journal_key(sid)
+        self.pending.mkdir(parents=True, exist_ok=True)
+        # An R78-format entry the crash left behind, with a wall-clock name from the future...
+        (self.pending / f"99999999999999999999-1-000000-aa-k{key}.json").write_text(
+            json.dumps({"op": "export", "sid": sid, "session": {"pane_id": "w1:pCrash", "seq": 1}}))
+        # ...and the newer R81 entry for the same session.
+        (self.pending / f"k{key}.json").write_text(
+            json.dumps({"op": "export", "sid": sid, "session": {"pane_id": "w1:pCrash", "seq": 2}, "jseq": 1}))
+        self.assertTrue(orphans.flush_pending_orphan_ops())
+        self.assertEqual(orphans.read_orphan_records(self.orphan)[sid]["seq"], 2, "the newer op wins")
+
+    def test_cross_session_order_follows_causality_not_the_clock(self):
+        hold_lock(self, _lock_path(self.orphan), seconds=30)
+        with mock.patch.object(orphans.clock, "time_ns", return_value=200_000_000_000):
+            export_orphan_record("herdr:h:w1:pFirst", {"pane_id": "w1:pFirst", "seq": 1})
+        with mock.patch.object(orphans.clock, "time_ns", return_value=100_000_000_000):
+            export_orphan_record("herdr:h:w1:pSecond", {"pane_id": "w1:pSecond", "seq": 1})
+        ops = orphans._load_journal(self.orphan).ops
+        self.assertEqual([op["sid"] for op in ops], ["herdr:h:w1:pFirst", "herdr:h:w1:pSecond"])
+
+
 class OwedWorkWakesReconcilerTests(SandboxTestCase):
     def test_ignored_event_wakes_the_reconciler_for_persisted_owed_work(self):
         """R78: only Ended sessions are cached, but a compensation is owed (a crash lost its hand-off). Even an event

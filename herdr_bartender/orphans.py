@@ -192,8 +192,10 @@ def pending_dir_for(orphan_path: Path) -> Path:
 
 
 JOURNAL_MAX_ENTRIES = 1024   # R78: distinct sessions with a journaled op (one entry each, the newest)
-JOURNAL_KEY_MARK = "-k"
+JOURNAL_KEY_MARK = "-k"          # R78-format entries: <ns>-<pid>-<seq>-<rand>-k<key>.json
+JOURNAL_FILE_PREFIX = "k"         # R81-format entries: k<key>.json (sorts after every digit-led legacy name)
 JOURNAL_LOCK_SECONDS = 0.05
+JOURNAL_COMMIT_LOCK_SECONDS = 1.0   # the commit holds pending/.lock only for local file I/O
 
 
 def _journal_key(sid: str) -> str:
@@ -202,7 +204,7 @@ def _journal_key(sid: str) -> str:
 
 def _write_journal_entry(pending: Path, name: str, op: dict) -> Path:
     tmp_path, final_path = pending / f".{name}.tmp", pending / f"{name}.json"
-    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, PRIVATE_FILE_MODE)
+    fd = open_exclusive_tmp(tmp_path)   # a crash-stale tmp of this fixed name is unlinked, never followed
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             fd = None
@@ -218,6 +220,36 @@ def _write_journal_entry(pending: Path, name: str, op: dict) -> Path:
     return final_path
 
 
+JOURNAL_SEQ_FILE = "seq"
+
+
+def _next_journal_seq(pending: Path) -> int:
+    """Under ``pending/.lock``: the next causal sequence number (a durable counter; gaps after a crash are fine)."""
+    path = pending / JOURNAL_SEQ_FILE
+    try:
+        current = int(read_regular_file(path, 64).decode("ascii").strip() or "0")
+    except FileNotFoundError:
+        current = 0
+    except (OSError, ValueError):
+        current = max((_entry_seq(p) for p in pending.glob("*.json")), default=0)
+    nxt = current + 1
+    fd = open_exclusive_tmp(pending / f".{JOURNAL_SEQ_FILE}.tmp")
+    with os.fdopen(fd, "w", encoding="ascii") as f:
+        f.write(str(nxt))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(pending / f".{JOURNAL_SEQ_FILE}.tmp", path)
+    return nxt
+
+
+def _entry_seq(path: Path) -> int:
+    try:
+        seq = jsonsafe.loads(read_regular_file(path, JOURNAL_ENTRY_MAX_BYTES)).get("jseq")
+    except (OSError, ValueError, AttributeError):
+        return 0
+    return seq if isinstance(seq, int) and not isinstance(seq, bool) else 0
+
+
 def _journal_op(orphan_path: Path, op: dict) -> bool:
     """Durably record ``op`` for the next lock holder; False when even that failed (or was refused).
 
@@ -229,19 +261,21 @@ def _journal_op(orphan_path: Path, op: dict) -> bool:
     """
     pending = ensure_private_dir(pending_dir_for(orphan_path))
     key = _journal_key(op["sid"])
-    name = f"{clock.time_ns():020d}-{os.getpid()}-{next(_JOURNAL_SEQ):06d}-{os.urandom(3).hex()}{JOURNAL_KEY_MARK}{key}"
+    # R81: ONE file per session, named by its key and replaced atomically (tmp + rename): there is never a moment
+    # with two entries for a session, so no crash or clock step can make an older op replay after a newer one.
+    # Older-format entries ("<ns>-<pid>-...") sort before "k<key>" names and replay first, so the new one wins.
+    name = f"{JOURNAL_FILE_PREFIX}{key}"
     try:
         with locked_directory(pending, JOURNAL_LOCK_SECONDS):
-            older = sorted(pending.glob(f"*{JOURNAL_KEY_MARK}{key}.json"))
-            if not older and sum(1 for _ in pending.glob("*.json")) >= JOURNAL_MAX_ENTRIES:
+            current = pending / f"{name}.json"
+            legacy = list(pending.glob(f"*{JOURNAL_KEY_MARK}{key}.json"))
+            if not current.exists() and not legacy \
+                    and sum(1 for _ in pending.glob("*.json")) >= JOURNAL_MAX_ENTRIES:
                 log_warning(f"Orphan journal full ({JOURNAL_MAX_ENTRIES} sessions); {op['sid']} stays owed in the cache")
                 return False
-            final_path = _write_journal_entry(pending, name, op)
-            # R80: under pending/.lock the op being written IS the newest for its session (lock order is causal
-            # order), so it supersedes every other entry of the session whatever their (wall-clock) names say.
-            for path in older:
-                if path != final_path:
-                    path.unlink(missing_ok=True)
+            _write_journal_entry(pending, name, {**op, "jseq": _next_journal_seq(pending)})
+            for path in legacy:
+                path.unlink(missing_ok=True)
     except DirectoryFull as exc:
         log_debug(f"Orphan journal busy ({exc}); {op['sid']} stays owed in the cache")
         return False
@@ -295,7 +329,17 @@ def _load_journal(orphan_path: Path) -> _Journal:
         else:
             log_debug(f"Orphan journal entry {entry.name} malformed; quarantining it")
             journal.poison.append(entry)
-    return journal
+    # R81: replay in causal order - legacy entries (no "jseq", already in filename order) first, then by the
+    # lock-ordered sequence number every R81 entry carries (never by wall-clock names).
+    order = sorted(range(len(journal.ops)), key=lambda i: _replay_rank(journal.ops[i], i))
+    return _Journal([journal.applied[i] for i in order], [journal.ops[i] for i in order], journal.poison)
+
+
+def _replay_rank(op: dict, index: int) -> Tuple[int, int, int]:
+    seq = op.get("jseq")
+    if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0:
+        return (1, seq, index)
+    return (0, 0, index)
 
 
 def journaled_export_sids(orphan_file: Optional[Path] = None) -> FrozenSet[str]:
@@ -350,7 +394,18 @@ def _commit_locked(orphan_path: Path, ops: List[dict]) -> None:
     """Under the orphan lock: replay the journal, apply ``ops``, write once, drop the journal.
 
     Raises OrphanFileError, leaving the file AND the journal untouched, when the file cannot be understood.
+    R81: the journal is read, applied and pruned under ``pending/.lock`` - the lock every journal writer takes -
+    so an entry replaced after it was read can never be unlinked unapplied. Busy past the bound: DirectoryFull.
     """
+    pending = pending_dir_for(orphan_path)
+    if not pending.is_dir():
+        _commit_ops(orphan_path, ops)
+        return
+    with locked_directory(pending, JOURNAL_COMMIT_LOCK_SECONDS):
+        _commit_ops(orphan_path, ops)
+
+
+def _commit_ops(orphan_path: Path, ops: List[dict]) -> None:
     journal = _load_journal(orphan_path)
     before = _read_orphan_sessions(orphan_path)
     after = before
