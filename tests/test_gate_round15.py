@@ -33,6 +33,14 @@ class SpoolHardCapTests(SandboxTestCase):
         self.assertFalse(first.exists())
         self.assertEqual(json.loads(second.read_text())["arrival_ns"], 2_000)
 
+    def test_failed_replacement_keeps_the_spooled_close(self):
+        """R67: the older close is removed only after its replacement is durable; a failed write loses nothing."""
+        first = enqueue_spool("pane.closed", close_event(1), {}, arrival_ns=1_000)
+        with mock.patch.object(spool, "write_bytes_atomic", side_effect=OSError(28, "No space left on device")):
+            with self.assertRaises(SpoolWriteError):
+                enqueue_spool("pane.closed", close_event(1), {}, arrival_ns=2_000)
+        self.assertEqual(self.spooled(), [first])
+
     def test_distinct_closes_stop_at_the_close_ceiling(self):
         with mock.patch.object(spool, "CLOSE_HARD_CAP", 30):
             for n in range(30):

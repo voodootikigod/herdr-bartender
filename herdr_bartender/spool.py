@@ -143,10 +143,14 @@ def _make_room(directory: Path) -> None:
         excess -= 1
 
 
-def _replace_spooled_close(directory: Path, key: str) -> None:
-    """Under the spool lock: drop older envelopes for the same container (the new one supersedes them)."""
-    for older in directory.glob(f"*{CLOSE_MARK}{key}.json"):
-        unlink_files([older])
+def _spooled_closes(directory: Path, key: str) -> List[Path]:
+    return list(directory.glob(f"*{CLOSE_MARK}{key}.json"))
+
+
+def _require_close_room(directory: Path, superseded: List[Path]) -> None:
+    """Under the spool lock: a known container always has room (it replaces itself); a new one needs a slot."""
+    if superseded:
+        return
     if sum(1 for p in directory.glob("*.json") if _is_keyed_close(p)) >= CLOSE_HARD_CAP:
         raise SpoolWriteError(f"{CLOSE_HARD_CAP} distinct container closes already awaiting replay")
 
@@ -167,11 +171,13 @@ def enqueue_spool(event_name: str, event_data: dict, context: dict, arrival_ns: 
         env = build_envelope(event_name, event_data, context, arrival_ns or enqueued_ns, enqueued_ns)
         stem = f"{enqueued_ns:020d}_{os.getpid()}_{time.monotonic_ns()}"
         with locked_directory(directory, capped_lock_timeout()):
+            superseded: List[Path] = []
             if is_close_envelope(env):
                 key = _close_key(event_name, event_data)
                 env = build_envelope(event_name, *_slim_close(event_name, event_data, context),
                                      env["arrival_ns"], enqueued_ns)
-                _replace_spooled_close(directory, key)
+                superseded = _spooled_closes(directory, key)
+                _require_close_room(directory, superseded)
                 path = directory / f"{stem}{CLOSE_MARK}{key}.json"
             else:
                 _make_room(directory)
@@ -180,6 +186,7 @@ def enqueue_spool(event_name: str, event_data: dict, context: dict, arrival_ns: 
             if len(data) > MAX_ENVELOPE_BYTES:
                 raise SpoolWriteError(f"envelope too large ({len(data)} bytes > {MAX_ENVELOPE_BYTES})")
             write_bytes_atomic(path, data)
+            unlink_files(superseded)   # R67: only once the replacement is durable
         return path
     except (OSError, TypeError, ValueError) as e:
         raise SpoolWriteError(f"could not spool {event_name}: {e}") from e
