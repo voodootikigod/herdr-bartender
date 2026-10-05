@@ -69,13 +69,13 @@ class MultiLineSessionIdTests(_GuardCase):
 
 class RefreshNeverRecreatesTests(_GuardCase):
     def test_refresh_does_not_recreate_a_vendor_active_retired_meanwhile(self):
-        """A `touch` shim first unlinks its target (Python retiring the file right after the guard's `[ -f ]`),
-        then runs the real touch with the guard's arguments: the file must stay retired."""
+        """The refresh's own process first unlinks the file (Python retiring it right after the guard's checks), then
+        runs the real refresh: the file must stay retired (R79: a no-follow fd open never creates)."""
         bin_dir = self.tmp / "retire-bin"
-        make_shim(bin_dir, "touch",
-                  'for target in "$@"; do :; done\n'
-                  'rm -f "$target"\n'
-                  'PATH="$HB_REAL_PATH" exec touch "$@"')
+        retire = 'for target in "$@"; do :; done\nrm -f "$target"\n'
+        make_shim(bin_dir, "touch", retire + 'PATH="$HB_REAL_PATH" exec touch "$@"')
+        make_shim(bin_dir, "perl", 'case "$*" in *utime*) ' + retire.replace("\n", "; ") + ';; esac\n'
+                  'PATH="$HB_REAL_PATH" exec perl "$@"')
         script = self.script("guard-refresh.sh", 'echo "PASSTHROUGH"')
         pane = "w1:pRetired"
         _, va = self.paths(pane)

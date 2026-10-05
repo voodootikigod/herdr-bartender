@@ -316,6 +316,10 @@ while True:
         if [ ! -L "$_HB_VA_CLAIM" ] && [ -f "$_HB_VA_CLAIM" ]; then
           if [ "$1" = bare ]; then
             if [ -s "$_HB_VA_CLAIM" ]; then _HB_VA_KEEP=1; fi
+          elif [ "$1" = snapshot ]; then
+            # R79: retire only the record this guard read; anything else (newer) goes back
+            _HB_VA_NOW=$(head -c 4097 "$_HB_VA_CLAIM" 2>/dev/null) || _HB_VA_NOW="unreadable"
+            if [ "$_HB_VA_NOW" != "$_HB_VA_CONTENT" ]; then _HB_VA_KEEP=1; fi
           else
             _HB_VA_N=$(head -c 4097 "$_HB_VA_CLAIM" 2>/dev/null | wc -c | tr -d ' \t') || _HB_VA_N=4097
             case "$_HB_VA_N" in ''|*[!0-9]*) _HB_VA_N=4097 ;; esac
@@ -415,7 +419,10 @@ sys.stdout.buffer.write(b)' "$_HB_VENDOR_ACTIVE" 2>/dev/null); then
       fi
 
       if [ "$_HB_IS_SESSION_TERMINAL" -eq 1 ]; then
-        rm -f "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
+        # R79: retire (by claim) only the record read above; a record written since is put back
+        if [ "$_HB_VA_STATE" -eq 0 ] && [ "$_HB_VA_BLOCKED" -eq 0 ]; then
+          _hb_retire_va snapshot
+        fi
         : # pass through to vendor script
       elif [ "$_HB_VA_STATE" -eq 0 ] && [ "$_HB_VA_BLOCKED" -eq 0 ]; then   # R76: the snapshot, not a re-check
         # Upgrade bare touch to UUID record if UUID is now available
@@ -480,9 +487,22 @@ sys.stdout.buffer.write(b)' "$_HB_VENDOR_ACTIVE" 2>/dev/null); then
       fi
 
 
-      # Refresh only (-c never creates): Python may retire .vendor_active between the test and the touch.
-      if [ "$_HB_IS_SESSION_TERMINAL" -eq 0 ] && [ -f "$_HB_VENDOR_ACTIVE" ] && [ ! -L "$_HB_VENDOR_ACTIVE" ]; then
-        touch -c "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
+      # Refresh only (never creates): Python may retire .vendor_active at any time.
+      # R79: through a no-follow, non-blocking fd on a regular file only (never a path-based touch, which a symlink
+      # swapped in after the check would redirect); skipped without perl/python3.
+      if [ "$_HB_IS_SESSION_TERMINAL" -eq 0 ] && [ "$_HB_VA_BLOCKED" -eq 0 ]; then
+        if [ "$_HB_HAS_PERL" -eq 1 ]; then
+          perl -e 'use Fcntl; sysopen(my $f, $ARGV[0], O_WRONLY|O_NONBLOCK|O_NOFOLLOW) or exit 0;
+                   stat($f); -f _ or exit 0; utime(undef, undef, $f); exit 0' "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
+        elif command -v python3 >/dev/null 2>&1; then
+          python3 -c 'import os, stat, sys
+try:
+    fd = os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+except OSError:
+    sys.exit(0)
+if stat.S_ISREG(os.fstat(fd).st_mode):
+    os.utime(fd)' "$_HB_VENDOR_ACTIVE" 2>/dev/null || true
+        fi
       fi
       if [ -n "$_HB_GUARD_TMP" ] && [ -f "$_HB_GUARD_TMP" ]; then
         exec < "$_HB_GUARD_TMP" || true
@@ -494,7 +514,7 @@ sys.stdout.buffer.write(b)' "$_HB_VENDOR_ACTIVE" 2>/dev/null); then
             _HB_HERDR_HEALTHY _HB_MARKER_MTIME _HB_MARKER_AGE _HB_NOW_TIME _HB_OLD_UMASK _HB_FIRST_LINE \
             _HB_READ_STATUS _HB_RAW_SID _HB_VA_TMP _HB_CAPTURE_ERR _HB_GUARD_TMP _HB_SPLICE_FIFO \
             _HB_ARGV_IS_JSON _HB_ARGV_SID _HB_AWK _HB_CLASS _HB_CLASSIFY_ERR _HB_HAS_PERL _HB_DEADLINE \
-            _HB_VA_BLOCKED _HB_VA_CONTENT _HB_VA_STATE _HB_VA_CLAIM _HB_VA_KEEP _HB_VA_N
+            _HB_VA_BLOCKED _HB_VA_CONTENT _HB_VA_STATE _HB_VA_CLAIM _HB_VA_KEEP _HB_VA_N _HB_VA_NOW
       unset -f _hb_retire_va 2>/dev/null || true
     fi
   fi

@@ -89,5 +89,57 @@ class GuardRetireRaceTests(_GuardCase):
         self.assertEqual(list(va.parent.glob(".va.claim.*")), [], "no claim file is left behind")
 
 
+class GuardTerminalAndRefreshRaceTests(_GuardCase):
+    def test_session_end_never_deletes_a_newer_record(self):
+        """R79: SessionEnd retires (by claim) only the record the guard read; a newer one written meanwhile stays."""
+        import shutil
+        self.set_herdr_dead()
+        pane = "w1:pVaEnd"
+        _, va = self.paths(pane)
+        va.write_text(json.dumps({"vendor_session_id": "a" * 36}))
+        newer = json.dumps({"vendor_session_id": SID})
+        real_mktemp = shutil.which("mktemp")
+        make_shim(self.shim_bin, "mktemp",
+                  'case "$*" in *.va.claim.*) printf %s \'' + newer + '\' > "' + str(va) + '" ;; esac\n'
+                  f'exec "{real_mktemp}" "$@"')
+        script = self.script("guard-va-end.sh", 'echo "PASSTHROUGH"')
+        res = run_guard(script, "SessionEnd", env_extra={"HERDR_PANE_ID": pane, "PATH": path_with(self.shim_bin)})
+        self.assertIn("PASSTHROUGH", res.stdout)
+        self.assertEqual(json.loads(va.read_text()), {"vendor_session_id": SID}, "the newer record survives")
+
+    def test_session_end_retires_the_record_it_read(self):
+        self.set_herdr_dead()
+        pane = "w1:pVaEnd2"
+        _, va = self.paths(pane)
+        va.write_text(json.dumps({"vendor_session_id": SID}))
+        script = self.script("guard-va-end2.sh", 'echo "PASSTHROUGH"')
+        run_guard(script, "SessionEnd", env_extra={"HERDR_PANE_ID": pane})
+        self.assertFalse(os.path.lexists(va))
+        self.assertEqual(list(va.parent.glob(".va.claim.*")), [])
+
+    def test_refresh_never_follows_a_symlink_swapped_in_late(self):
+        """R79: the closing refresh goes through a no-follow fd, so a symlink swapped in after every check cannot
+        redirect it to another file."""
+        import shutil
+        self.set_herdr_dead()
+        pane = "w1:pVaTouch"
+        _, va = self.paths(pane)
+        va.write_text(json.dumps({"vendor_session_id": SID}))
+        victim = self.tmp / "victim.txt"
+        victim.write_text("x")
+        os.utime(victim, (1_000_000, 1_000_000))
+        real_perl = shutil.which("perl")
+        if real_perl is None:
+            self.skipTest("perl not installed")
+        swap = f'rm -f "{va}"; ln -s "{victim}" "{va}"'
+        make_shim(self.shim_bin, "perl", f'case "$*" in *utime*) {swap} ;; esac\nexec "{real_perl}" "$@"')
+        real_touch = shutil.which("touch")
+        make_shim(self.shim_bin, "touch", f'case "$*" in *vendor_active*) {swap} ;; esac\nexec "{real_touch}" "$@"')
+        script = self.script("guard-va-touch.sh", 'echo "PASSTHROUGH"')
+        res = run_guard(script, "Working", env_extra={"HERDR_PANE_ID": pane, "PATH": path_with(self.shim_bin)})
+        self.assertIn("PASSTHROUGH", res.stdout)
+        self.assertEqual(int(victim.stat().st_mtime), 1_000_000, "the swapped-in symlink's target is untouched")
+
+
 if __name__ == "__main__":
     unittest.main()

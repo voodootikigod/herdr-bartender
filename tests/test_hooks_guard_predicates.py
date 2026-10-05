@@ -123,7 +123,7 @@ class TopLevelClassificationTests(_GuardCase):
 
 
 GUARD_TOOLS = ("bash", "cat", "grep", "od", "tr", "mkdir", "mktemp", "rm", "mkfifo", "awk", "stat", "date",
-               "mv", "touch", "sleep", "env", "python3")
+               "mv", "touch", "sleep", "env", "python3", "head", "wc")
 
 
 class PythonCaptureFallbackTests(_GuardCase):
