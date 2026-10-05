@@ -36,6 +36,16 @@ class JournalBoundTests(SandboxTestCase):
         self.assertEqual(len(self.entries()), 1)
         self.assertEqual(journaled_export_records()[sid][0]["seq"], 2)
 
+    def test_newer_op_wins_even_when_the_clock_stepped_back(self):
+        """R80: a backward wall-clock step gives the newer op the smaller filename; it still supersedes the older."""
+        sid = "herdr:h:w1:pClock"
+        with mock.patch.object(orphans.clock, "time_ns", return_value=200_000_000_000):
+            export_orphan_record(sid, {"pane_id": "w1:pClock", "seq": 1, "desired_state": "Ended"})
+        with mock.patch.object(orphans.clock, "time_ns", return_value=100_000_000_000):
+            export_orphan_record(sid, {"pane_id": "w1:pClock", "seq": 2, "desired_state": "Ended"})
+        self.assertEqual(len(self.entries()), 1)
+        self.assertEqual([r["seq"] for r in journaled_export_records()[sid]], [2])
+
     def test_distinct_sessions_stop_at_the_ceiling(self):
         with mock.patch.object(orphans, "JOURNAL_MAX_ENTRIES", 3):
             for n in range(3):

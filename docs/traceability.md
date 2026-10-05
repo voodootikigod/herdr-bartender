@@ -198,3 +198,4 @@ Status at the W5 gate:
 | R77 | Owed-export durability matches the record, not the session id | `tests.test_gate_round29.*` (2 tests) |
 | R78 | Owed work wakes the reconciler; per-session bounded orphan journal | `tests.test_gate_round30.*` (3 tests) |
 | R79 | Snapshot-matched terminal retirement; no-follow refresh | `tests.test_gate_round26.GuardTerminalAndRefreshRaceTests.*` (3 tests) |
+| R80 | Journal supersession independent of wall-clock names | `tests.test_gate_round30.JournalBoundTests.test_newer_op_wins_even_when_the_clock_stepped_back` |

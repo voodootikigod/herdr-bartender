@@ -237,8 +237,10 @@ def _journal_op(orphan_path: Path, op: dict) -> bool:
                 log_warning(f"Orphan journal full ({JOURNAL_MAX_ENTRIES} sessions); {op['sid']} stays owed in the cache")
                 return False
             final_path = _write_journal_entry(pending, name, op)
+            # R80: under pending/.lock the op being written IS the newest for its session (lock order is causal
+            # order), so it supersedes every other entry of the session whatever their (wall-clock) names say.
             for path in older:
-                if path.name < final_path.name:
+                if path != final_path:
                     path.unlink(missing_ok=True)
     except DirectoryFull as exc:
         log_debug(f"Orphan journal busy ({exc}); {op['sid']} stays owed in the cache")
