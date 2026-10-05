@@ -15,7 +15,7 @@ import tempfile
 from pathlib import Path
 from typing import Dict, Tuple
 
-from .boundedio import SMALL_STATE_MAX_BYTES, read_regular_file
+from .boundedio import HOOK_SCRIPT_MAX_BYTES, SMALL_STATE_MAX_BYTES, read_regular_file
 from . import jsonsafe
 from .log import log_warning
 
@@ -65,7 +65,7 @@ def atomic_replace_hook(hook: Path, new_content: bytes, mode: int, expected: byt
         ok, err = bash_syntax_ok(tmp_path)
         if not ok:
             raise HookWriteError(f"Syntax validation failed for {hook.name}: {err}")
-        if hook.read_bytes() != expected:
+        if read_regular_file(hook, HOOK_SCRIPT_MAX_BYTES, follow_symlinks=True) != expected:   # R69: bounded
             raise HookWriteError(f"Aborting patch for {hook.name}: file modified on disk during patch preparation")
         os.replace(tmp_path, hook)
     finally:

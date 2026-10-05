@@ -88,8 +88,12 @@ def cleanup_budget(session_count: int) -> float:
     return max(CLEANUP_BASE_BUDGET, session_count * CLEANUP_PER_SESSION)
 
 
-def cleanup_policy(session_count: int) -> SendPolicy:
-    """--cleanup: unbounded mode, DISABLED bypassed, 0.15s per POST, one overall budget from now."""
+def cleanup_policy(session_count: int, deadline: Optional[float] = None) -> SendPolicy:
+    """--cleanup: unbounded mode, DISABLED bypassed, 0.15s per POST, one overall budget.
+
+    ``deadline`` (R69): the run's own budget end, fixed when --cleanup started; default: the budget from now.
+    """
+    end = deadline if deadline is not None else clock.monotonic() + cleanup_budget(session_count)
     return SendPolicy("cleanup", bounded=False, max_sessions=None, socket_cap=CLEANUP_SOCKET_SECONDS,
                       orphan_blocking=True, lock_timeout=UNBOUNDED_LOCK_TIMEOUT, spawns_reconciler=False,
-                      honors_disabled=False, deadline=clock.monotonic() + cleanup_budget(session_count))
+                      honors_disabled=False, deadline=end)

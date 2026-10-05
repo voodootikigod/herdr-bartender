@@ -33,7 +33,7 @@ from .delivery_state import journal_exports_before_save
 from .lifecycle import expire_session, orphan_record, sendable
 from .log import log_debug, log_warning
 from .markers import touch_heartbeat
-from .orphans import export_orphan_record, flush_pending_orphan_ops
+from .orphans import ORPHAN_BLOCKING_DEADLINE_SECONDS, export_orphan_record, flush_pending_orphan_ops
 from .paths import get_state_dir
 from .process import own_start_time
 from .results import drain_results_dir
@@ -49,6 +49,7 @@ from .sender import (
     warm_step_a_probes,
 )
 from .sender.lease import peek_cache
+from .sender.policy import cleanup_budget
 
 EXIT_OK, EXIT_FATAL, EXIT_UNCONFIRMED = 0, 1, 2
 DEFERRED_RETRY_PAUSE_SECONDS = 0.05
@@ -70,6 +71,17 @@ class _Leftovers:
 
     def __bool__(self) -> bool:
         return bool(self.exports or self.others)
+
+
+class _DeadlineCache(BoundedSessionCache):
+    """R69: every cache-lock wait of a --cleanup run is clamped to what is left of its overall budget."""
+
+    def __init__(self, state_dir, deadline: float):
+        super().__init__(state_dir, lock_timeout=UNBOUNDED_LOCK_TIMEOUT, check_disabled=False)
+        self.deadline = deadline
+
+    def effective_lock_timeout(self) -> float:
+        return max(0.0, min(UNBOUNDED_LOCK_TIMEOUT, self.deadline - clock.monotonic()))
 
 
 def _stage_all_ended(cache_mgr: BoundedSessionCache) -> Dict[str, int]:
@@ -115,11 +127,14 @@ def _round(cache_mgr: BoundedSessionCache, outstanding: List[str], policy: SendP
     for sid in outstanding:
         if not policy.allows_network():
             break
-        claim, leased_elsewhere = _claim(cache_mgr, sid)
-        if leased_elsewhere:
-            deferred.append(sid)
-        elif claim is not None:
-            _deliver(cache_mgr, claim, policy, bridge_url, progress)
+        try:
+            claim, leased_elsewhere = _claim(cache_mgr, sid)
+            if leased_elsewhere:
+                deferred.append(sid)
+            elif claim is not None:
+                _deliver(cache_mgr, claim, policy, bridge_url, progress)
+        except CacheError as exc:   # R69: a lock wait past the budget leaves the session unconfirmed (exit 2)
+            log_warning(f"--cleanup could not lock the cache for {sid} ({exc}); leaving it unconfirmed")
     return deferred
 
 
@@ -185,9 +200,12 @@ def _leftovers(cache_mgr: BoundedSessionCache, progress: _Progress) -> _Leftover
         return _sort_leftovers(peek_cache(cache_mgr.state_dir).get("sessions") or {}, progress, None)
 
 
-def _export(leftovers: Tuple[Tuple[str, dict], ...]) -> None:
+def _export(leftovers: Tuple[Tuple[str, dict], ...], deadline: float) -> None:
     for sid, record in leftovers:
-        export_orphan_record(sid, record, blocking=True)   # R10: --cleanup may block (bounded)
+        # R10/R69: block on the orphan lock only while the budget lasts; past it, a contended export is journaled
+        # (durable) for the next lock holder instead of waiting.
+        blocking = deadline - clock.monotonic() > ORPHAN_BLOCKING_DEADLINE_SECONDS
+        export_orphan_record(sid, record, blocking=blocking)
     if not flush_pending_orphan_ops(blocking=True):
         log_warning("Orphan journal not fully flushed by --cleanup; the next lock holder folds it in")
 
@@ -207,14 +225,33 @@ def _fold_deferred_confirmations(cache_mgr: BoundedSessionCache) -> None:
             return
 
 
+def _unstaged_exit(state_dir, deadline: float) -> int:
+    """R69: the cache could not be locked to stage the Endeds within the budget - export every cached session
+    from a lock-free snapshot (unconfirmed, exit 2), or exit 0 when there is nothing to clean."""
+    sessions = peek_cache(state_dir).get("sessions") or {}
+    exports = tuple((sid, orphan_record(rec)) for sid, rec in sessions.items() if isinstance(rec, dict))
+    if not exports:
+        return EXIT_OK
+    _export(exports, deadline)
+    log_warning(f"--cleanup could not stage {len(exports)} session(s); exported them to the orphan file")
+    return EXIT_UNCONFIRMED
+
+
 def _cleanup(bridge_url: Optional[str]) -> int:
     touch_heartbeat()
     own_start_time()  # the lease-token start time, outside any critical section
+    state_dir = get_state_dir()
+    # R69: one budget for the whole run (sized lock-free), covering the journal flush, staging and every lock wait.
+    deadline = clock.monotonic() + cleanup_budget(len(peek_cache(state_dir).get("sessions") or {}))
     flush_pending_orphan_ops(blocking=True)
     # DISABLED is never consulted: --cleanup runs after the rollback set it (Plan §5.2).
-    cache_mgr = BoundedSessionCache(get_state_dir(), lock_timeout=UNBOUNDED_LOCK_TIMEOUT, check_disabled=False)
-    progress = _Progress(targeted=_stage_all_ended(cache_mgr))
-    policy = cleanup_policy(len(progress.targeted))
+    cache_mgr = _DeadlineCache(state_dir, deadline)
+    try:
+        progress = _Progress(targeted=_stage_all_ended(cache_mgr))
+    except CacheError as exc:
+        log_warning(f"--cleanup could not stage the Endeds ({exc})")
+        return _unstaged_exit(state_dir, deadline)
+    policy = cleanup_policy(len(progress.targeted), deadline=deadline)
     _deliver_all(cache_mgr, policy, bridge_url, progress)
     _fold_deferred_confirmations(cache_mgr)
     leftovers = _leftovers(cache_mgr, progress)
@@ -222,7 +259,7 @@ def _cleanup(bridge_url: Optional[str]) -> int:
         log_debug(f"--cleanup confirmed {len(progress.targeted)} session(s) Ended")
         return EXIT_OK
     if leftovers.exports:
-        _export(leftovers.exports)
+        _export(leftovers.exports, deadline)
         log_warning(f"--cleanup left {len(leftovers.exports)} session(s) unconfirmed; exported to the orphan file")
     if leftovers.others:
         log_warning(f"--cleanup: {len(leftovers.others)} session(s) admitted while it ran were left live")

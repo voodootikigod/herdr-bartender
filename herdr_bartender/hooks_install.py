@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
+from .boundedio import HOOK_SCRIPT_MAX_BYTES, read_regular_file
 from . import hooks_fs
 from .hooks_text import GuardTextError, find_guard, insert_guard, is_legacy_layout, replace_guard, strip_guard
 from .log import log_debug
@@ -68,7 +69,7 @@ def _say(msg: str) -> None:
 def _ensure_pristine(hook: Path, clean: bytes, mode: int) -> None:
     pristine = hook.with_name(hook.name + PRISTINE_SUFFIX)
     try:
-        if pristine.is_file() and pristine.read_bytes() == clean:
+        if pristine.is_file() and read_regular_file(pristine, HOOK_SCRIPT_MAX_BYTES, follow_symlinks=True) == clean:
             if stat.S_IMODE(pristine.stat().st_mode) != mode:
                 os.chmod(pristine, mode)
             return
@@ -79,7 +80,7 @@ def _ensure_pristine(hook: Path, clean: bytes, mode: int) -> None:
 
 def _install_one(hook: Path, template: bytes) -> HookOutcome:
     try:
-        content = hook.read_bytes()
+        content = read_regular_file(hook, HOOK_SCRIPT_MAX_BYTES, follow_symlinks=True)
         orig_mode = stat.S_IMODE(hook.stat().st_mode)
         target_mode = orig_mode | 0o100
         clean = strip_guard(content)
@@ -149,7 +150,7 @@ def install_hooks(state_dir: Optional[Path] = None, hooks_dir: Optional[Path] = 
 def _remove_redundant_pristine(hook: Path, restored: bytes) -> None:
     pristine = hook.with_name(hook.name + PRISTINE_SUFFIX)
     try:
-        if pristine.is_file() and pristine.read_bytes() == restored:
+        if pristine.is_file() and read_regular_file(pristine, HOOK_SCRIPT_MAX_BYTES, follow_symlinks=True) == restored:
             pristine.unlink()
         elif pristine.exists():
             _say(f"[=] Keeping {pristine.name}: it differs from the restored hook")
@@ -159,7 +160,7 @@ def _remove_redundant_pristine(hook: Path, restored: bytes) -> None:
 
 def _uninstall_one(hook: Path) -> bool:
     try:
-        content = hook.read_bytes()
+        content = read_regular_file(hook, HOOK_SCRIPT_MAX_BYTES, follow_symlinks=True)
         if find_guard(content) is None:
             _say(f"[=] No dedup guard in {hook.name}; skipping")
             return True

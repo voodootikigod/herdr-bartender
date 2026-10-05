@@ -187,3 +187,4 @@ Status at the W5 gate:
 | R66 | Keyed close envelopes: never pruned, newest per container, bounded distinct containers | `tests.test_gate_round15.SpoolHardCapTests.*` (6 tests), `tests.test_gate_round16.StrictSpoolCeilingTests.test_concurrent_writers_never_exceed_the_close_ceiling` |
 | R67 | Close replacement is write-then-remove | `tests.test_gate_round15.SpoolHardCapTests.test_failed_replacement_keeps_the_spooled_close` |
 | R68 | Rollback aborts before cleanup when event handlers outlive the drain | `tests.test_rollback.RollbackScriptTests.test_event_handler_that_never_ends_keeps_the_state` |
+| R69 | Cleanup budget covers lock waits; bounded hook rereads | `tests.test_gate_round21.*` (2 tests) |
