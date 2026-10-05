@@ -128,7 +128,8 @@ class CleanupLockTests(SandboxTestCase):
 
     def test_confirmation_is_kept_when_the_cache_cannot_be_relocked(self):
         """Plan §4.3 L483 applied to --cleanup: a POST confirmed but not recordable under the lock goes to results/
-        (the reconciler applies it) instead of being lost behind exit 1."""
+        (the reconciler applies it) instead of being lost behind exit 1. R58: while it lives only in results/ it is
+        not a confirmed cleanup - exit 2 with the session exported, so the rollback keeps the state dir."""
         real_flock, posted = cache._flock_within, []
 
         def post(payload, timeout=0.2, bridge_url=None):
@@ -140,10 +141,11 @@ class CleanupLockTests(SandboxTestCase):
 
         with mock.patch.object(step_b, "send_event", side_effect=post), \
                 mock.patch.object(cache, "_flock_within", side_effect=flock):
-            self.assertEqual(run_cleanup(bridge_url=self.mock_url), 0)
+            self.assertEqual(run_cleanup(bridge_url=self.mock_url), 2)
         (result,) = [json.loads(p.read_text()) for p in (self.state_dir / "results").glob("*.json")]
         self.assertEqual((result["session_id"], result["transmitting_state"], result["status"]),
                          (self.sid_, "Ended", "success"))
+        self.assertIn(self.sid_, json.loads(get_orphan_path().read_text())["sessions"], "R58: exported as unconfirmed")
 
     def test_readmission_after_a_deferred_step_c_still_exits_2(self):
         """R31 (gate finding: cleanup skipped a landed-but-unrecorded session unconditionally): the Ended landed, its
@@ -174,7 +176,8 @@ class CleanupLockTests(SandboxTestCase):
                 mock.patch.object(cache, "_flock_within", side_effect=flock):
             self.assertEqual(run_cleanup(bridge_url=self.mock_url), 2, "a live session remains: never exit 0")
         self.assertTrue(failed, "control: Step C was deferred")
-        self.assertEqual(len(list((self.state_dir / "results").glob("*.json"))), 1, "the landed Ended is recorded")
+        self.assertEqual(list((self.state_dir / "results").glob("*.json")), [],
+                         "R58: the landed Ended's confirmation was applied (stale vs the re-admission, so no eviction)")
         with self.cache_mgr as data:
             record = data["sessions"][self.sid_]
         self.assertEqual(record["desired_state"], "Working")

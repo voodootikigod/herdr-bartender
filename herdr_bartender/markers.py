@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from . import clock
-from .log import log_debug
+from .log import log_debug, log_warning
 from .paths import ensure_private_dir, get_state_dir
 from .sanitize import get_hex_pane_id
 
@@ -20,18 +21,33 @@ def is_disabled() -> bool:
 def touch_pane_failed(pane_id: str):
     if not pane_id or is_disabled():
         return
+    # R60: fail open - the healthy marker goes FIRST, so the guard stops suppressing even if .failed cannot be
+    # written; if neither step lands, DELIVERY_DOWN is the global fall-through of last resort.
+    hex_id = get_hex_pane_id(pane_id)
+    panes_dir = get_state_dir() / "panes"
+    marker_gone = _unlink_quietly(panes_dir / hex_id)
     try:
-        panes_dir = ensure_private_dir(get_state_dir() / "panes")
-        now_ts = str(int(clock.time()))
-        hex_id = get_hex_pane_id(pane_id)
-        failed_path = panes_dir / f"{hex_id}.failed"
-        with open(failed_path, "w", encoding="utf-8") as f:
-            f.write(now_ts)
-        marker_path = panes_dir / hex_id
-        if marker_path.exists():
-            marker_path.unlink()
-    except Exception:
+        ensure_private_dir(panes_dir)
+        with open(panes_dir / f"{hex_id}.failed", "w", encoding="utf-8") as f:
+            f.write(str(int(clock.time())))
+        return
+    except Exception as exc:
+        log_warning(f"Could not write failure flag for pane {pane_id!r}: {exc!r}")
+    if not marker_gone:
+        log_warning(f"Pane {pane_id!r} marker could not be removed either; touching DELIVERY_DOWN")
+        touch_delivery_down()
+
+
+def _unlink_quietly(path: Path) -> bool:
+    """True when ``path`` no longer exists afterwards."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
         pass
+    except Exception as exc:
+        log_warning(f"Could not remove {path}: {exc!r}")
+        return False
+    return True
 
 
 def clear_pane_failed(pane_id: str):

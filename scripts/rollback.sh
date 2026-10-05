@@ -65,7 +65,10 @@ unsafe_state_dir() {
 removable_state_dir() {
   local dir
   dir=$(printf '%s' "$1" | tr -s '/'); dir="${dir%/}"
-  [ -n "$dir" ] && [ -d "$dir" ] && [ ! -L "$dir" ] && [ "${dir##*/}" = "herdr-bartender" ]
+  [ -n "$dir" ] && [ -d "$dir" ] && [ ! -L "$dir" ] && [ "${dir##*/}" = "herdr-bartender" ] || return 1
+  # R59: no symlink anywhere on the path - its physical spelling must equal the configured one, so `rm -rf`
+  # can never be redirected through an intermediate symlinked directory.
+  [ "$(physical_dir "$dir")" = "$dir" ]
 }
 
 if unsafe_state_dir "$STATE_DIR"; then

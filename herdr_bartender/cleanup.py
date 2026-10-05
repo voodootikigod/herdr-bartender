@@ -36,6 +36,7 @@ from .markers import touch_heartbeat
 from .orphans import export_orphan_record, flush_pending_orphan_ops
 from .paths import get_state_dir
 from .process import own_start_time
+from .results import drain_results_dir
 from .sender import (
     Claim,
     SendPolicy,
@@ -52,6 +53,7 @@ from .sender.lease import peek_cache
 EXIT_OK, EXIT_FATAL, EXIT_UNCONFIRMED = 0, 1, 2
 DEFERRED_RETRY_PAUSE_SECONDS = 0.05
 CLEANUP_UNCONFIRMED_ERROR = "cleanup_unconfirmed"
+MAX_RESULT_DRAIN_PASSES = 32   # results drain applies a bounded batch per pass
 
 
 @dataclass
@@ -59,8 +61,6 @@ class _Progress:
     """Per-run bookkeeping (local to ``run_cleanup``)."""
 
     targeted: Mapping[str, int] = field(default_factory=dict)   # session id -> the seq of the Ended staged
-    # session id -> seq of an Ended the bridge confirmed whose Step C went to results/ (the reconciler applies it)
-    landed_unrecorded: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -105,8 +105,6 @@ def _deliver(cache_mgr: BoundedSessionCache, claim: Claim, policy: SendPolicy, b
     sent = transmit(claim, policy, bridge_url)
     post = settle(cache_mgr, claim, sent, policy)
     run_post_lock(cache_mgr, post, policy, bridge_url)
-    if sent.transmitted and sent.result.success and post.live_remaining is None:
-        progress.landed_unrecorded[claim.session_id] = claim.seq   # Step C deferred to results/
 
 
 def _round(cache_mgr: BoundedSessionCache, outstanding: List[str], policy: SendPolicy,
@@ -153,22 +151,11 @@ def _owed_ended(sid: str, record: dict, progress: _Progress) -> bool:
         and int(record.get("seq", 0) or 0) >= staged
 
 
-def _landed(sid: str, record: dict, progress: _Progress) -> bool:
-    """Confirmed by the bridge (Step C in results/) and not moved on since: still that Ended, no newer seq.
-
-    A session re-admitted live after its Ended landed (or ended again at a newer, unconfirmed seq) is not
-    confirmed: R31 still makes the exit code 2 for it.
-    """
-    landed = progress.landed_unrecorded.get(sid)
-    return landed is not None and record.get("desired_state") == "Ended" \
-        and int(record.get("seq", 0) or 0) <= landed
-
-
 def _sort_leftovers(sessions: Mapping, progress: _Progress, mark_at: Optional[float]) -> _Leftovers:
     """Split the cached sessions into this run's unconfirmed Endeds (marked when ``mark_at``) and the others."""
     exports, others = [], []
     for sid, record in sessions.items():
-        if not isinstance(record, dict) or _landed(sid, record, progress):
+        if not isinstance(record, dict):
             continue
         if not _owed_ended(sid, record, progress):
             others.append(sid)
@@ -205,6 +192,21 @@ def _export(leftovers: Tuple[Tuple[str, dict], ...]) -> None:
         log_warning("Orphan journal not fully flushed by --cleanup; the next lock holder folds it in")
 
 
+def _fold_deferred_confirmations(cache_mgr: BoundedSessionCache) -> None:
+    """R58: a Step C confirmation deferred to results/ only counts once it is applied to the cache.
+
+    Until then the session is still an unconfirmed Ended, so it is exported and --cleanup exits 2 - the rollback
+    never deletes the state dir while the only durable proof of an Ended lives under it.
+    """
+    for _ in range(MAX_RESULT_DRAIN_PASSES):
+        try:
+            if not drain_results_dir(cache_mgr.state_dir, cache_mgr=cache_mgr).applied:
+                return
+        except CacheError as exc:
+            log_warning(f"--cleanup could not apply deferred confirmations ({exc}); treating them as unconfirmed")
+            return
+
+
 def _cleanup(bridge_url: Optional[str]) -> int:
     touch_heartbeat()
     own_start_time()  # the lease-token start time, outside any critical section
@@ -214,6 +216,7 @@ def _cleanup(bridge_url: Optional[str]) -> int:
     progress = _Progress(targeted=_stage_all_ended(cache_mgr))
     policy = cleanup_policy(len(progress.targeted))
     _deliver_all(cache_mgr, policy, bridge_url, progress)
+    _fold_deferred_confirmations(cache_mgr)
     leftovers = _leftovers(cache_mgr, progress)
     if not leftovers:
         log_debug(f"--cleanup confirmed {len(progress.targeted)} session(s) Ended")
