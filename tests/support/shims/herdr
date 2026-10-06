@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Test shim for the herdr CLI: records argv in the sandbox log and exits 0.
+if [ -n "${HB_TEST_SANDBOX:-}" ]; then
+  printf '%s\n' "$*" >> "${HB_TEST_SANDBOX}/herdr.log"
+fi
+exit 0

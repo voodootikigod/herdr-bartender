@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Test shim for ps. For a PID listed in $HB_TEST_SANDBOX/procs.list it answers
+# `-o lstart=` / `-o comm=` / `-o command=` from that file; anything else is
+# delegated to the real ps found on $HB_REAL_PATH (so real child processes such
+# as `sleep` lease holders keep their genuine start times).
+orig_args=("$@")
+pid=""; fmt=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) pid="${2:-}"; shift ;;
+    -o) fmt="${2:-}"; shift ;;
+  esac
+  shift
+done
+
+procs="${HB_TEST_SANDBOX:-}/procs.list"
+if [ -n "$pid" ] && [ -n "${HB_TEST_SANDBOX:-}" ] && [ -f "$procs" ]; then
+  while IFS='|' read -r fpid name lstart comm cmdline; do
+    [ "$fpid" = "$pid" ] || continue
+    case "$fmt" in
+      lstart=) if [ -n "$lstart" ]; then echo "$lstart"; exit 0; fi ;;
+      comm=) echo "${comm:-$name}"; exit 0 ;;
+      command=|args=) echo "${cmdline:-$name}"; exit 0 ;;
+    esac
+    break
+  done < "$procs"
+fi
+
+real_ps=$(PATH="${HB_REAL_PATH:-/usr/bin:/bin}" command -v ps)
+if [ -z "$real_ps" ]; then
+  exit 1
+fi
+exec "$real_ps" "${orig_args[@]}"

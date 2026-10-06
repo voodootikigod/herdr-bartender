@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Test shim for osascript: never talks to macOS; records argv in the sandbox log.
+if [ -n "${HB_TEST_SANDBOX:-}" ]; then
+  printf '%s\n' "$*" >> "${HB_TEST_SANDBOX}/osascript.log"
+fi
+exit 0
