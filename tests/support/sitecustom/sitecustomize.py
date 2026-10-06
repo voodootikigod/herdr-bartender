@@ -10,6 +10,7 @@ package are untouched. Production code has no test branch: it uses whatever spaw
 
 import importlib.abc
 import importlib.machinery
+import importlib.util
 import json
 import os
 import sys
@@ -47,6 +48,23 @@ class _SpawnerHook(importlib.abc.MetaPathFinder):
         spec.loader.exec_module = exec_module
         return spec
 
+
+def _run_shadowed_sitecustomize():
+    """Run the interpreter's own sitecustomize, which this file hides by sitting first on PYTHONPATH.
+
+    Homebrew's Python, for one, uses it to set ``sys.executable`` to its ``opt/`` path; without it a sandboxed
+    child reports the Cellar path and its reconciler argv no longer matches the test process's.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    search = [p for p in sys.path if os.path.abspath(p or os.curdir) != here]
+    spec = importlib.machinery.PathFinder.find_spec("sitecustomize", search)
+    if spec is None or spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+
+_run_shadowed_sitecustomize()
 
 _SANDBOX = os.environ.get("HB_TEST_SANDBOX")
 if _SANDBOX:

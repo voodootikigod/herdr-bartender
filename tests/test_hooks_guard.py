@@ -346,6 +346,11 @@ class HookGuardCaptureTests(_GuardCase):
         pane = "w1:pFifoTest"
         self.fresh_marker(pane)
         script = self.script("guard-fifo.sh", 'echo "PASSTHROUGH_SUCCESS"')
+        # The bound is on the capture, not on the guard's fixed cost (bash forks, the pgrep shim), which is several
+        # times larger on macOS: measure that cost with a stdin that closes at once and allow it on top.
+        t_start = time.monotonic()
+        run_guard(script, input="", env_extra={"HERDR_PANE_ID": pane})
+        baseline = time.monotonic() - t_start
         fifo = self.tmp / "hanging_fifo"
         os.mkfifo(str(fifo))
         start_fifo_writer(self, fifo, f"exec 3>'{fifo}'; sleep 5; exec 3>&-")
@@ -355,7 +360,9 @@ class HookGuardCaptureTests(_GuardCase):
             elapsed = time.monotonic() - t_start
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("PASSTHROUGH_SUCCESS", res.stdout, "capture timeout must fail open (no suppression)")
-        self.assertLess(elapsed, 1.5, f"capture must be bounded to <=1.0s (+tolerance), took {elapsed:.2f}s")
+        self.assertLess(elapsed - baseline, 1.5,
+                        f"capture must be bounded to <=1.0s (+tolerance), took {elapsed:.2f}s "
+                        f"(guard baseline {baseline:.2f}s)")
         self.assertEqual(leftovers(self.state_dir, ".guard_stdin.*", ".guard_splice.*"), [])
 
     def _splice_shells(self):

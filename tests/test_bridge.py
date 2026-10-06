@@ -5,7 +5,7 @@ import socket
 import time
 import unittest
 
-from herdr_bartender import bridge, config, runtime
+from herdr_bartender import bridge, config, process, runtime
 from herdr_bartender.bridge import (
     DeliveryResult,
     check_bridge_health,
@@ -137,6 +137,9 @@ class BudgetModeTests(SandboxTestCase):
 
     def test_bounded_path_skips_retry_without_budget(self):
         """Plan §3.3 L479 (gap minimal-retry-noop): on the hot path the retry needs time_remaining() > 0.3s."""
+        # Warm the 0.5s liveness memo first: with the budget spent the gate's probe gets the 0.02s floor, which the
+        # bash pgrep shim cannot meet on macOS, and the gate (not the retry budget) would decide the outcome.
+        self.assertEqual(process.get_bartender_pid(), FAKE_BARTENDER_PID)
         self._long_running(runtime.DEADLINE_BOUNDED)
         self.bridge.enqueue(400)
         result = deliver_event({"state": "Ended", "agent": "claude", "session_id": "s-hot"}, bridge_url=self.mock_url)

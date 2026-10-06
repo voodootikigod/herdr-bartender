@@ -379,7 +379,11 @@ class DrainSupersessionTests(RaceCase):
         turn re-admits the pane and is delivered; the Ended's Step C must not evict the newer session.
 
         Same-PID race: the new turn runs in this process, so it claims our lease and delivers inline. The
-        cross-process variant (deferral plus reconciler hand-off) is the test below."""
+        cross-process variant (deferral plus reconciler hand-off) is the test below.
+
+        The new turn runs inside the bridge's ``after_apply`` hook while our Ended waits for its response, so our
+        socket timeout must outlast it: under the real 0.2s cap a slow host (macOS fsync) times the Ended out and
+        its minimal-payload retry would run while the hook's thread holds this process's cache lock."""
         handle_agent_status_changed(_status(), {}, bridge_url=self.mock_url)
 
         def new_turn(_payload):
@@ -388,7 +392,8 @@ class DrainSupersessionTests(RaceCase):
                                         arrival_ns=later)
 
         self.bridge.after_apply = _once(lambda p: p.get("state") == "Ended", new_turn)
-        handle_pane_closed({"pane_id": PANE}, {}, bridge_url=self.mock_url)
+        with mock.patch.object(SendPolicy, "socket_timeout", lambda _policy: HOOK_WAIT_SECONDS):
+            handle_pane_closed({"pane_id": PANE}, {}, bridge_url=self.mock_url)
         self.assertEqual([b["state"] for b in self._arrived()], ["Working", "Ended", "Working"])
         self.assertEqual(self.bridge.sessions[self.session_id]["state"], "Working", "final bridge state Working")
         s = self._session()
