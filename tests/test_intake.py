@@ -4,6 +4,7 @@
 import io
 import json
 import os
+import time
 import unittest
 from unittest import mock
 
@@ -107,6 +108,26 @@ class ReadStdinTests(unittest.TestCase):
         clock = iter([0.0, 0.0, 0.05, 0.2, 0.3, 0.4, 0.5, 9.0, 9.0, 9.0])
         with os.fdopen(r, "rb") as f:
             got = intake.read_stdin_bounded(f, budget=0.1, now=lambda: next(clock))
+        self.assertEqual(got, b"partial")
+
+    def test_spent_budget_still_takes_buffered_input(self):
+        """R89: a slow start-up that spends the stdin budget must not drop an envelope already in the pipe."""
+        envelope = b'{"event":"pane.closed","data":{"pane_id":"w1:p1"}}'
+        r, w = os.pipe()
+        os.write(w, envelope)
+        os.close(w)
+        with os.fdopen(r, "rb") as f:
+            self.assertEqual(intake.read_stdin_bounded(f, budget=0.0), envelope)
+
+    def test_spent_budget_never_waits_on_an_open_pipe(self):
+        """R89: past the budget only what is already buffered is taken; an open writer is not waited for."""
+        r, w = os.pipe()
+        self.addCleanup(os.close, w)
+        os.write(w, b"partial")
+        with os.fdopen(r, "rb") as f:
+            t0 = time.monotonic()
+            got = intake.read_stdin_bounded(f, budget=0.0)
+            self.assertLess(time.monotonic() - t0, 0.05)
         self.assertEqual(got, b"partial")
 
     def test_size_cap(self):

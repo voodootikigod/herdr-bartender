@@ -82,6 +82,8 @@ def read_stdin_bounded(stream, budget: float, max_bytes: int = STDIN_MAX_BYTES,
     """Read ``stream`` until EOF, ``max_bytes`` or ``budget`` seconds, never blocking past the budget.
 
     A TTY, a missing stream or one without a usable file descriptor reads as b"".
+    R89: a spent budget (slow start-up) still takes what is already buffered, without waiting, so an envelope
+    Herdr wrote before we got here is never dropped.
     """
     try:
         fd = stream.fileno()
@@ -93,12 +95,12 @@ def read_stdin_bounded(stream, budget: float, max_bytes: int = STDIN_MAX_BYTES,
     total = 0
     deadline = now() + max(0.0, budget)
     while total < max_bytes:
-        remaining = deadline - now()
-        if remaining <= 0:
-            break
+        remaining = max(0.0, deadline - now())
         try:
             readable, _, _ = select.select([fd], [], [], remaining)
             if not readable:
+                if remaining <= 0:
+                    break
                 continue
             chunk = os.read(fd, min(STDIN_CHUNK, max_bytes - total))
         except (OSError, ValueError):

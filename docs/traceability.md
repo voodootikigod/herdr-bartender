@@ -207,3 +207,4 @@ Status at the W5 gate:
 | R86 | Claim-and-link hook replacement without atomic exchange | `tests.test_gate_round38.*` (3 tests) |
 | R87 | Watchdog hand-off during exceptions; FIFO-less byte-exact splice (bash and dash) | `tests.test_gate_round39.*` (2 tests) |
 | R88 | `.vendor_active` retirement outside the cache lock | `tests.test_gate_round40.*` (3 tests) |
+| R89 | Spent stdin budget still takes buffered input | `tests.test_intake.ReadStdinTests.test_spent_budget_*` (2 tests) |
