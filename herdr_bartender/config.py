@@ -25,6 +25,18 @@ AGENT_NAME_OVERRIDES = {
     "copilot": "Copilot",
     "kimi": "Kimi",
     "opencode": "OpenCode",
+    "open_code": "OpenCode",
+    "github_copilot": "GitHub Copilot",
+    "agy": "Antigravity",
+    "antigravity": "Antigravity",
+    "gemini": "Gemini",
+    "devin": "Devin",
+    "cline": "Cline",
+    "pi": "Pi",
+    "droid": "Droid",
+    "amp": "Amp",
+    "hermes": "Hermes",
+    "letta": "Letta",
 }
 
 STATUS_MAP = {

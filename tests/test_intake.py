@@ -341,6 +341,13 @@ class SanitizeTests(unittest.TestCase):
         """Plan §2.3 agent row (gap agent-sanitization): OSC-injected and 200-char agents are cleaned, <= 64 chars."""
         self.assertEqual(sanitize.format_agent_name("\x1b]0;pwn\x07claude"), "Claude (Herdr)")
         self.assertEqual(sanitize.format_agent_name("  CODEX "), "Codex (Herdr)")
+        self.assertEqual(sanitize.format_agent_name("agy"), "Antigravity (Herdr)")
+        self.assertEqual(sanitize.format_agent_name("antigravity"), "Antigravity (Herdr)")
+        self.assertEqual(sanitize.format_agent_name("gemini"), "Gemini (Herdr)")
+        self.assertEqual(sanitize.format_agent_name("open_code"), "OpenCode (Herdr)")
+        self.assertEqual(sanitize.format_agent_name("github_copilot"), "GitHub Copilot (Herdr)")
+        self.assertEqual(sanitize.format_agent_name("devin"), "Devin (Herdr)")
+        self.assertEqual(sanitize.format_agent_name("cline"), "Cline (Herdr)")
         long_name = sanitize.format_agent_name("a" * 200)
         self.assertLessEqual(len(long_name), 64)
         self.assertTrue(long_name.endswith(" (Herdr)"))

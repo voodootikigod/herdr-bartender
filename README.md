@@ -15,13 +15,13 @@ The spec is [`herdr-bartender-plan.md`](herdr-bartender-plan.md). [`docs/plan-re
 | `pane.agent_status_changed` with `agent` null/empty (agent exited) | `Ended` |
 | `pane.closed`, `tab.closed`, `workspace.closed` | `Ended` (entry removed) |
 
-- Agents show as `<Agent> (Herdr)`, for example `Claude (Herdr)` or `Codex (Herdr)`.
+- Agents show as `<Agent> (Herdr)`, for example `Antigravity (Herdr)`, `Claude (Herdr)`, `Codex (Herdr)`, `Gemini (Herdr)`, `Cursor (Herdr)`, `OpenCode (Herdr)`, or `GitHub Copilot (Herdr)`.
 - Each session is identified as `herdr:<host>:<workspace>:<pane>`.
 - Shell panes with no agent are ignored, and an `unknown` status never evicts a session.
 - Every delivery goes through one locked, sequenced sender. A failed delivery is retried at 0/1/2/4/8s.
 - A background reconciler owns retries, TTLs (Working 12h, Idle/Done 24h, Waiting 48h), restart re-syncs and orphan replay.
-- An optional guard patched into Bartender's own Claude/Codex hook scripts stops the same agent from showing twice. The guard falls back to the vendor hooks whenever Herdr is unhealthy.
-- The plugin is pure Python 3 (3.9+, stdlib only) plus one bash guard. It has no dependencies.
+- An optional guard patched into Bartender's own Claude/Codex hook scripts stops the same agent from showing twice. Standalone Antigravity (`agy`) sessions also report cleanly via `scripts/agy-notify-hook.sh` with automatic `HERDR_PANE_ID` deduplication.
+- The plugin is pure Python 3 (3.9+, stdlib only) plus bash hook guards. It has no external dependencies.
 
 ## Scope and requirements
 
@@ -126,6 +126,14 @@ The guard suppresses a vendor notification only while Herdr demonstrably owns th
 - `--status` then prints `[WARNING] Vendor hook modified upstream (SHA mismatch). Run 'herdr-bartender --install-hooks' to re-verify and approve changes.`, followed by a `Review needed:` line naming each hook's cause.
 - If you never ran `--install-hooks` (no `vendor-hook-sha.json` and no guard in any hook), the guard is simply not installed (R42): nothing is flagged, alerted or logged.
 - Until you approve the change by re-running `--install-hooks`, the vendor hooks run unguarded, so you may see duplicate entries.
+
+## Antigravity (`agy`) CLI support
+
+Antigravity CLI sessions are fully supported both inside Herdr panes and standalone across Ghostty, iTerm2, Terminal.app, Warp, and VS Code:
+
+- **Inside Herdr**: Herdr natively detects `agy` and emits `pane.agent_status_changed`. The plugin translates this to `Antigravity (Herdr)` on Top Shelf.
+- **Standalone `agy`**: Standalone sessions report directly to Bartender Top Shelf via `scripts/agy-notify-hook.sh`. The hook integrates into Antigravity lifecycle events (`PreInvocation`, `PreToolUse`, `PostInvocation`, `Stop`) via `~/.gemini/config/hooks.json`.
+- **Automatic Deduplication**: If an `agy` session runs within Herdr (`HERDR_PANE_ID` is set in the environment), `agy-notify-hook.sh` suppresses direct Bartender notifications so `herdr-bartender` manages Top Shelf updates with zero duplicate entries.
 
 ## CLI reference
 
