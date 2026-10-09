@@ -133,7 +133,7 @@ class AgyNotifyHookTests(SandboxTestCase):
                     self.assertIn(cid, va_file.read_text())
 
     def test_fail_open_recover_stop_handoff(self):
-        """When an earlier fail-open wrote .vendor_active, Stop is NOT suppressed even if Herdr is healthy now."""
+        """When an earlier fail-open wrote .vendor_active, Stop delivers Ended and retires .vendor_active."""
         pane_id = "ws1:pHandoff"
         hex_pane = pane_id.encode("utf-8").hex()
         cid = "conv-handoff-session-0001"
@@ -169,6 +169,75 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(self.bridge.history[-1].get("session_id"), cid)
         # .vendor_active should now be retired
         self.assertFalse(va_file.exists())
+
+    def test_fail_open_recover_post_invocation_dismisses_direct_entry(self):
+        """When Herdr recovers, the next non-Stop event immediately dismisses the direct entry so no duplicate remains."""
+        pane_id = "ws1:pRecovPost"
+        hex_pane = pane_id.encode("utf-8").hex()
+        cid = "conv-recov-post-000001"
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+
+        # Step 1: PreInvocation fails open (no marker)
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": cid},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(1)
+        self.assertEqual(len(self.bridge.history), 1)
+        self.assertEqual(self.bridge.history[-1].get("state"), "Working")
+        self.assertTrue(va_file.exists())
+
+        # Step 2: Herdr recovers and creates fresh marker
+        self._fresh_marker(pane_id)
+
+        # Step 3: PostInvocation arrives while Herdr is healthy.
+        # It suppresses the standalone PostInvocation, BUT immediately ends the previous direct session!
+        code, out, _ = self._run_hook(
+            "PostInvocation",
+            payload={"conversationId": cid},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "{}")
+
+        self._wait_for_history(2)
+        self.assertEqual(len(self.bridge.history), 2)
+        self.assertEqual(self.bridge.history[-1].get("state"), "Ended")
+        self.assertEqual(self.bridge.history[-1].get("session_id"), cid)
+        self.assertFalse(va_file.exists(), ".vendor_active must be unlinked upon handoff dismissal")
+
+    def test_subshell_wrapper_preserves_stable_session_id(self):
+        """Spawning via the README sh -c wrapper produces stable session IDs across invocations without conversationId."""
+        self.bridge.history.clear()
+        cmd = f'if [ -x "{HOOK_SCRIPT}" ]; then AGY_HOOK_EVENT="$1" "{HOOK_SCRIPT}"; fi'
+        env = {
+            **os.environ,
+            "NOTCHBAR_AGENTS_HOST": "127.0.0.1",
+            "NOTCHBAR_AGENTS_PORT": str(self.bridge.port),
+            "TERM_SESSION_ID": "term-sess-fixed-1234",
+        }
+        payload = json.dumps({"workspacePaths": ["/Users/tester/subshell_project"]})
+
+        # Run 1: PreInvocation via sh -c wrapper
+        p1 = subprocess.run(["sh", "-c", cmd, "sh", "PreInvocation"], input=payload, text=True, capture_output=True, env=env)
+        self.assertEqual(p1.returncode, 0)
+        self._wait_for_history(1)
+        sid1 = self.bridge.history[-1].get("session_id")
+        pid1 = self.bridge.history[-1].get("pid")
+
+        # Run 2: PostInvocation via sh -c wrapper
+        p2 = subprocess.run(["sh", "-c", cmd, "sh", "PostInvocation"], input=payload, text=True, capture_output=True, env=env)
+        self.assertEqual(p2.returncode, 0)
+        self._wait_for_history(2)
+        sid2 = self.bridge.history[-1].get("session_id")
+        pid2 = self.bridge.history[-1].get("pid")
+
+        # Must not match the transient sh PID and must stay strictly identical across calls
+        self.assertEqual(sid1, sid2)
+        self.assertEqual(pid1, pid2)
+        self.assertTrue(sid1.startswith("agy-session-"))
 
     def test_event_resolved_from_json_body_alone(self):
         """When AGY_HOOK_EVENT and argv are unset, EVENT is correctly resolved from hook_event_name in JSON."""
@@ -256,11 +325,10 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(sid1, sid2)
         self.assertTrue(sid1.startswith("agy-session-"))
 
-    def test_python_unavailable_fallback(self):
-        """When Python is unavailable, bash fallback correctly maps Stop to Ended and PostInvocation to Idle."""
+    def test_python_unavailable_fallback_and_event_whitelist(self):
+        """When Python is unavailable, bash fallback correctly maps Stop to Ended, PostInvocation to Idle, and whitelists EVENT."""
         no_py_dir = self.tmp / "no-py-bin"
         no_py_dir.mkdir(parents=True, exist_ok=True)
-        # Create a failing / non-executable python3 shim in front of PATH
         fake_py = no_py_dir / "python3"
         fake_py.write_text("#!/bin/sh\nexit 127\n")
         fake_py.chmod(0o755)
@@ -286,6 +354,12 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(out, '{"decision":""}')
         self._wait_for_history(3)
         self.assertEqual(self.bridge.history[-1].get("state"), "Ended")
+
+        # 4. Injected event -> whitelisted to empty, safe fallback
+        code, out, _ = self._run_hook('Stop"; injection', payload={}, env_extra=env)
+        self.assertEqual(code, 0)
+        self._wait_for_history(4)
+        self.assertEqual(self.bridge.history[-1].get("event"), "")
 
     def test_bartender_not_running_skips_delivery(self):
         """When Bartender process is not running, hook skips network request and exits 0 cleanly."""

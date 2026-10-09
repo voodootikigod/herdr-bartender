@@ -13,6 +13,12 @@ if [ -z "$EVENT" ]; then
   EVENT=$(printf '%s' "$HOOK_JSON" | LC_ALL=C grep -o '"hook_event_name"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
 fi
 
+# Whitelist EVENT strictly to prevent injection into JSON or logic
+case "$EVENT" in
+  PreInvocation|PreToolUse|PostInvocation|Stop) ;;
+  *) EVENT="" ;;
+esac
+
 # Strictly loopback only (Plan §8: literal loopback, no hostname resolution, no remote proxy)
 HOST="127.0.0.1"
 PORT="${NOTCHBAR_AGENTS_PORT:-7823}"
@@ -78,41 +84,56 @@ is_herdr_owning_pane() {
 }
 
 # If Herdr actively owns this pane:
-# - If an earlier fail-open left .vendor_active on this pane, let Stop through so the direct entry is ended
+# - If an earlier fail-open wrote .vendor_active, immediately dismiss the direct entry now that Herdr has taken over!
 # - Otherwise suppress standalone reporting to prevent duplicate entries
 if is_herdr_owning_pane; then
-  if [ -n "$VENDOR_ACTIVE" ] && [ -f "$VENDOR_ACTIVE" ] && [ "$EVENT" = "Stop" ]; then
-    # Do not suppress: fall through to deliver Ended and retire .vendor_active
-    :
-  else
-    case "$EVENT" in
-      PreToolUse) printf '{"decision":"allow"}\n' ;;
-      Stop) printf '{"decision":""}\n' ;;
-      *) printf '{}\n' ;;
-    esac
-    exit 0
+  if [ -n "$VENDOR_ACTIVE" ] && [ -f "$VENDOR_ACTIVE" ]; then
+    prev_sid=$(printf '%s' "$(cat "$VENDOR_ACTIVE" 2>/dev/null || true)" | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+    rm -f "$VENDOR_ACTIVE" 2>/dev/null || true
+    if [ -n "$prev_sid" ] && is_bartender_alive; then
+      curl -s \
+        --noproxy '*' \
+        --max-redirs 0 \
+        --proto =http \
+        --connect-timeout 0.15 \
+        --max-time 0.5 \
+        -X POST "http://${HOST}:${PORT}/event" \
+        -H 'Content-Type: application/json' \
+        --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${prev_sid}\"}" >/dev/null 2>&1 || true
+    fi
   fi
+
+  case "$EVENT" in
+    PreToolUse) printf '{"decision":"allow"}\n' ;;
+    Stop) printf '{"decision":""}\n' ;;
+    *) printf '{}\n' ;;
+  esac
+  exit 0
 fi
 
-# Find agent PID (search up process tree checking comm and command line for agy/antigravity)
+# Find agent PID: match ONLY the binary basename (agy, antigravity, Antigravity),
+# NEVER matching wrapper shells (sh, bash, zsh) whose arguments may contain the script path.
 find_agent_pid() {
   local pid=$PPID
   local max=8
   while [ "$max" -gt 0 ] && [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
-    local comm args
+    local comm base_comm
     comm=$(ps -o comm= -p "$pid" 2>/dev/null || true)
-    args=$(ps -o args= -p "$pid" 2>/dev/null || true)
-    case "$comm $args" in
-      *agy*|*antigravity*|*Antigravity*) echo "$pid"; return 0 ;;
+    base_comm=$(basename "$comm" 2>/dev/null || echo "$comm")
+    case "$base_comm" in
+      agy|antigravity|Antigravity) echo "$pid"; return 0 ;;
     esac
     pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
     max=$((max - 1))
   done
-  echo "${PPID:-$$}"
+  echo ""
   return 0
 }
 
-AGENT_PID="$(find_agent_pid 2>/dev/null || echo "$$")"
+AGENT_PID="$(find_agent_pid 2>/dev/null || true)"
+if ! printf '%s' "${AGENT_PID:-}" | grep -Eq '^[0-9]+$'; then
+  AGENT_PID=""
+fi
 
 # Build Bartender Top Shelf JSON payload with comprehensive terminal/bidi control stripping
 # and strict length caps.
@@ -176,7 +197,8 @@ else:
     title = ""
 
 try:
-    pid = int(os.environ.get("AGENT_PID") or 0) or None
+    raw_pid = os.environ.get("AGENT_PID")
+    pid = int(raw_pid) if raw_pid and raw_pid.isdigit() else None
 except Exception:
     pid = None
 
@@ -194,8 +216,8 @@ conv_id = d.get("conversationId")
 if isinstance(conv_id, str) and re.match(r'^[a-zA-Z0-9_-]{16,64}\Z', conv_id):
     session_id = conv_id
 else:
-    # Deterministic fallback per session/workspace (16-64 chars [a-zA-Z0-9_-])
-    seed = f"{raw_cwd}:{os.environ.get('TERM_SESSION_ID', '')}:{os.environ.get('TTY', '')}:{pid}"
+    # Deterministic fallback per workspace and terminal session (independent of transient subshell PIDs)
+    seed = f"{cwd}:{os.environ.get('TERM_SESSION_ID', '')}:{os.environ.get('TTY', '')}"
     h = hashlib.sha256(seed.encode('utf-8')).hexdigest()[:24]
     session_id = f"agy-session-{h}"
 
@@ -235,12 +257,12 @@ if [ -z "${payload:-}" ]; then
     PostInvocation) FB_STATE="Idle" ;;
     *) FB_STATE="Working" ;;
   esac
-  FALLBACK_SID="agy-session-${AGENT_PID}"
+  FALLBACK_SID="agy-session-fallback-default"
   payload="{\"state\":\"${FB_STATE}\",\"agent\":\"Antigravity\",\"event\":\"${EVENT}\",\"session_id\":\"${FALLBACK_SID}\"}"
 fi
 
 # Extract session_id from payload for .vendor_active management
-SID=$(printf '%s' "$payload" | /usr/bin/python3 -c 'import json, sys; d=json.load(sys.stdin); sys.stdout.write(d.get("session_id") or "")' 2>/dev/null || echo "agy-session-${AGENT_PID}")
+SID=$(printf '%s' "$payload" | /usr/bin/python3 -c 'import json, sys; d=json.load(sys.stdin); sys.stdout.write(d.get("session_id") or "")' 2>/dev/null || echo "agy-session-fallback-default")
 
 # Record or retire .vendor_active if running within a Herdr pane during a fail-open window
 if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ]; then
