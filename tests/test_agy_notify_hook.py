@@ -243,6 +243,69 @@ class AgyNotifyHookTests(SandboxTestCase):
         # .vendor_active MUST STILL EXIST so Herdr's reconciler can stage and retry!
         self.assertTrue(va_file.exists(), ".vendor_active must be preserved when dismissal was not confirmed")
 
+    def test_fail_open_stop_failed_delivery_preserves_vendor_active(self):
+        """When Stop fails open and delivery fails (e.g. Bartender dead), .vendor_active is NOT deleted and remains for reconciler."""
+        pane_id = "ws1:pFailOpenStop"
+        hex_pane = pane_id.encode("utf-8").hex()
+        cid = "conv-failopen-stop-0001"
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+
+        # Step 1: PreInvocation fails open (marker missing) -> writes .vendor_active
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": cid},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(1)
+        self.assertTrue(va_file.exists())
+
+        # Step 2: Bartender process dies
+        self.clear_fake_processes()
+
+        # Step 3: Stop arrives while Herdr is still unhealthy (marker missing) and Bartender is dead
+        code, out, _ = self._run_hook(
+            "Stop",
+            payload={"conversationId": cid},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":""}')
+
+        # .vendor_active MUST STILL EXIST so Herdr's reconciler can recover the orphan!
+        self.assertTrue(va_file.exists(), ".vendor_active must be preserved when fail-open Stop was not confirmed by Bartender")
+
+    def test_fail_open_stop_confirmed_delivery_retires_vendor_active(self):
+        """When Stop fails open and delivery succeeds with HTTP 200, .vendor_active is claimed and retired."""
+        pane_id = "ws1:pSuccOpenStop"
+        hex_pane = pane_id.encode("utf-8").hex()
+        cid = "conv-succopen-stop-0001"
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+
+        # Step 1: PreInvocation fails open -> writes .vendor_active
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": cid},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(1)
+        self.assertTrue(va_file.exists())
+
+        # Step 2: Stop arrives while Herdr is still unhealthy, but Bartender is alive -> HTTP 200 delivery
+        code, out, _ = self._run_hook(
+            "Stop",
+            payload={"conversationId": cid},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":""}')
+        self._wait_for_history(2)
+        self.assertEqual(self.bridge.history[-1].get("state"), "Ended")
+
+        # .vendor_active should now be retired
+        self.assertFalse(va_file.exists())
+
     def test_subshell_wrapper_preserves_stable_session_id(self):
         """Spawning via the README sh -c wrapper produces stable session IDs across invocations without conversationId."""
         self.bridge.history.clear()

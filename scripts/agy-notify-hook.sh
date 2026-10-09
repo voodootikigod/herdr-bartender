@@ -100,7 +100,7 @@ if is_herdr_owning_pane; then
         -H 'Content-Type: application/json' \
         --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${prev_sid}\"}" 2>/dev/null || echo "000")
       if [ "$http_code" = "200" ]; then
-        claim_file="${VENDOR_ACTIVE}.claim.$$-$(date +%s 2>/dev/null || echo $$)"
+        claim_file="${VENDOR_ACTIVE}.claim-$$-$(date +%s%N 2>/dev/null || date +%s 2>/dev/null || echo $$)"
         if mv -f "$VENDOR_ACTIVE" "$claim_file" 2>/dev/null; then
           rm -f "$claim_file" 2>/dev/null || true
         fi
@@ -334,27 +334,21 @@ if [ -z "${payload:-}" ]; then
   payload="{\"state\":\"${FB_STATE}\",\"agent\":\"Antigravity\",\"event\":\"${EVENT}\",\"session_id\":\"${FALLBACK_SID}\"}"
 fi
 
-# Record or retire .vendor_active if running within a Herdr pane during a fail-open window
-if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ]; then
-  if [ "$EVENT" = "Stop" ]; then
-    claim_file="${VENDOR_ACTIVE}.claim.$$-$(date +%s 2>/dev/null || echo $$)"
-    if mv -f "$VENDOR_ACTIVE" "$claim_file" 2>/dev/null; then
-      rm -f "$claim_file" 2>/dev/null || true
-    fi
-  else
-    mkdir -m 700 -p "${STATE_HOME}/panes" 2>/dev/null || true
-    TMP_VA=$(mktemp "${STATE_HOME}/panes/.va.tmp.XXXXXX" 2>/dev/null || true)
-    if [ -n "$TMP_VA" ]; then
-      chmod 0600 "$TMP_VA" 2>/dev/null || true
-      printf '{"vendor_session_id":"%s"}\n' "$SID" > "$TMP_VA" 2>/dev/null || true
-      mv -f "$TMP_VA" "$VENDOR_ACTIVE" 2>/dev/null || rm -f "$TMP_VA" 2>/dev/null || true
-    fi
+# On non-Stop events, record or update .vendor_active during fail-open window
+if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ]; then
+  mkdir -m 700 -p "${STATE_HOME}/panes" 2>/dev/null || true
+  TMP_VA=$(mktemp "${STATE_HOME}/panes/.va.tmp.XXXXXX" 2>/dev/null || true)
+  if [ -n "$TMP_VA" ]; then
+    chmod 0600 "$TMP_VA" 2>/dev/null || true
+    printf '{"vendor_session_id":"%s"}\n' "$SID" > "$TMP_VA" 2>/dev/null || true
+    mv -f "$TMP_VA" "$VENDOR_ACTIVE" 2>/dev/null || rm -f "$TMP_VA" 2>/dev/null || true
   fi
 fi
 
 # Send event synchronously with tight timeout. Strictly loopback, no proxies, no redirects.
+http_code="000"
 if is_bartender_alive; then
-  curl -s \
+  http_code=$(curl -s -o /dev/null -w "%{http_code}" \
     --noproxy '*' \
     --max-redirs 0 \
     --proto =http \
@@ -362,7 +356,16 @@ if is_bartender_alive; then
     --max-time 0.5 \
     -X POST "http://${HOST}:${PORT}/event" \
     -H 'Content-Type: application/json' \
-    --data-raw "$payload" >/dev/null 2>&1 || true
+    --data-raw "$payload" 2>/dev/null || echo "000")
+fi
+
+# On Stop, retire .vendor_active ONLY if dismissal was confirmed by HTTP 200.
+# If delivery timed out or failed, keep .vendor_active intact so Herdr reconciler retries.
+if [ -n "$VENDOR_ACTIVE" ] && [ "$EVENT" = "Stop" ] && [ "$http_code" = "200" ]; then
+  claim_file="${VENDOR_ACTIVE}.claim-$$-$(date +%s%N 2>/dev/null || date +%s 2>/dev/null || echo $$)"
+  if mv -f "$VENDOR_ACTIVE" "$claim_file" 2>/dev/null; then
+    rm -f "$claim_file" 2>/dev/null || true
+  fi
 fi
 
 # Emit expected JSON response to stdout for Antigravity lifecycle
