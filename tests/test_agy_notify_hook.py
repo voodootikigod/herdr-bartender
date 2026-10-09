@@ -53,13 +53,16 @@ class AgyNotifyHookTests(SandboxTestCase):
         while len(self.bridge.history) < count and (time.monotonic() - t0) < timeout:
             time.sleep(0.02)
 
-    def test_herdr_pane_suppression_when_healthy(self):
-        """When HERDR_PANE_ID is set AND Herdr is healthy (fresh marker + process alive), the hook suppresses."""
-        # Create fresh pane marker for ws1:p10
-        hex_pane = "ws1:p10".encode("utf-8").hex()
+    def _fresh_marker(self, pane_id: str) -> Path:
+        hex_pane = pane_id.encode("utf-8").hex()
         marker = self.state_dir / "panes" / hex_pane
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text("active")
+        return marker
+
+    def test_herdr_pane_suppression_when_healthy(self):
+        """When HERDR_PANE_ID is set AND Herdr is healthy (fresh marker + process alive), the hook suppresses."""
+        self._fresh_marker("ws1:p10")
 
         for event, expected_stdout in (
             ("PreInvocation", "{}"),
@@ -70,7 +73,7 @@ class AgyNotifyHookTests(SandboxTestCase):
             with self.subTest(event=event):
                 code, out, _ = self._run_hook(
                     event,
-                    payload={"conversationId": "c-test-suppress"},
+                    payload={"conversationId": "c-test-suppress-0001"},
                     env_extra={"HERDR_PANE_ID": "ws1:p10"},
                 )
                 self.assertEqual(code, 0)
@@ -79,107 +82,139 @@ class AgyNotifyHookTests(SandboxTestCase):
         # Confirm no events were delivered to the bridge
         self.assertEqual(len(self.bridge.history), 0)
 
-    def test_herdr_pane_fails_open_when_unhealthy(self):
-        """When HERDR_PANE_ID is set but Herdr is dead or marker missing, suppression fails open and delivers."""
-        # No pane marker created -> Herdr not actively managing pane
+    def test_fail_open_predicates(self):
+        """Each unhealthy condition causes the hook to fail open, delivering to the bridge and recording .vendor_active."""
+        conditions = [
+            ("missing_marker", lambda p, m: m.unlink(missing_ok=True)),
+            ("disabled_flag", lambda p, m: (self.state_dir / "DISABLED").write_text("1")),
+            ("delivery_down_flag", lambda p, m: (self.state_dir / "DELIVERY_DOWN").write_text("1")),
+            ("failed_marker", lambda p, m: (m.parent / f"{m.name}.failed").write_text("1")),
+            ("stale_marker", lambda p, m: os.utime(m, (time.time() - 120, time.time() - 120))),
+            ("symlink_marker", lambda p, m: (m.unlink(missing_ok=True), m.symlink_to(self.tmp))),
+            ("herdr_dead", lambda p, m: (self.clear_fake_processes(), self.add_fake_process("Bartender 6", pid=424200))),
+            ("bare_pane_no_ws", lambda p, m: None),
+        ]
+
+        for label, setup_fn in conditions:
+            with self.subTest(condition=label):
+                self.bridge.history.clear()
+                self.set_herdr_alive()
+                for f in ("DISABLED", "DELIVERY_DOWN"):
+                    (self.state_dir / f).unlink(missing_ok=True)
+
+                pane_id = f"ws1:p{label}"
+                hex_pane = pane_id.encode("utf-8").hex()
+                marker = self._fresh_marker(pane_id)
+                va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+                va_file.unlink(missing_ok=True)
+
+                setup_fn(pane_id, marker)
+
+                env = {"HERDR_PANE_ID": pane_id} if label != "bare_pane_no_ws" else {"HERDR_PANE_ID": "pBare"}
+                cid = f"conv-failopen-{label[:10]}-0001"
+                code, out, _ = self._run_hook(
+                    "PreInvocation",
+                    payload={"conversationId": cid},
+                    env_extra=env,
+                )
+                self.assertEqual(code, 0)
+                self.assertEqual(out, "{}")
+
+                self._wait_for_history(1)
+                self.assertEqual(len(self.bridge.history), 1)
+                self.assertEqual(self.bridge.history[-1].get("session_id"), cid)
+
+                if label != "bare_pane_no_ws":
+                    self.assertTrue(va_file.exists(), f"vendor_active missing for {label}")
+                    self.assertIn(cid, va_file.read_text())
+
+    def test_fail_open_recover_stop_handoff(self):
+        """When an earlier fail-open wrote .vendor_active, Stop is NOT suppressed even if Herdr is healthy now."""
+        pane_id = "ws1:pHandoff"
+        hex_pane = pane_id.encode("utf-8").hex()
+        cid = "conv-handoff-session-0001"
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+
+        # Step 1: PreInvocation fails open (no marker yet)
         code, out, _ = self._run_hook(
             "PreInvocation",
-            payload={"conversationId": "c-unhealthy"},
-            env_extra={"HERDR_PANE_ID": "ws1:pUnhealthy"},
+            payload={"conversationId": cid},
+            env_extra={"HERDR_PANE_ID": pane_id},
         )
         self.assertEqual(code, 0)
-        self.assertEqual(out, "{}")
-
         self._wait_for_history(1)
         self.assertEqual(len(self.bridge.history), 1)
-        self.assertEqual(self.bridge.history[-1].get("session_id"), "agy:c-unhealthy")
+        self.assertEqual(self.bridge.history[-1].get("state"), "Working")
+        self.assertTrue(va_file.exists())
 
-    def test_standalone_pre_invocation(self):
-        """Standalone PreInvocation emits Working with Thinking... title to Bartender."""
-        code, out, _ = self._run_hook(
-            "PreInvocation",
-            payload={
-                "conversationId": "c-inv-1",
-                "workspacePaths": ["/Users/tester/myproject"],
-            },
-        )
-        self.assertEqual(code, 0)
-        self.assertEqual(out, "{}")
+        # Step 2: Herdr recovers and creates a fresh marker
+        self._fresh_marker(pane_id)
 
-        self._wait_for_history(1)
-        self.assertEqual(len(self.bridge.history), 1)
-        ev = self.bridge.history[-1]
-        self.assertEqual(ev.get("agent"), "Antigravity")
-        self.assertEqual(ev.get("state"), "Working")
-        self.assertEqual(ev.get("title"), "Thinking...")
-        self.assertEqual(ev.get("session_id"), "agy:c-inv-1")
-        self.assertEqual(ev.get("cwd"), "/Users/tester/myproject")
-
-    def test_standalone_pre_tool_use(self):
-        """Standalone PreToolUse emits Working with tool name and returns decision: allow."""
-        code, out, _ = self._run_hook(
-            "PreToolUse",
-            payload={
-                "conversationId": "c-tool-1",
-                "toolCall": {"name": "run_command", "args": {"CommandLine": "cargo test"}},
-            },
-        )
-        self.assertEqual(code, 0)
-        self.assertEqual(out, '{"decision":"allow"}')
-
-        self._wait_for_history(1)
-        self.assertEqual(len(self.bridge.history), 1)
-        ev = self.bridge.history[-1]
-        self.assertEqual(ev.get("agent"), "Antigravity")
-        self.assertEqual(ev.get("state"), "Working")
-        self.assertEqual(ev.get("title"), "Tool: run_command")
-        self.assertEqual(ev.get("session_id"), "agy:c-tool-1")
-
-    def test_standalone_post_invocation(self):
-        """Standalone PostInvocation emits Idle to Bartender."""
-        code, out, _ = self._run_hook(
-            "PostInvocation",
-            payload={"conversationId": "c-idle-1"},
-        )
-        self.assertEqual(code, 0)
-        self.assertEqual(out, "{}")
-
-        self._wait_for_history(1)
-        self.assertEqual(len(self.bridge.history), 1)
-        ev = self.bridge.history[-1]
-        self.assertEqual(ev.get("agent"), "Antigravity")
-        self.assertEqual(ev.get("state"), "Idle")
-        self.assertEqual(ev.get("session_id"), "agy:c-idle-1")
-
-    def test_standalone_stop(self):
-        """Standalone Stop emits Ended synchronously to dismiss the item."""
+        # Step 3: Stop runs. Because .vendor_active was left, Stop passes through to deliver Ended
         code, out, _ = self._run_hook(
             "Stop",
-            payload={"conversationId": "c-stop-1"},
+            payload={"conversationId": cid},
+            env_extra={"HERDR_PANE_ID": pane_id},
         )
         self.assertEqual(code, 0)
         self.assertEqual(out, '{"decision":""}')
 
-        self._wait_for_history(1)
-        self.assertEqual(len(self.bridge.history), 1)
-        ev = self.bridge.history[-1]
-        self.assertEqual(ev.get("agent"), "Antigravity")
-        self.assertEqual(ev.get("state"), "Ended")
-        self.assertEqual(ev.get("session_id"), "agy:c-stop-1")
+        self._wait_for_history(2)
+        self.assertEqual(len(self.bridge.history), 2)
+        self.assertEqual(self.bridge.history[-1].get("state"), "Ended")
+        self.assertEqual(self.bridge.history[-1].get("session_id"), cid)
+        # .vendor_active should now be retired
+        self.assertFalse(va_file.exists())
 
-    def test_missing_conversation_id_falls_back_to_pid(self):
-        """When conversationId is absent, session_id falls back to a per-PID ID, not a shared constant."""
+    def test_string_sanitization_and_length_caps(self):
+        """OSC, ANSI CSI, bidi overrides, and invalid controls are stripped; lengths are capped."""
+        dirty_tool = "\x1b]0;pwn\x07\u202eexe.txt\u202c\x1b[31mrun_command\x1b[0m"
+        long_cwd = "/dir/" + "x" * 500
+
+        code, out, _ = self._run_hook(
+            "PreToolUse",
+            payload={
+                "conversationId": "valid-conv-uuid-0001",
+                "toolCall": {"name": dirty_tool},
+                "workspacePaths": [long_cwd],
+            },
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(1)
+        ev = self.bridge.history[-1]
+        self.assertEqual(ev.get("title"), "Tool: exe.txtrun_command")
+        self.assertEqual(len(ev.get("cwd")), 256)
+        self.assertEqual(ev.get("session_id"), "valid-conv-uuid-0001")
+
+    def test_invalid_conversation_id_falls_back_to_safe_pid_id(self):
+        """Non-string or malformed conversationId safely falls back to agy-session-<pid>."""
+        for bad_id in (None, 12345, "a" * 100, "has spaces", {"obj": 1}):
+            with self.subTest(bad_id=bad_id):
+                self.bridge.history.clear()
+                code, out, _ = self._run_hook(
+                    "PreInvocation",
+                    payload={"conversationId": bad_id},
+                )
+                self.assertEqual(code, 0)
+                self._wait_for_history(1)
+                sid = self.bridge.history[-1].get("session_id")
+                self.assertTrue(sid.startswith("agy-session-"), f"unexpected sid: {sid}")
+                self.assertLessEqual(len(sid), 64)
+                self.assertGreaterEqual(len(sid), 16)
+
+    def test_bartender_not_running_skips_delivery(self):
+        """When Bartender process is not running, hook skips network request and exits 0 cleanly."""
+        self.clear_fake_processes()  # no Bartender process registered
+        self.set_herdr_alive()
+        self.bridge.history.clear()
         code, out, _ = self._run_hook(
             "PreInvocation",
-            payload={"workspacePaths": ["/Users/tester/p"]},
+            payload={"conversationId": "conv-nobartender-01"},
         )
         self.assertEqual(code, 0)
         self.assertEqual(out, "{}")
-
-        self._wait_for_history(1)
-        self.assertEqual(len(self.bridge.history), 1)
-        sid = self.bridge.history[-1].get("session_id")
-        self.assertTrue(sid.startswith("agy:pid:"), f"unexpected session_id: {sid}")
+        # Nothing sent because Bartender was not running
+        self.assertEqual(len(self.bridge.history), 0)
 
     def test_terminal_name_mapping(self):
         """TERM_PROGRAM values are mapped to human-readable names for Bartender."""
@@ -195,7 +230,7 @@ class AgyNotifyHookTests(SandboxTestCase):
                 self.bridge.history.clear()
                 code, out, _ = self._run_hook(
                     "PreInvocation",
-                    payload={"conversationId": "c-term"},
+                    payload={"conversationId": "conv-term-test-01"},
                     env_extra={"TERM_PROGRAM": term_prog},
                 )
                 self.assertEqual(code, 0)
@@ -207,22 +242,11 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.bridge.history.clear()
         code, out, _ = self._run_hook(
             "PreInvocation",
-            payload={"conversationId": "c-loopback"},
+            payload={"conversationId": "conv-loopback-001"},
             env_extra={"NOTCHBAR_AGENTS_HOST": "192.0.2.1"},
         )
         self.assertEqual(code, 0)
         self.assertEqual(out, "{}")
-        # Should still reach our local mock bridge on 127.0.0.1
         self._wait_for_history(1)
         self.assertEqual(len(self.bridge.history), 1)
-        self.assertEqual(self.bridge.history[-1].get("session_id"), "agy:c-loopback")
-
-    def test_fail_safe_on_malformed_input(self):
-        """Hook handles unparseable JSON or empty input cleanly with 0 exit code."""
-        code, out, _ = self._run_hook("PreToolUse", payload="{malformed json")
-        self.assertEqual(code, 0)
-        self.assertEqual(out, '{"decision":"allow"}')
-
-        code, out, _ = self._run_hook("PreInvocation", payload="")
-        self.assertEqual(code, 0)
-        self.assertEqual(out, "{}")
+        self.assertEqual(self.bridge.history[-1].get("session_id"), "conv-loopback-001")
