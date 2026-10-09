@@ -1,13 +1,69 @@
 #!/bin/bash
 set -u
 
-HOST="${NOTCHBAR_AGENTS_HOST:-127.0.0.1}"
+# Strictly loopback only (Plan §8: literal loopback, no hostname resolution, no remote proxy)
+HOST="127.0.0.1"
 PORT="${NOTCHBAR_AGENTS_PORT:-7823}"
+if ! printf '%s' "$PORT" | grep -Eq '^[0-9]{1,5}$' || [ "$PORT" -lt 1024 ] || [ "$PORT" -gt 65535 ]; then
+  PORT=7823
+fi
+
 EVENT="${AGY_HOOK_EVENT:-${1:-}}"
 
-# If running inside a Herdr pane, suppress direct Bartender notifications.
-# Herdr's native agent detection and herdr-bartender handle Top Shelf deduplication.
-if [ -n "${HERDR_PANE_ID:-}" ]; then
+# Check if Bartender 6 / Bartender is running (matching Python is_bartender_alive)
+is_bartender_alive() {
+  pgrep -xi "Bartender 6" >/dev/null 2>&1 \
+    || pgrep -xi "Bartender" >/dev/null 2>&1 \
+    || pgrep -f '^[^[:space:]]*/Bartender( 6)?\.app/Contents/MacOS/' >/dev/null 2>&1
+}
+
+# Check if Herdr is demonstrably healthy and actively owns this pane.
+# If Herdr is dead, disabled, or the marker is stale/missing, fail open so standalone
+# agy still reports to Bartender Top Shelf.
+is_herdr_owning_pane() {
+  [ -n "${HERDR_PANE_ID:-}" ] || return 1
+  printf '%s' "$HERDR_PANE_ID" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_:-]{1,48}$' || return 1
+
+  local canonical_pane=""
+  if printf '%s' "$HERDR_PANE_ID" | grep -q ':'; then
+    canonical_pane="$HERDR_PANE_ID"
+  elif [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
+    canonical_pane="${HERDR_WORKSPACE_ID}:${HERDR_PANE_ID}"
+  fi
+  [ -n "$canonical_pane" ] || return 1
+  printf '%s' "$canonical_pane" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_:-]{1,48}$' || return 1
+
+  local state_home="${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/herdr-bartender}"
+  local hex_pane
+  hex_pane=$(printf '%s' "$canonical_pane" | LC_ALL=C od -An -v -tx1 | tr -d ' \t\n')
+  local pane_marker="${state_home}/panes/${hex_pane}"
+
+  # Flag files: if disabled or delivery down, do not suppress
+  [ -e "${state_home}/DISABLED" ] && return 1
+  [ -e "${state_home}/DELIVERY_DOWN" ] && return 1
+
+  # Marker must exist and not be failed
+  [ -f "$pane_marker" ] && [ ! -L "$pane_marker" ] || return 1
+  [ -e "${pane_marker}.failed" ] && return 1
+
+  # Marker freshness: mtime within 60s
+  local mtime now age
+  mtime=$(stat -c %Y "$pane_marker" 2>/dev/null || stat -f %m "$pane_marker" 2>/dev/null || echo 0)
+  now=$(date +%s 2>/dev/null || echo 0)
+  age=$(( now - mtime ))
+  [ "$age" -ge 0 ] && [ "$age" -lt 60 ] || return 1
+
+  # Herdr process must be alive
+  if pgrep -a -xi "herdr" >/dev/null 2>&1 || pgrep -a -f '^[^[:space:]]*/Herdr\.app/Contents/MacOS/' >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+# If Herdr actively owns this pane, suppress standalone reporting to prevent duplicate entries
+if is_herdr_owning_pane; then
+  # Drain bounded stdin to avoid EPIPE in caller
+  { head -c 65536 >/dev/null 2>&1 || cat >/dev/null 2>&1; } || true
   case "$EVENT" in
     PreToolUse) printf '{"decision":"allow"}\n' ;;
     Stop) printf '{"decision":""}\n' ;;
@@ -16,8 +72,8 @@ if [ -n "${HERDR_PANE_ID:-}" ]; then
   exit 0
 fi
 
-# Drain stdin safely
-HOOK_JSON=$(cat 2>/dev/null || true)
+# Drain bounded stdin safely (cap at 64 KiB)
+HOOK_JSON=$(head -c 65536 2>/dev/null || true)
 if [ -z "${HOOK_JSON:-}" ]; then
   HOOK_JSON='{}'
 fi
@@ -74,9 +130,14 @@ else:
     state = "Working" if "Pre" in event else "Idle"
     title = ""
 
-# Conversation / Session ID
+try:
+    pid = int(os.environ.get("AGENT_PID") or 0) or None
+except Exception:
+    pid = None
+
+# Conversation / Session ID (per-process fallback prevents cross-session collision)
 conv_id = d.get("conversationId") or ""
-session_id = f"agy:{conv_id}" if conv_id else "agy:default"
+session_id = f"agy:{conv_id}" if conv_id else f"agy:pid:{pid or os.getpid()}"
 
 # Working directory
 ws = d.get("workspacePaths")
@@ -100,11 +161,6 @@ term_map = {
 }
 raw_term = os.environ.get("TERM_PROGRAM") or ""
 
-try:
-    pid = int(os.environ.get("AGENT_PID") or 0) or None
-except Exception:
-    pid = None
-
 sys.stdout.write(json.dumps({
     "state": state,
     "agent": "Antigravity",
@@ -119,18 +175,22 @@ PY
 )
 
 if [ -z "${payload:-}" ]; then
-  payload="{\"state\":\"Working\",\"agent\":\"Antigravity\"}"
+  payload="{\"state\":\"Working\",\"agent\":\"Antigravity\",\"session_id\":\"agy:pid:${AGENT_PID}\"}"
 fi
 
-# Send event to Bartender NotchBar / Top Shelf server
-if [ "$EVENT" = "Stop" ]; then
-  curl -s -m 2 -X POST "http://${HOST}:${PORT}/event" \
+# Send event synchronously with tight timeout. Strictly loopback, no proxies, no redirects.
+# Synchronous delivery guarantees events arrive in strict chronological order and
+# cannot race or land after Stop.
+if is_bartender_alive; then
+  curl -s \
+    --noproxy '*' \
+    --max-redirs 0 \
+    --proto =http \
+    --connect-timeout 0.15 \
+    --max-time 0.5 \
+    -X POST "http://${HOST}:${PORT}/event" \
     -H 'Content-Type: application/json' \
-    --data-raw "$payload" >/dev/null 2>&1
-else
-  curl -s -m 1 -X POST "http://${HOST}:${PORT}/event" \
-    -H 'Content-Type: application/json' \
-    --data-raw "$payload" >/dev/null 2>&1 &
+    --data-raw "$payload" >/dev/null 2>&1 || true
 fi
 
 # Emit expected JSON response to stdout for Antigravity lifecycle

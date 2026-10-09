@@ -53,8 +53,14 @@ class AgyNotifyHookTests(SandboxTestCase):
         while len(self.bridge.history) < count and (time.monotonic() - t0) < timeout:
             time.sleep(0.02)
 
-    def test_herdr_pane_suppression(self):
-        """When HERDR_PANE_ID is set, the hook immediately suppresses output and makes zero network calls."""
+    def test_herdr_pane_suppression_when_healthy(self):
+        """When HERDR_PANE_ID is set AND Herdr is healthy (fresh marker + process alive), the hook suppresses."""
+        # Create fresh pane marker for ws1:p10
+        hex_pane = "ws1:p10".encode("utf-8").hex()
+        marker = self.state_dir / "panes" / hex_pane
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("active")
+
         for event, expected_stdout in (
             ("PreInvocation", "{}"),
             ("PreToolUse", '{"decision":"allow"}'),
@@ -72,6 +78,21 @@ class AgyNotifyHookTests(SandboxTestCase):
 
         # Confirm no events were delivered to the bridge
         self.assertEqual(len(self.bridge.history), 0)
+
+    def test_herdr_pane_fails_open_when_unhealthy(self):
+        """When HERDR_PANE_ID is set but Herdr is dead or marker missing, suppression fails open and delivers."""
+        # No pane marker created -> Herdr not actively managing pane
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "c-unhealthy"},
+            env_extra={"HERDR_PANE_ID": "ws1:pUnhealthy"},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "{}")
+
+        self._wait_for_history(1)
+        self.assertEqual(len(self.bridge.history), 1)
+        self.assertEqual(self.bridge.history[-1].get("session_id"), "agy:c-unhealthy")
 
     def test_standalone_pre_invocation(self):
         """Standalone PreInvocation emits Working with Thinking... title to Bartender."""
@@ -146,6 +167,20 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(ev.get("state"), "Ended")
         self.assertEqual(ev.get("session_id"), "agy:c-stop-1")
 
+    def test_missing_conversation_id_falls_back_to_pid(self):
+        """When conversationId is absent, session_id falls back to a per-PID ID, not a shared constant."""
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"workspacePaths": ["/Users/tester/p"]},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "{}")
+
+        self._wait_for_history(1)
+        self.assertEqual(len(self.bridge.history), 1)
+        sid = self.bridge.history[-1].get("session_id")
+        self.assertTrue(sid.startswith("agy:pid:"), f"unexpected session_id: {sid}")
+
     def test_terminal_name_mapping(self):
         """TERM_PROGRAM values are mapped to human-readable names for Bartender."""
         cases = [
@@ -166,6 +201,21 @@ class AgyNotifyHookTests(SandboxTestCase):
                 self.assertEqual(code, 0)
                 self._wait_for_history(1)
                 self.assertEqual(self.bridge.history[-1].get("terminal"), expected_name)
+
+    def test_loopback_only_ignores_notchbar_agents_host(self):
+        """Hook strictly connects to 127.0.0.1, ignoring NOTCHBAR_AGENTS_HOST."""
+        self.bridge.history.clear()
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "c-loopback"},
+            env_extra={"NOTCHBAR_AGENTS_HOST": "192.0.2.1"},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "{}")
+        # Should still reach our local mock bridge on 127.0.0.1
+        self._wait_for_history(1)
+        self.assertEqual(len(self.bridge.history), 1)
+        self.assertEqual(self.bridge.history[-1].get("session_id"), "agy:c-loopback")
 
     def test_fail_safe_on_malformed_input(self):
         """Hook handles unparseable JSON or empty input cleanly with 0 exit code."""
