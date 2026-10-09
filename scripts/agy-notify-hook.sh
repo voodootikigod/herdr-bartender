@@ -12,7 +12,7 @@ fi
 
 # Whitelist EVENT strictly to prevent injection into JSON or logic
 case "$EVENT" in
-  PreInvocation|PreToolUse|PostInvocation|Stop) ;;
+  PreInvocation|PreToolUse|PostInvocation|Stop|SessionEnd) ;;
   *) EVENT="" ;;
 esac
 
@@ -80,6 +80,24 @@ is_herdr_owning_pane() {
   return 1
 }
 
+# Safely claim and retire a .vendor_active file (mirroring vendor.retire_vendor_file).
+# Checks that the claimed file still holds expected_sid; if rewritten concurrently,
+# restores the newer record so it is never lost.
+retire_vendor_file() {
+  local target="$1"
+  local expected_sid="$2"
+  [ -f "$target" ] || return 0
+  local claim="${target}.claim-$$-$(date +%s%N 2>/dev/null || date +%s 2>/dev/null || echo $$)"
+  if mv -f "$target" "$claim" 2>/dev/null; then
+    if grep -q "\"vendor_session_id\"[[:space:]]*:[[:space:]]*\"${expected_sid}\"" "$claim" 2>/dev/null; then
+      rm -f "$claim" 2>/dev/null || true
+    else
+      # Newer record written concurrently: restore it so newer session is never lost
+      mv -n "$claim" "$target" 2>/dev/null || rm -f "$claim" 2>/dev/null || true
+    fi
+  fi
+}
+
 # If Herdr actively owns this pane:
 # - If an earlier fail-open wrote .vendor_active, attempt dismissal of the direct entry.
 #   Only retire .vendor_active if dismissal was confirmed by HTTP 200. If delivery fails
@@ -100,17 +118,14 @@ if is_herdr_owning_pane; then
         -H 'Content-Type: application/json' \
         --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${prev_sid}\"}" 2>/dev/null || echo "000")
       if [ "$http_code" = "200" ]; then
-        claim_file="${VENDOR_ACTIVE}.claim-$$-$(date +%s%N 2>/dev/null || date +%s 2>/dev/null || echo $$)"
-        if mv -f "$VENDOR_ACTIVE" "$claim_file" 2>/dev/null; then
-          rm -f "$claim_file" 2>/dev/null || true
-        fi
+        retire_vendor_file "$VENDOR_ACTIVE" "$prev_sid"
       fi
     fi
   fi
 
   case "$EVENT" in
     PreToolUse) printf '{"decision":"allow"}\n' ;;
-    Stop) printf '{"decision":""}\n' ;;
+    Stop|SessionEnd) printf '{"decision":""}\n' ;;
     *) printf '{}\n' ;;
   esac
   exit 0
@@ -209,14 +224,16 @@ try:
 except Exception:
     d = {}
 
-event = os.environ.get("EVENT") or d.get("hook_event_name") or ""
-event = sanitize_str(event, 64)
+event = os.environ.get("EVENT") or ""
+if not event:
+    sys.stdout.write("SKIP")
+    sys.exit(0)
 
 # Antigravity lifecycle mapping:
 # PreInvocation -> turn starts, model thinking -> Working
 # PreToolUse -> tool call started -> Working
 # PostInvocation -> tool calls finished, model turn complete -> Idle
-# Stop -> execution loop terminated -> Ended
+# Stop / SessionEnd -> execution terminated -> Ended
 if event == "PreInvocation":
     state = "Working"
     title = "Thinking..."
@@ -229,7 +246,7 @@ elif event == "PreToolUse":
 elif event == "PostInvocation":
     state = "Idle"
     title = ""
-elif event == "Stop":
+elif event in ("Stop", "SessionEnd"):
     state = "Ended"
     title = ""
 else:
@@ -262,7 +279,7 @@ if not (isinstance(conv_id, str) and re.match(r"^[a-zA-Z0-9_-]{16,64}\Z", conv_i
 
 if conv_id:
     session_id = conv_id
-elif parse_ok or event == "Stop":
+elif parse_ok or event in ("Stop", "SessionEnd"):
     # Stable fallback session ID incorporating workspace, terminal session, TTY, and agent PID
     term_sess = os.environ.get("TERM_SESSION_ID", "")
     agent_tty = os.environ.get("AGENT_TTY", "")
@@ -308,7 +325,7 @@ sys.stdout.write(f"{session_id}\n{payload_json}")
   if [ "$py_output" = "SKIP" ]; then
     case "$EVENT" in
       PreToolUse) printf '{"decision":"allow"}\n' ;;
-      Stop) printf '{"decision":""}\n' ;;
+      Stop|SessionEnd) printf '{"decision":""}\n' ;;
       *) printf '{}\n' ;;
     esac
     exit 0
@@ -321,8 +338,16 @@ fi
 
 # Resilient fallback if Python is unavailable
 if [ -z "${payload:-}" ]; then
+  if [ -z "$EVENT" ]; then
+    case "$EVENT" in
+      PreToolUse) printf '{"decision":"allow"}\n' ;;
+      Stop|SessionEnd) printf '{"decision":""}\n' ;;
+      *) printf '{}\n' ;;
+    esac
+    exit 0
+  fi
   case "$EVENT" in
-    Stop) FB_STATE="Ended" ;;
+    Stop|SessionEnd) FB_STATE="Ended" ;;
     PostInvocation) FB_STATE="Idle" ;;
     *) FB_STATE="Working" ;;
   esac
@@ -335,7 +360,7 @@ if [ -z "${payload:-}" ]; then
 fi
 
 # On non-Stop events, record or update .vendor_active during fail-open window
-if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ]; then
+if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVENT" != "SessionEnd" ]; then
   mkdir -m 700 -p "${STATE_HOME}/panes" 2>/dev/null || true
   TMP_VA=$(mktemp "${STATE_HOME}/panes/.va.tmp.XXXXXX" 2>/dev/null || true)
   if [ -n "$TMP_VA" ]; then
@@ -359,19 +384,16 @@ if is_bartender_alive; then
     --data-raw "$payload" 2>/dev/null || echo "000")
 fi
 
-# On Stop, retire .vendor_active ONLY if dismissal was confirmed by HTTP 200.
+# On Stop/SessionEnd, retire .vendor_active ONLY if dismissal was confirmed by HTTP 200.
 # If delivery timed out or failed, keep .vendor_active intact so Herdr reconciler retries.
-if [ -n "$VENDOR_ACTIVE" ] && [ "$EVENT" = "Stop" ] && [ "$http_code" = "200" ]; then
-  claim_file="${VENDOR_ACTIVE}.claim-$$-$(date +%s%N 2>/dev/null || date +%s 2>/dev/null || echo $$)"
-  if mv -f "$VENDOR_ACTIVE" "$claim_file" 2>/dev/null; then
-    rm -f "$claim_file" 2>/dev/null || true
-  fi
+if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEnd" ]; } && [ "$http_code" = "200" ]; then
+  retire_vendor_file "$VENDOR_ACTIVE" "$SID"
 fi
 
 # Emit expected JSON response to stdout for Antigravity lifecycle
 case "$EVENT" in
   PreToolUse) printf '{"decision":"allow"}\n' ;;
-  Stop) printf '{"decision":""}\n' ;;
+  Stop|SessionEnd) printf '{"decision":""}\n' ;;
   *) printf '{}\n' ;;
 esac
 

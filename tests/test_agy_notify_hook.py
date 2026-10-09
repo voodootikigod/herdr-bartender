@@ -513,11 +513,11 @@ class AgyNotifyHookTests(SandboxTestCase):
         sid3 = self.bridge.history[-1].get("session_id", "")
         self.assertTrue(sid3.startswith("agy-fallback-"), f"expected agy-fallback- prefix, got {sid3}")
 
-        # 4. Injected event -> whitelisted to empty, safe fallback
+        # 4. Injected event -> whitelisted to empty, delivery is skipped safely
         code, out, _ = self._run_hook('Stop"; injection', payload={}, env_extra=env)
         self.assertEqual(code, 0)
-        self._wait_for_history(4)
-        self.assertEqual(self.bridge.history[-1].get("event"), "")
+        time.sleep(0.1)
+        self.assertEqual(len(self.bridge.history), 3)
 
     def test_bartender_not_running_skips_delivery(self):
         """When Bartender process is not running, hook skips network request and exits 0 cleanly."""
