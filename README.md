@@ -132,8 +132,58 @@ The guard suppresses a vendor notification only while Herdr demonstrably owns th
 Antigravity CLI sessions are fully supported both inside Herdr panes and standalone across Ghostty, iTerm2, Terminal.app, Warp, and VS Code:
 
 - **Inside Herdr**: Herdr natively detects `agy` and emits `pane.agent_status_changed`. The plugin translates this to `Antigravity (Herdr)` on Top Shelf.
-- **Standalone `agy`**: Standalone sessions report directly to Bartender Top Shelf via `scripts/agy-notify-hook.sh`. The hook integrates into Antigravity lifecycle events (`PreInvocation`, `PreToolUse`, `PostInvocation`, `Stop`) via `~/.gemini/config/hooks.json`.
-- **Automatic Deduplication**: If an `agy` session runs within Herdr (`HERDR_PANE_ID` is set in the environment), `agy-notify-hook.sh` suppresses direct Bartender notifications so `herdr-bartender` manages Top Shelf updates with zero duplicate entries.
+- **Standalone `agy`**: Standalone sessions report directly to Bartender Top Shelf via `scripts/agy-notify-hook.sh`. The hook integrates into Antigravity lifecycle events via `~/.gemini/config/hooks.json`:
+  - `PreInvocation`: Model generation starts / user submits prompt $\rightarrow$ `Working` (`"Thinking..."`)
+  - `PreToolUse`: Model starts executing a tool step $\rightarrow$ `Working` (`"Tool: <tool_name>"`)
+  - `PostInvocation`: Model completes its turn and awaits user input $\rightarrow$ `Idle`
+  - `Stop`: Agent execution loop terminates $\rightarrow$ `Ended` (dismisses Top Shelf item)
+- **Automatic Deduplication & Handoff**: If an `agy` session runs within Herdr (`HERDR_PANE_ID` is set):
+  - While Herdr is healthy, direct notifications are suppressed so `herdr-bartender` manages Top Shelf updates with zero duplicate entries.
+  - If Herdr is temporarily down or recovering, the hook fails open, records `.vendor_active`, and preserves `Stop` to ensure direct entries are cleanly dismissed when the session exits.
+
+### Standalone Hook Configuration (`~/.gemini/config/hooks.json`)
+
+To enable standalone `agy` reporting, copy `scripts/agy-notify-hook.sh` to `~/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks/agy-notify-hook.sh` (or keep it in the repo) and add the following entry to `~/.gemini/config/hooks.json`:
+
+```json
+{
+  "bartender-topshelf": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "if [ -x \"$HOME/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks/agy-notify-hook.sh\" ]; then AGY_HOOK_EVENT='PreInvocation' \"$HOME/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks/agy-notify-hook.sh\"; else printf '{}\\n'; fi",
+        "timeout": 5
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -x \"$HOME/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks/agy-notify-hook.sh\" ]; then AGY_HOOK_EVENT='PreToolUse' \"$HOME/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks/agy-notify-hook.sh\"; else printf '{\"decision\":\"allow\"}\\n'; fi",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "if [ -x \"$HOME/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks/agy-notify-hook.sh\" ]; then AGY_HOOK_EVENT='PostInvocation' \"$HOME/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks/agy-notify-hook.sh\"; else printf '{}\\n'; fi",
+        "timeout": 5
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "if [ -x \"$HOME/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks/agy-notify-hook.sh\" ]; then AGY_HOOK_EVENT='Stop' \"$HOME/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks/agy-notify-hook.sh\"; else printf '{\"decision\":\"\"}\\n'; fi",
+        "timeout": 5
+      }
+    ]
+  }
+}
+```
 
 ## CLI reference
 

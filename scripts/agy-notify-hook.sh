@@ -1,14 +1,24 @@
 #!/bin/bash
 set -u
 
+# Drain bounded stdin safely (cap at 64 KiB) once at the start of execution
+HOOK_JSON=$(head -c 65536 2>/dev/null || true)
+if [ -z "${HOOK_JSON:-}" ]; then
+  HOOK_JSON='{}'
+fi
+
+# Resolve EVENT from AGY_HOOK_EVENT, argv $1, or top-level hook_event_name in JSON
+EVENT="${AGY_HOOK_EVENT:-${1:-}}"
+if [ -z "$EVENT" ]; then
+  EVENT=$(printf '%s' "$HOOK_JSON" | LC_ALL=C grep -o '"hook_event_name"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+fi
+
 # Strictly loopback only (Plan §8: literal loopback, no hostname resolution, no remote proxy)
 HOST="127.0.0.1"
 PORT="${NOTCHBAR_AGENTS_PORT:-7823}"
 if ! printf '%s' "$PORT" | grep -Eq '^[0-9]{1,5}$' || [ "$PORT" -lt 1024 ] || [ "$PORT" -gt 65535 ]; then
   PORT=7823
 fi
-
-EVENT="${AGY_HOOK_EVENT:-${1:-}}"
 
 # Check if Bartender 6 / Bartender is running (matching Python is_bartender_alive)
 is_bartender_alive() {
@@ -68,15 +78,13 @@ is_herdr_owning_pane() {
 }
 
 # If Herdr actively owns this pane:
-# - If an earlier fail-open left .vendor_active, allow Stop through so the direct entry is ended
+# - If an earlier fail-open left .vendor_active on this pane, let Stop through so the direct entry is ended
 # - Otherwise suppress standalone reporting to prevent duplicate entries
 if is_herdr_owning_pane; then
   if [ -n "$VENDOR_ACTIVE" ] && [ -f "$VENDOR_ACTIVE" ] && [ "$EVENT" = "Stop" ]; then
     # Do not suppress: fall through to deliver Ended and retire .vendor_active
     :
   else
-    # Drain bounded stdin to avoid EPIPE in caller
-    { head -c 65536 >/dev/null 2>&1 || cat >/dev/null 2>&1; } || true
     case "$EVENT" in
       PreToolUse) printf '{"decision":"allow"}\n' ;;
       Stop) printf '{"decision":""}\n' ;;
@@ -86,20 +94,15 @@ if is_herdr_owning_pane; then
   fi
 fi
 
-# Drain bounded stdin safely (cap at 64 KiB)
-HOOK_JSON=$(head -c 65536 2>/dev/null || true)
-if [ -z "${HOOK_JSON:-}" ]; then
-  HOOK_JSON='{}'
-fi
-
-# Find agent PID (search for agy or fallback to PPID)
+# Find agent PID (search up process tree checking comm and command line for agy/antigravity)
 find_agent_pid() {
   local pid=$PPID
-  local max=6
+  local max=8
   while [ "$max" -gt 0 ] && [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
-    local name
-    name=$(ps -o comm= -p "$pid" 2>/dev/null)
-    case "$name" in
+    local comm args
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null || true)
+    args=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    case "$comm $args" in
       *agy*|*antigravity*|*Antigravity*) echo "$pid"; return 0 ;;
     esac
     pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
@@ -115,7 +118,7 @@ AGENT_PID="$(find_agent_pid 2>/dev/null || echo "$$")"
 # and strict length caps.
 payload=$(
   EVENT="$EVENT" HOOK_JSON="$HOOK_JSON" TERM_PROGRAM="${TERM_PROGRAM:-}" AGENT_PID="${AGENT_PID:-}" /usr/bin/python3 - <<'PY' 2>/dev/null
-import json, os, re, sys
+import hashlib, json, os, re, sys
 
 CSI_RE = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]")
 OSC_RE = re.compile(r"(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c|$)")
@@ -148,7 +151,11 @@ except Exception:
 event = os.environ.get("EVENT") or d.get("hook_event_name") or ""
 event = sanitize_str(event, 64)
 
-# Map state and title
+# Antigravity lifecycle mapping:
+# PreInvocation -> turn starts, model thinking -> Working
+# PreToolUse -> tool call started -> Working
+# PostInvocation -> tool calls finished, model turn complete -> Idle
+# Stop -> execution loop terminated -> Ended
 if event == "PreInvocation":
     state = "Working"
     title = "Thinking..."
@@ -173,15 +180,6 @@ try:
 except Exception:
     pid = None
 
-# Conversation / Session ID:
-# Strict format validation: 16 to 64 chars [a-zA-Z0-9_-] (matching VENDOR_UUID_REGEX)
-conv_id = d.get("conversationId")
-if isinstance(conv_id, str) and re.match(r'^[a-zA-Z0-9_-]{16,64}\Z', conv_id):
-    session_id = conv_id
-else:
-    # 16+ char fallback compatible with VENDOR_UUID_REGEX
-    session_id = f"agy-session-{pid or os.getpid()}"[:64]
-
 # Working directory
 ws = d.get("workspacePaths")
 if isinstance(ws, list) and ws and isinstance(ws[0], str):
@@ -189,6 +187,17 @@ if isinstance(ws, list) and ws and isinstance(ws[0], str):
 else:
     raw_cwd = d.get("cwd") or os.getcwd()
 cwd = sanitize_str(raw_cwd, 256)
+
+# Conversation / Session ID:
+# Strict format validation: 16 to 64 chars [a-zA-Z0-9_-] (matching VENDOR_UUID_REGEX)
+conv_id = d.get("conversationId")
+if isinstance(conv_id, str) and re.match(r'^[a-zA-Z0-9_-]{16,64}\Z', conv_id):
+    session_id = conv_id
+else:
+    # Deterministic fallback per session/workspace (16-64 chars [a-zA-Z0-9_-])
+    seed = f"{raw_cwd}:{os.environ.get('TERM_SESSION_ID', '')}:{os.environ.get('TTY', '')}:{pid}"
+    h = hashlib.sha256(seed.encode('utf-8')).hexdigest()[:24]
+    session_id = f"agy-session-{h}"
 
 # Terminal mapping
 term_map = {
@@ -219,13 +228,19 @@ sys.stdout.write(json.dumps({
 PY
 )
 
+# Resilient fallback if Python is unavailable
 if [ -z "${payload:-}" ]; then
+  case "$EVENT" in
+    Stop) FB_STATE="Ended" ;;
+    PostInvocation) FB_STATE="Idle" ;;
+    *) FB_STATE="Working" ;;
+  esac
   FALLBACK_SID="agy-session-${AGENT_PID}"
-  payload="{\"state\":\"Working\",\"agent\":\"Antigravity\",\"session_id\":\"${FALLBACK_SID}\"}"
+  payload="{\"state\":\"${FB_STATE}\",\"agent\":\"Antigravity\",\"event\":\"${EVENT}\",\"session_id\":\"${FALLBACK_SID}\"}"
 fi
 
 # Extract session_id from payload for .vendor_active management
-SID=$(printf '%s' "$payload" | /usr/bin/python3 -c 'import json, sys; d=json.load(sys.stdin); sys.stdout.write(d.get("session_id") or "")' 2>/dev/null || true)
+SID=$(printf '%s' "$payload" | /usr/bin/python3 -c 'import json, sys; d=json.load(sys.stdin); sys.stdout.write(d.get("session_id") or "")' 2>/dev/null || echo "agy-session-${AGENT_PID}")
 
 # Record or retire .vendor_active if running within a Herdr pane during a fail-open window
 if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ]; then

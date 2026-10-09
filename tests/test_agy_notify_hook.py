@@ -18,16 +18,20 @@ class AgyNotifyHookTests(SandboxTestCase):
 
     def _run_hook(
         self,
-        event: str,
+        event: str | None,
         payload: dict | str | None = None,
         env_extra: dict[str, str] | None = None,
     ) -> tuple[int, str, str]:
         env = {
             **os.environ,
-            "AGY_HOOK_EVENT": event,
             "NOTCHBAR_AGENTS_HOST": "127.0.0.1",
             "NOTCHBAR_AGENTS_PORT": str(self.bridge.port),
         }
+        if event is not None:
+            env["AGY_HOOK_EVENT"] = event
+        else:
+            env.pop("AGY_HOOK_EVENT", None)
+
         if env_extra:
             env.update(env_extra)
 
@@ -166,6 +170,37 @@ class AgyNotifyHookTests(SandboxTestCase):
         # .vendor_active should now be retired
         self.assertFalse(va_file.exists())
 
+    def test_event_resolved_from_json_body_alone(self):
+        """When AGY_HOOK_EVENT and argv are unset, EVENT is correctly resolved from hook_event_name in JSON."""
+        # 1. PreToolUse in JSON
+        self.bridge.history.clear()
+        code, out, _ = self._run_hook(
+            None,
+            payload={
+                "hook_event_name": "PreToolUse",
+                "conversationId": "conv-json-event-001",
+                "toolCall": {"name": "run_command"},
+            },
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":"allow"}')
+        self._wait_for_history(1)
+        self.assertEqual(self.bridge.history[-1].get("state"), "Working")
+        self.assertEqual(self.bridge.history[-1].get("title"), "Tool: run_command")
+
+        # 2. Stop in JSON
+        code, out, _ = self._run_hook(
+            None,
+            payload={
+                "hook_event_name": "Stop",
+                "conversationId": "conv-json-event-001",
+            },
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":""}')
+        self._wait_for_history(2)
+        self.assertEqual(self.bridge.history[-1].get("state"), "Ended")
+
     def test_string_sanitization_and_length_caps(self):
         """OSC, ANSI CSI, bidi overrides, and invalid controls are stripped; lengths are capped."""
         dirty_tool = "\x1b]0;pwn\x07\u202eexe.txt\u202c\x1b[31mrun_command\x1b[0m"
@@ -186,21 +221,71 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(len(ev.get("cwd")), 256)
         self.assertEqual(ev.get("session_id"), "valid-conv-uuid-0001")
 
-    def test_invalid_conversation_id_falls_back_to_safe_pid_id(self):
-        """Non-string or malformed conversationId safely falls back to agy-session-<pid>."""
+    def test_invalid_conversation_id_falls_back_to_safe_deterministic_id(self):
+        """Non-string or malformed conversationId safely falls back to a deterministic 36-char session ID."""
         for bad_id in (None, 12345, "a" * 100, "has spaces", {"obj": 1}):
             with self.subTest(bad_id=bad_id):
                 self.bridge.history.clear()
                 code, out, _ = self._run_hook(
                     "PreInvocation",
-                    payload={"conversationId": bad_id},
+                    payload={"conversationId": bad_id, "workspacePaths": ["/Users/tester/proj1"]},
                 )
                 self.assertEqual(code, 0)
                 self._wait_for_history(1)
                 sid = self.bridge.history[-1].get("session_id")
                 self.assertTrue(sid.startswith("agy-session-"), f"unexpected sid: {sid}")
-                self.assertLessEqual(len(sid), 64)
-                self.assertGreaterEqual(len(sid), 16)
+                self.assertEqual(len(sid), 36)
+
+    def test_stable_fallback_session_id_across_calls(self):
+        """Two hook calls without conversationId in the same workspace produce the identical session ID."""
+        self.bridge.history.clear()
+        payload = {"workspacePaths": ["/Users/tester/same_project"]}
+
+        # Call 1: PreInvocation
+        code1, _, _ = self._run_hook("PreInvocation", payload=payload)
+        self.assertEqual(code1, 0)
+        self._wait_for_history(1)
+        sid1 = self.bridge.history[-1].get("session_id")
+
+        # Call 2: PostInvocation
+        code2, _, _ = self._run_hook("PostInvocation", payload=payload)
+        self.assertEqual(code2, 0)
+        self._wait_for_history(2)
+        sid2 = self.bridge.history[-1].get("session_id")
+
+        self.assertEqual(sid1, sid2)
+        self.assertTrue(sid1.startswith("agy-session-"))
+
+    def test_python_unavailable_fallback(self):
+        """When Python is unavailable, bash fallback correctly maps Stop to Ended and PostInvocation to Idle."""
+        no_py_dir = self.tmp / "no-py-bin"
+        no_py_dir.mkdir(parents=True, exist_ok=True)
+        # Create a failing / non-executable python3 shim in front of PATH
+        fake_py = no_py_dir / "python3"
+        fake_py.write_text("#!/bin/sh\nexit 127\n")
+        fake_py.chmod(0o755)
+
+        env = {"PATH": f"{no_py_dir}:{os.environ.get('PATH', '')}"}
+
+        # 1. PreInvocation -> Working
+        self.bridge.history.clear()
+        code, out, _ = self._run_hook("PreInvocation", payload={}, env_extra=env)
+        self.assertEqual(code, 0)
+        self._wait_for_history(1)
+        self.assertEqual(self.bridge.history[-1].get("state"), "Working")
+
+        # 2. PostInvocation -> Idle
+        code, out, _ = self._run_hook("PostInvocation", payload={}, env_extra=env)
+        self.assertEqual(code, 0)
+        self._wait_for_history(2)
+        self.assertEqual(self.bridge.history[-1].get("state"), "Idle")
+
+        # 3. Stop -> Ended
+        code, out, _ = self._run_hook("Stop", payload={}, env_extra=env)
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":""}')
+        self._wait_for_history(3)
+        self.assertEqual(self.bridge.history[-1].get("state"), "Ended")
 
     def test_bartender_not_running_skips_delivery(self):
         """When Bartender process is not running, hook skips network request and exits 0 cleanly."""
