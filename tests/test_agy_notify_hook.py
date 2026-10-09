@@ -208,6 +208,41 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(self.bridge.history[-1].get("session_id"), cid)
         self.assertFalse(va_file.exists(), ".vendor_active must be unlinked upon handoff dismissal")
 
+    def test_fail_open_recover_failed_dismissal_preserves_vendor_active(self):
+        """When dismissal delivery fails (e.g. Bartender dead), .vendor_active is NOT unlinked and remains for reconciler."""
+        pane_id = "ws1:pFailDismiss"
+        hex_pane = pane_id.encode("utf-8").hex()
+        cid = "conv-fail-dismiss-0001"
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+
+        # Step 1: PreInvocation fails open
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": cid},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(1)
+        self.assertTrue(va_file.exists())
+
+        # Step 2: Herdr recovers and creates fresh marker
+        self._fresh_marker(pane_id)
+
+        # Step 3: Clear fake processes so Bartender is not alive
+        self.clear_fake_processes()
+
+        # Step 4: PostInvocation arrives while Herdr is healthy but Bartender is dead
+        code, out, _ = self._run_hook(
+            "PostInvocation",
+            payload={"conversationId": cid},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "{}")
+
+        # .vendor_active MUST STILL EXIST so Herdr's reconciler can stage and retry!
+        self.assertTrue(va_file.exists(), ".vendor_active must be preserved when dismissal was not confirmed")
+
     def test_subshell_wrapper_preserves_stable_session_id(self):
         """Spawning via the README sh -c wrapper produces stable session IDs across invocations without conversationId."""
         self.bridge.history.clear()
@@ -325,6 +360,56 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(sid1, sid2)
         self.assertTrue(sid1.startswith("agy-session-"))
 
+    def test_large_payload_over_64k(self):
+        """Stdin payload larger than 64 KiB is read completely without EPIPE and parses conversationId."""
+        self.bridge.history.clear()
+        large_content = "x" * (128 * 1024)
+        payload = {
+            "conversationId": "conv-large-payload-0001",
+            "hook_event_name": "PreToolUse",
+            "toolCall": {"name": "write_file", "args": {"content": large_content}},
+            "workspacePaths": ["/Users/tester/proj"],
+        }
+        code, out, _ = self._run_hook(None, payload=payload)
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":"allow"}')
+        self._wait_for_history(1)
+        self.assertEqual(len(self.bridge.history), 1)
+        self.assertEqual(self.bridge.history[-1].get("session_id"), "conv-large-payload-0001")
+        self.assertEqual(self.bridge.history[-1].get("title"), "Tool: write_file")
+
+    def test_corrupted_payload_without_conv_id_skips_delivery(self):
+        """Corrupted / unparseable payload without conversationId on non-Stop event skips delivery to avoid phantom sessions."""
+        self.bridge.history.clear()
+        broken_payload = '{"broken_json": true, "partial": ' + ("x" * 1000)
+        code, out, _ = self._run_hook("PreToolUse", payload=broken_payload)
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":"allow"}')
+        time.sleep(0.1)
+        # Must NOT deliver anything to bridge or mint a phantom session ID
+        self.assertEqual(len(self.bridge.history), 0)
+
+    def test_concurrent_sessions_in_same_cwd_have_distinct_session_ids(self):
+        """Concurrent sessions in the same directory without TERM_SESSION_ID produce distinct session IDs."""
+        self.bridge.history.clear()
+        payload = {"workspacePaths": ["/Users/tester/shared_repo"]}
+        env1 = {"TERM_SESSION_ID": "", "AGENT_PID": "1001", "AGENT_TTY": "ttys001"}
+        env2 = {"TERM_SESSION_ID": "", "AGENT_PID": "2002", "AGENT_TTY": "ttys002"}
+
+        code1, _, _ = self._run_hook("PreInvocation", payload=payload, env_extra=env1)
+        self.assertEqual(code1, 0)
+        self._wait_for_history(1)
+        sid1 = self.bridge.history[-1].get("session_id")
+
+        code2, _, _ = self._run_hook("PreInvocation", payload=payload, env_extra=env2)
+        self.assertEqual(code2, 0)
+        self._wait_for_history(2)
+        sid2 = self.bridge.history[-1].get("session_id")
+
+        self.assertNotEqual(sid1, sid2)
+        self.assertTrue(sid1.startswith("agy-session-"))
+        self.assertTrue(sid2.startswith("agy-session-"))
+
     def test_python_unavailable_fallback_and_event_whitelist(self):
         """When Python is unavailable, bash fallback correctly maps Stop to Ended, PostInvocation to Idle, and whitelists EVENT."""
         no_py_dir = self.tmp / "no-py-bin"
@@ -333,7 +418,10 @@ class AgyNotifyHookTests(SandboxTestCase):
         fake_py.write_text("#!/bin/sh\nexit 127\n")
         fake_py.chmod(0o755)
 
-        env = {"PATH": f"{no_py_dir}:{os.environ.get('PATH', '')}"}
+        env = {
+            "PATH": f"{no_py_dir}:{os.environ.get('PATH', '')}",
+            "AGY_HOOK_PYTHON": str(fake_py),
+        }
 
         # 1. PreInvocation -> Working
         self.bridge.history.clear()
@@ -341,12 +429,17 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(code, 0)
         self._wait_for_history(1)
         self.assertEqual(self.bridge.history[-1].get("state"), "Working")
+        # Assert fallback-only session ID prefix proving bash fallback path executed
+        sid1 = self.bridge.history[-1].get("session_id", "")
+        self.assertTrue(sid1.startswith("agy-fallback-"), f"expected agy-fallback- prefix, got {sid1}")
 
         # 2. PostInvocation -> Idle
         code, out, _ = self._run_hook("PostInvocation", payload={}, env_extra=env)
         self.assertEqual(code, 0)
         self._wait_for_history(2)
         self.assertEqual(self.bridge.history[-1].get("state"), "Idle")
+        sid2 = self.bridge.history[-1].get("session_id", "")
+        self.assertTrue(sid2.startswith("agy-fallback-"), f"expected agy-fallback- prefix, got {sid2}")
 
         # 3. Stop -> Ended
         code, out, _ = self._run_hook("Stop", payload={}, env_extra=env)
@@ -354,6 +447,8 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(out, '{"decision":""}')
         self._wait_for_history(3)
         self.assertEqual(self.bridge.history[-1].get("state"), "Ended")
+        sid3 = self.bridge.history[-1].get("session_id", "")
+        self.assertTrue(sid3.startswith("agy-fallback-"), f"expected agy-fallback- prefix, got {sid3}")
 
         # 4. Injected event -> whitelisted to empty, safe fallback
         code, out, _ = self._run_hook('Stop"; injection', payload={}, env_extra=env)

@@ -1,16 +1,13 @@
 #!/bin/bash
 set -u
 
-# Drain bounded stdin safely (cap at 64 KiB) once at the start of execution
-HOOK_JSON=$(head -c 65536 2>/dev/null || true)
-if [ -z "${HOOK_JSON:-}" ]; then
-  HOOK_JSON='{}'
-fi
+# Drain stdin completely to prevent EPIPE to writing agent processes
+RAW_INPUT="$(cat 2>/dev/null || true)"
 
 # Resolve EVENT from AGY_HOOK_EVENT, argv $1, or top-level hook_event_name in JSON
 EVENT="${AGY_HOOK_EVENT:-${1:-}}"
 if [ -z "$EVENT" ]; then
-  EVENT=$(printf '%s' "$HOOK_JSON" | LC_ALL=C grep -o '"hook_event_name"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+  EVENT=$(printf '%s' "$RAW_INPUT" | LC_ALL=C grep -o '"hook_event_name"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
 fi
 
 # Whitelist EVENT strictly to prevent injection into JSON or logic
@@ -84,14 +81,16 @@ is_herdr_owning_pane() {
 }
 
 # If Herdr actively owns this pane:
-# - If an earlier fail-open wrote .vendor_active, immediately dismiss the direct entry now that Herdr has taken over!
-# - Otherwise suppress standalone reporting to prevent duplicate entries
+# - If an earlier fail-open wrote .vendor_active, attempt dismissal of the direct entry.
+#   Only retire .vendor_active if dismissal was confirmed by HTTP 200. If delivery fails
+#   or Bartender is unavailable, keep .vendor_active intact so Herdr's reconciler stages
+#   and retries dismissal under cache lock.
+# - Otherwise suppress standalone reporting to prevent duplicate entries.
 if is_herdr_owning_pane; then
   if [ -n "$VENDOR_ACTIVE" ] && [ -f "$VENDOR_ACTIVE" ]; then
-    prev_sid=$(printf '%s' "$(cat "$VENDOR_ACTIVE" 2>/dev/null || true)" | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
-    rm -f "$VENDOR_ACTIVE" 2>/dev/null || true
+    prev_sid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
     if [ -n "$prev_sid" ] && is_bartender_alive; then
-      curl -s \
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" \
         --noproxy '*' \
         --max-redirs 0 \
         --proto =http \
@@ -99,7 +98,13 @@ if is_herdr_owning_pane; then
         --max-time 0.5 \
         -X POST "http://${HOST}:${PORT}/event" \
         -H 'Content-Type: application/json' \
-        --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${prev_sid}\"}" >/dev/null 2>&1 || true
+        --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${prev_sid}\"}" 2>/dev/null || echo "000")
+      if [ "$http_code" = "200" ]; then
+        claim_file="${VENDOR_ACTIVE}.claim.$$-$(date +%s 2>/dev/null || echo $$)"
+        if mv -f "$VENDOR_ACTIVE" "$claim_file" 2>/dev/null; then
+          rm -f "$claim_file" 2>/dev/null || true
+        fi
+      fi
     fi
   fi
 
@@ -111,7 +116,7 @@ if is_herdr_owning_pane; then
   exit 0
 fi
 
-# Find agent PID: match ONLY the binary basename (agy, antigravity, Antigravity),
+# Find agent PID: match ONLY binary basename (agy, antigravity, Antigravity),
 # NEVER matching wrapper shells (sh, bash, zsh) whose arguments may contain the script path.
 find_agent_pid() {
   local pid=$PPID
@@ -130,15 +135,46 @@ find_agent_pid() {
   return 0
 }
 
-AGENT_PID="$(find_agent_pid 2>/dev/null || true)"
+AGENT_PID="${AGENT_PID:-$(find_agent_pid 2>/dev/null || true)}"
 if ! printf '%s' "${AGENT_PID:-}" | grep -Eq '^[0-9]+$'; then
   AGENT_PID=""
 fi
 
-# Build Bartender Top Shelf JSON payload with comprehensive terminal/bidi control stripping
-# and strict length caps.
-payload=$(
-  EVENT="$EVENT" HOOK_JSON="$HOOK_JSON" TERM_PROGRAM="${TERM_PROGRAM:-}" AGENT_PID="${AGENT_PID:-}" /usr/bin/python3 - <<'PY' 2>/dev/null
+# Resolve controlling terminal for multi-session collision avoidance
+AGENT_TTY="${AGENT_TTY:-}"
+if [ -z "$AGENT_TTY" ]; then
+  if [ -n "$AGENT_PID" ]; then
+    AGENT_TTY=$(ps -o tty= -p "$AGENT_PID" 2>/dev/null | tr -d ' \t\n' || true)
+  fi
+  if [ -z "$AGENT_TTY" ] || [ "$AGENT_TTY" = "?" ] || [ "$AGENT_TTY" = "??" ]; then
+    AGENT_TTY=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' \t\n' || true)
+  fi
+fi
+
+# Resolve Python interpreter safely:
+# On macOS, /usr/bin/python3 is an xcrun stub that triggers GUI installation prompts
+# if Command Line Tools are missing. We verify CLT before invoking /usr/bin/python3.
+PYTHON_BIN="${AGY_HOOK_PYTHON:-}"
+if [ -z "$PYTHON_BIN" ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    py_candidate=$(command -v python3)
+    if [ "$py_candidate" = "/usr/bin/python3" ]; then
+      if xcode-select -p >/dev/null 2>&1; then
+        PYTHON_BIN="/usr/bin/python3"
+      fi
+    else
+      PYTHON_BIN="$py_candidate"
+    fi
+  elif [ -x /usr/bin/python3 ] && xcode-select -p >/dev/null 2>&1; then
+    PYTHON_BIN="/usr/bin/python3"
+  fi
+fi
+
+SID=""
+payload=""
+
+if [ -n "$PYTHON_BIN" ]; then
+  py_output=$(printf '%s' "$RAW_INPUT" | EVENT="$EVENT" AGENT_PID="${AGENT_PID:-}" AGENT_TTY="${AGENT_TTY:-}" TERM_PROGRAM="${TERM_PROGRAM:-}" "$PYTHON_BIN" -c '
 import hashlib, json, os, re, sys
 
 CSI_RE = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]")
@@ -162,9 +198,13 @@ def strip_controls(raw: object) -> str:
 def sanitize_str(raw: object, max_len: int = 120) -> str:
     return strip_controls(raw).strip()[:max_len]
 
+raw_input = sys.stdin.read()
+parse_ok = False
 try:
-    d = json.loads(os.environ.get("HOOK_JSON") or "{}")
-    if not isinstance(d, dict):
+    d = json.loads(raw_input) if raw_input.strip() else {}
+    if isinstance(d, dict):
+        parse_ok = True
+    else:
         d = {}
 except Exception:
     d = {}
@@ -210,16 +250,31 @@ else:
     raw_cwd = d.get("cwd") or os.getcwd()
 cwd = sanitize_str(raw_cwd, 256)
 
-# Conversation / Session ID:
-# Strict format validation: 16 to 64 chars [a-zA-Z0-9_-] (matching VENDOR_UUID_REGEX)
+# Conversation / Session ID
 conv_id = d.get("conversationId")
-if isinstance(conv_id, str) and re.match(r'^[a-zA-Z0-9_-]{16,64}\Z', conv_id):
+if not (isinstance(conv_id, str) and re.match(r"^[a-zA-Z0-9_-]{16,64}\Z", conv_id)):
+    pattern = chr(34) + "conversationId" + chr(34) + r"\s*:\s*" + chr(34) + r"([a-zA-Z0-9_-]{16,64})" + chr(34)
+    m = re.search(pattern, raw_input)
+    if m:
+        conv_id = m.group(1)
+    else:
+        conv_id = None
+
+if conv_id:
     session_id = conv_id
-else:
-    # Deterministic fallback per workspace and terminal session (independent of transient subshell PIDs)
-    seed = f"{cwd}:{os.environ.get('TERM_SESSION_ID', '')}:{os.environ.get('TTY', '')}"
-    h = hashlib.sha256(seed.encode('utf-8')).hexdigest()[:24]
+elif parse_ok or event == "Stop":
+    # Stable fallback session ID incorporating workspace, terminal session, TTY, and agent PID
+    term_sess = os.environ.get("TERM_SESSION_ID", "")
+    agent_tty = os.environ.get("AGENT_TTY", "")
+    pid_str = str(pid) if pid else ""
+    seed = f"{cwd}:{term_sess}:{agent_tty}:{pid_str}"
+    h = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
     session_id = f"agy-session-{h}"
+else:
+    # Corrupted / unparseable payload on a non-Stop event without conversationId.
+    # Output SKIP so the hook cleanly ignores it without inventing a phantom session.
+    sys.stdout.write("SKIP")
+    sys.exit(0)
 
 # Terminal mapping
 term_map = {
@@ -237,7 +292,7 @@ term_map = {
 raw_term = os.environ.get("TERM_PROGRAM") or ""
 clean_term = sanitize_str(term_map.get(raw_term, raw_term), 64)
 
-sys.stdout.write(json.dumps({
+payload_json = json.dumps({
     "state": state,
     "agent": "Antigravity",
     "event": event,
@@ -246,9 +301,23 @@ sys.stdout.write(json.dumps({
     "title": title,
     "terminal": clean_term,
     "pid": pid,
-}))
-PY
-)
+})
+
+sys.stdout.write(f"{session_id}\n{payload_json}")
+' 2>/dev/null || true)
+  if [ "$py_output" = "SKIP" ]; then
+    case "$EVENT" in
+      PreToolUse) printf '{"decision":"allow"}\n' ;;
+      Stop) printf '{"decision":""}\n' ;;
+      *) printf '{}\n' ;;
+    esac
+    exit 0
+  fi
+  if [ -n "$py_output" ]; then
+    SID=$(printf '%s\n' "$py_output" | head -n1)
+    payload=$(printf '%s\n' "$py_output" | tail -n +2)
+  fi
+fi
 
 # Resilient fallback if Python is unavailable
 if [ -z "${payload:-}" ]; then
@@ -257,17 +326,21 @@ if [ -z "${payload:-}" ]; then
     PostInvocation) FB_STATE="Idle" ;;
     *) FB_STATE="Working" ;;
   esac
-  FALLBACK_SID="agy-session-fallback-default"
+  # Compute unique per-process fallback session ID (>= 16 chars)
+  seed_str="${PWD:-}:${AGENT_PID:-$$}:${AGENT_TTY:-}:${TERM_SESSION_ID:-}"
+  h=$(printf '%s' "$seed_str" | shasum -a 256 2>/dev/null | cut -c1-24 || echo "$$")
+  FALLBACK_SID="agy-fallback-${h}"
+  SID="$FALLBACK_SID"
   payload="{\"state\":\"${FB_STATE}\",\"agent\":\"Antigravity\",\"event\":\"${EVENT}\",\"session_id\":\"${FALLBACK_SID}\"}"
 fi
-
-# Extract session_id from payload for .vendor_active management
-SID=$(printf '%s' "$payload" | /usr/bin/python3 -c 'import json, sys; d=json.load(sys.stdin); sys.stdout.write(d.get("session_id") or "")' 2>/dev/null || echo "agy-session-fallback-default")
 
 # Record or retire .vendor_active if running within a Herdr pane during a fail-open window
 if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ]; then
   if [ "$EVENT" = "Stop" ]; then
-    rm -f "$VENDOR_ACTIVE" 2>/dev/null || true
+    claim_file="${VENDOR_ACTIVE}.claim.$$-$(date +%s 2>/dev/null || echo $$)"
+    if mv -f "$VENDOR_ACTIVE" "$claim_file" 2>/dev/null; then
+      rm -f "$claim_file" 2>/dev/null || true
+    fi
   else
     mkdir -m 700 -p "${STATE_HOME}/panes" 2>/dev/null || true
     TMP_VA=$(mktemp "${STATE_HOME}/panes/.va.tmp.XXXXXX" 2>/dev/null || true)
@@ -280,8 +353,6 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ]; then
 fi
 
 # Send event synchronously with tight timeout. Strictly loopback, no proxies, no redirects.
-# Synchronous delivery guarantees events arrive in strict chronological order and
-# cannot race or land after Stop.
 if is_bartender_alive; then
   curl -s \
     --noproxy '*' \
