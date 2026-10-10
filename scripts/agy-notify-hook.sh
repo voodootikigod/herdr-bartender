@@ -481,21 +481,39 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVE
   # Only record if SID matches standard vendor UUID regex (16-64 chars)
   if printf '%s' "$SID" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
     to_dismiss=""
+    local_count=0
     for s in $PENDING_DISMISSAL_SID $PREV_VENDOR_SID; do
       [ -n "$s" ] || continue
       [ "$s" = "$SID" ] && continue
       case " $to_dismiss " in
         *" $s "*) ;;
-        *) to_dismiss="${to_dismiss:+${to_dismiss} }${s}" ;;
+        *)
+          if [ "$local_count" -lt 8 ]; then
+            to_dismiss="${to_dismiss:+${to_dismiss} }${s}"
+            local_count=$((local_count + 1))
+          fi
+          ;;
       esac
     done
 
     still_pending=""
-    for s in $to_dismiss; do
-      if ! send_dismissal "$s"; then
-        still_pending="${still_pending:+${still_pending} }${s}"
-      fi
-    done
+    if [ "$EVENT" = "PreToolUse" ]; then
+      # On PreToolUse, preserve pending dismissals without spending network time so tool admission is never delayed
+      still_pending="$to_dismiss"
+    else
+      # Attempt dismissal for up to 4 SIDs per event, preserving any remaining or failed ones
+      attempt_count=0
+      for s in $to_dismiss; do
+        if [ "$attempt_count" -lt 4 ]; then
+          attempt_count=$((attempt_count + 1))
+          if ! send_dismissal "$s"; then
+            still_pending="${still_pending:+${still_pending} }${s}"
+          fi
+        else
+          still_pending="${still_pending:+${still_pending} }${s}"
+        fi
+      done
+    fi
 
     va_dir=$(dirname "$VENDOR_ACTIVE")
     mkdir -m 700 -p "$va_dir" 2>/dev/null || true
@@ -541,17 +559,29 @@ fi
 # If a pending or previous session differs from SID, both must be dismissed before retiring.
 if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEnd" ]; }; then
   to_dismiss=""
+  local_count=0
   for s in $PENDING_DISMISSAL_SID $PREV_VENDOR_SID; do
     [ -n "$s" ] || continue
     [ "$s" = "$SID" ] && continue
     case " $to_dismiss " in
       *" $s "*) ;;
-      *) to_dismiss="${to_dismiss:+${to_dismiss} }${s}" ;;
+      *)
+        if [ "$local_count" -lt 8 ]; then
+          to_dismiss="${to_dismiss:+${to_dismiss} }${s}"
+          local_count=$((local_count + 1))
+        fi
+        ;;
     esac
   done
   prior_ok=1
+  attempt_count=0
   for s in $to_dismiss; do
-    if ! send_dismissal "$s"; then
+    if [ "$attempt_count" -lt 4 ]; then
+      attempt_count=$((attempt_count + 1))
+      if ! send_dismissal "$s"; then
+        prior_ok=0
+      fi
+    else
       prior_ok=0
     fi
   done

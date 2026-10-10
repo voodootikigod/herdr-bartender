@@ -495,6 +495,45 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertIn(cid_c, dismissed_sids)
         self.assertFalse(va_file.exists(), ".vendor_active must be retired after confirmed Stop")
 
+    def test_long_chain_of_failed_switches_capped_and_pretooluse_fast(self):
+        """A long chain of failed switches caps pending_dismissal_sid at 8 and PreToolUse does not spend dismissal time."""
+        pane_id = "ws1:pCapChain"
+        hex_pane = pane_id.encode("utf-8").hex()
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+
+        # Simulate 12 conversation switches with bridge returning 500
+        for i in range(12):
+            self.bridge.enqueue(status=500)
+            self.bridge.enqueue(status=500)
+            code, _, _ = self._run_hook(
+                "PreInvocation",
+                payload={"conversationId": f"conv-cap-chain-{i:04d}"},
+                env_extra={"HERDR_PANE_ID": pane_id},
+            )
+            self.assertEqual(code, 0)
+
+        self.assertTrue(va_file.exists())
+        va_bytes = va_file.read_bytes()
+        self.assertLess(len(va_bytes), 4096, "record must remain well under VENDOR_FILE_MAX_BYTES")
+        va_data = json.loads(va_bytes.decode())
+        pending = va_data.get("pending_dismissal_sid", "").split()
+        self.assertLessEqual(len(pending), 8, "pending dismissals must be capped at 8")
+
+        # Now test PreToolUse: it must return immediately with allow and NOT attempt dismissals
+        t0 = time.monotonic()
+        code, out, _ = self._run_hook(
+            "PreToolUse",
+            payload={
+                "conversationId": "conv-cap-chain-0011",
+                "toolCall": {"name": "run_command"},
+            },
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        elapsed = time.monotonic() - t0
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":"allow"}')
+        self.assertLess(elapsed, 1.5, "PreToolUse must not be blocked by dismissal network calls")
+
     def test_crashed_standalone_session_cleaned_up_on_subsequent_run(self):
         """When an earlier standalone agy process crashes/dies without Stop, the next hook run sweeps it."""
         sa_dir = self.state_dir / "standalone"
