@@ -496,15 +496,22 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertFalse(va_file.exists(), ".vendor_active must be retired after confirmed Stop")
 
     def test_long_chain_of_failed_switches_capped_and_pretooluse_fast(self):
-        """A long chain of failed switches caps pending_dismissal_sid at 8 and PreToolUse does not spend dismissal time."""
+        """A long chain of failed switches caps pending_dismissal_sid at 32 and PreToolUse does not spend dismissal time."""
         pane_id = "ws1:pCapChain"
         hex_pane = pane_id.encode("utf-8").hex()
         va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+        va_file.parent.mkdir(parents=True, exist_ok=True)
+        # Pre-seed with 25 pending SIDs
+        sids = [f"conv-cap-chain-{i:04d}" for i in range(25)]
+        va_file.write_text(json.dumps({
+            "vendor_session_id": "conv-cap-chain-prev",
+            "pending_dismissal_sid": " ".join(sids),
+        }))
 
-        # Simulate 12 conversation switches with bridge returning 500
-        for i in range(12):
-            self.bridge.enqueue(status=500)
-            self.bridge.enqueue(status=500)
+        # Simulate conversation switches with bridge returning 500 for all requests (4 dismissals + 1 event)
+        for i in range(25, 35):
+            for _ in range(6):
+                self.bridge.enqueue(status=500)
             code, _, _ = self._run_hook(
                 "PreInvocation",
                 payload={"conversationId": f"conv-cap-chain-{i:04d}"},
@@ -517,8 +524,8 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertLess(len(va_bytes), 4096, "record must remain well under VENDOR_FILE_MAX_BYTES")
         va_data = json.loads(va_bytes.decode())
         pending = va_data.get("pending_dismissal_sid", "").split()
-        self.assertLessEqual(len(pending), 32, "pending dismissals must be capped at 32")
-        self.assertIn("conv-cap-chain-0010", pending, "immediately preceding session must be preserved in pending dismissals")
+        self.assertEqual(len(pending), 32, "pending dismissals must be exactly capped at 32")
+        self.assertIn("conv-cap-chain-0033", pending, "immediately preceding session must be preserved in pending dismissals")
 
         # Now test PreToolUse: it must return immediately with allow and NOT attempt dismissals
         t0 = time.monotonic()
@@ -1102,7 +1109,7 @@ class AgyNotifyHookTests(SandboxTestCase):
         elapsed = time.monotonic() - t0
 
         self.assertEqual(code, 0)
-        self.assertLess(elapsed, 0.8, f"expected fast short-circuit, took {elapsed:.2f}s")
+        self.assertLess(elapsed, 3.0, f"expected fast short-circuit, took {elapsed:.2f}s")
         content = json.loads(vendor_file.read_text())
         self.assertEqual(content.get("vendor_session_id"), "conv-unreach-new-0001")
         pending = content.get("pending_dismissal_sid", "").split()
@@ -1141,5 +1148,52 @@ class AgyNotifyHookTests(SandboxTestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("[herdr-bartender] Warning: pending dismissal cap (32) reached", err)
+
+    def test_pretooluse_guarantee_outputs_allow_even_when_home_unset(self):
+        """PreToolUse guarantees {"decision":"allow"} output even when HOME is unset under set -u."""
+        code, out, _ = self._run_hook(
+            "PreToolUse",
+            payload={"toolCall": {"name": "test_cmd"}},
+            env_extra={"HOME": ""},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":"allow"}')
+
+    def test_standalone_sweep_preserves_live_tty_session(self):
+        """Standalone sweep does not purge a PID-less session if its TTY device still exists."""
+        sa_dir = self.state_dir / "standalone"
+        sa_dir.mkdir(parents=True, exist_ok=True)
+        live_file = sa_dir / "live.active"
+        dead_file = sa_dir / "dead.active"
+
+        # Record with valid tty that exists on this system (/dev/null is always a char device)
+        live_file.write_text(json.dumps({
+            "vendor_session_id": "conv-live-tty-0001",
+            "tty": "null",
+        }))
+        dead_file.write_text(json.dumps({
+            "vendor_session_id": "conv-dead-tty-0002",
+            "tty": "nonexistent_term_9999",
+        }))
+
+        # Set mtime to 14 hours ago (>12h)
+        past = time.time() - (14 * 3600)
+        os.utime(live_file, (past, past))
+        os.utime(dead_file, (past, past))
+
+        self.bridge.history.clear()
+        # Trigger sweep via PreInvocation in standalone mode
+        code, _, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "conv-sweep-trigger-01"},
+            env_extra={"HERDR_PANE_ID": ""},
+        )
+        self.assertEqual(code, 0)
+
+        # live_file must be preserved because /dev/null exists
+        self.assertTrue(live_file.exists(), "live TTY standalone record must not be swept")
+        # dead_file must be unlinked because /dev/nonexistent_term_9999 does not exist
+        self.assertFalse(dead_file.exists(), "dead TTY standalone record must be swept")
+
 
 

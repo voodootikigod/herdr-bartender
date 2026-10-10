@@ -32,12 +32,24 @@ has_time_remaining() {
   [ $(( now - START_TIME )) -lt 3 ]
 }
 
-# Cleanup trap for temporary files
+# Cleanup trap and PreToolUse guarantee
 TMP_VA=""
-cleanup_tmp_va() {
-  [ -n "${TMP_VA:-}" ] && rm -f "$TMP_VA" 2>/dev/null || true
+PRETOOLUSE_EMITTED=0
+
+emit_pretooluse_allow() {
+  if [ "$PRETOOLUSE_EMITTED" -eq 0 ]; then
+    PRETOOLUSE_EMITTED=1
+    printf '{"decision":"allow"}\n'
+  fi
 }
-trap cleanup_tmp_va EXIT INT TERM
+
+cleanup_and_guarantee_pretooluse() {
+  [ -n "${TMP_VA:-}" ] && rm -f "$TMP_VA" 2>/dev/null || true
+  if [ "$EVENT" = "PreToolUse" ] && [ "$PRETOOLUSE_EMITTED" -eq 0 ]; then
+    emit_pretooluse_allow
+  fi
+}
+trap cleanup_and_guarantee_pretooluse EXIT INT TERM
 
 # Check if Bartender 6 / Bartender is running (memoised per invocation)
 BARTENDER_ALIVE_STATUS=""
@@ -89,7 +101,7 @@ send_dismissal() {
 # Resolve canonical pane ID and paths if HERDR_PANE_ID is set
 CANONICAL_PANE=""
 HEX_PANE=""
-STATE_HOME="${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/herdr-bartender}"
+STATE_HOME="${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-${HOME:-}/.local/state}/herdr/plugins/herdr-bartender}"
 PANE_MARKER=""
 VENDOR_ACTIVE=""
 
@@ -223,7 +235,7 @@ if is_herdr_owning_pane; then
   fi
 
   case "$EVENT" in
-    PreToolUse) printf '{"decision":"allow"}\n' ;;
+    PreToolUse) emit_pretooluse_allow ;;
     Stop|SessionEnd) printf '{"decision":""}\n' ;;
     *) printf '{}\n' ;;
   esac
@@ -298,10 +310,11 @@ sweep_standalone_active() {
       break
     fi
 
-    local f_pid f_sid f_pend is_dead mtime age
+    local f_pid f_sid f_pend f_tty is_dead mtime age
     f_pid=$(cat "$f" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | tr -cd '0-9')
     f_sid=$(cat "$f" 2>/dev/null | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
     f_pend=$(cat "$f" 2>/dev/null | LC_ALL=C grep -o '"pending_dismissal_sid"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+    f_tty=$(cat "$f" 2>/dev/null | LC_ALL=C grep -o '"tty"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
 
     # Determine age
     mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
@@ -315,9 +328,19 @@ sweep_standalone_active() {
         # 12h age horizon guards against PID reuse
         is_dead=1
       fi
+    elif [ -n "$f_tty" ]; then
+      # Record without PID but with TTY: verify whether terminal device is still open
+      if [ -c "/dev/$f_tty" ]; then
+        if [ "$age" -ge 86400 ] && ! ps -t "$f_tty" >/dev/null 2>&1; then
+          is_dead=1
+        fi
+      else
+        # Terminal device closed or destroyed: session is dead
+        is_dead=1
+      fi
     else
-      # PID-less record: check 12h (43200s) mtime horizon
-      if [ "$age" -ge 43200 ]; then
+      # PID-less, TTY-less record: 24h (86400s) age horizon
+      if [ "$age" -ge 86400 ]; then
         is_dead=1
       fi
     fi
@@ -539,7 +562,7 @@ except Exception:
 ' 2>/dev/null || true)
   if [ "$py_output" = "SKIP" ]; then
     case "$EVENT" in
-      PreToolUse) printf '{"decision":"allow"}\n' ;;
+      PreToolUse) emit_pretooluse_allow ;;
       Stop|SessionEnd) printf '{"decision":""}\n' ;;
       *) printf '{}\n' ;;
     esac
@@ -555,7 +578,7 @@ fi
 if [ -z "${payload:-}" ]; then
   if [ -z "$EVENT" ]; then
     case "$EVENT" in
-      PreToolUse) printf '{"decision":"allow"}\n' ;;
+      PreToolUse) emit_pretooluse_allow ;;
       Stop|SessionEnd) printf '{"decision":""}\n' ;;
       *) printf '{}\n' ;;
     esac
@@ -639,19 +662,21 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVE
     TMP_VA=$(mktemp "${va_dir}/.va.tmp.XXXXXX" 2>/dev/null || true)
     if [ -n "$TMP_VA" ]; then
       chmod 0600 "$TMP_VA" 2>/dev/null || true
+      local tty_json=""
+      [ -n "${AGENT_TTY:-}" ] && tty_json=",\"tty\":\"${AGENT_TTY}\""
       if [ -z "$still_pending" ]; then
         if [ -n "$AGENT_PID" ]; then
-          printf '{"vendor_session_id":"%s","pid":%s}\n' "$SID" "$AGENT_PID" > "$TMP_VA" 2>/dev/null || true
+          printf '{"vendor_session_id":"%s","pid":%s%s}\n' "$SID" "$AGENT_PID" "$tty_json" > "$TMP_VA" 2>/dev/null || true
         else
-          printf '{"vendor_session_id":"%s"}\n' "$SID" > "$TMP_VA" 2>/dev/null || true
+          printf '{"vendor_session_id":"%s"%s}\n' "$SID" "$tty_json" > "$TMP_VA" 2>/dev/null || true
         fi
       else
         # Dismissal of previous session(s) could not be completed; record both so subsequent events/Stop retry dismissing them,
         # while still recording and advancing to current session.
         if [ -n "$AGENT_PID" ]; then
-          printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s","pid":%s}\n' "$SID" "$still_pending" "$AGENT_PID" > "$TMP_VA" 2>/dev/null || true
+          printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s","pid":%s%s}\n' "$SID" "$still_pending" "$AGENT_PID" "$tty_json" > "$TMP_VA" 2>/dev/null || true
         else
-          printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"}\n' "$SID" "$still_pending" > "$TMP_VA" 2>/dev/null || true
+          printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"%s}\n' "$SID" "$still_pending" "$tty_json" > "$TMP_VA" 2>/dev/null || true
         fi
       fi
       mv -f "$TMP_VA" "$VENDOR_ACTIVE" 2>/dev/null || rm -f "$TMP_VA" 2>/dev/null || true
@@ -762,7 +787,7 @@ fi
 
 # Emit expected JSON response to stdout for Antigravity lifecycle
 case "$EVENT" in
-  PreToolUse) printf '{"decision":"allow"}\n' ;;
+  PreToolUse) emit_pretooluse_allow ;;
   Stop|SessionEnd) printf '{"decision":""}\n' ;;
   *) printf '{}\n' ;;
 esac
