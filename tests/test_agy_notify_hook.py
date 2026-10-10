@@ -683,6 +683,43 @@ class AgyNotifyHookTests(SandboxTestCase):
         # Stale active file must be cleaned up
         self.assertFalse(dead_file.exists(), "stale standalone file must be retired by sweep")
 
+    def test_sweep_standalone_multi_sid_dead_record_retired(self):
+        """Dead standalone records with multiple pending SIDs have all SIDs dismissed and the file retired."""
+        sa_dir = self.state_dir / "standalone"
+        sa_dir.mkdir(parents=True, exist_ok=True)
+        dead_pid = 99998
+        try:
+            os.kill(dead_pid, 0)
+            dead_pid = 99997
+        except OSError:
+            pass
+
+        dead_file = sa_dir / "deadmulti1234.active"
+        dead_primary = "conv-dead-multi-primary-0001"
+        dead_pend_1 = "conv-dead-multi-pending-0002"
+        dead_pend_2 = "conv-dead-multi-pending-0003"
+        dead_file.write_text(json.dumps({
+            "vendor_session_id": dead_primary,
+            "pending_dismissal_sid": f"{dead_pend_1} {dead_pend_2}",
+            "pid": dead_pid,
+        }))
+
+        self.bridge.history.clear()
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "conv-alive-sweep-0001"},
+            env_extra={"AGENT_PID": "4242", "AGENT_TTY": "ttys002"},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(4)  # 3 dismissals + 1 new PreInvocation
+        history_sids = [h.get("session_id") for h in self.bridge.history]
+        self.assertIn(dead_primary, history_sids)
+        self.assertIn(dead_pend_1, history_sids)
+        self.assertIn(dead_pend_2, history_sids)
+
+        # The multi-SID dead file MUST be retired completely!
+        self.assertFalse(dead_file.exists(), "multi-SID dead file must be retired by sweep")
+
     def test_sweep_standalone_failed_delivery_preserves_file(self):
         """When sweep cannot deliver dismissal (e.g. Bartender dead), .active file is NOT deleted."""
         sa_dir = self.state_dir / "standalone"

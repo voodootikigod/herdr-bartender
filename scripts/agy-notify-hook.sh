@@ -23,13 +23,18 @@ if ! printf '%s' "$PORT" | grep -Eq '^[0-9]{1,5}$' || [ "$PORT" -lt 1024 ] || [ 
   PORT=7823
 fi
 
+# Global request counter to cap total network requests per invocation (well under 5s timeout)
+TOTAL_NETWORK_REQUESTS=0
+MAX_NETWORK_REQUESTS=6
+
 # Record invocation start for hard deadline checking (well under 5s hook timeout)
 START_TIME=$(date +%s 2>/dev/null || echo 0)
 has_time_remaining() {
+  [ "$TOTAL_NETWORK_REQUESTS" -ge "$MAX_NETWORK_REQUESTS" ] && return 1
   [ "$START_TIME" -eq 0 ] && return 0
   local now
   now=$(date +%s 2>/dev/null || echo 0)
-  [ $(( now - START_TIME )) -lt 3 ]
+  [ $(( now - START_TIME )) -lt 2 ]
 }
 
 # Cleanup trap for temporary scratch files
@@ -65,6 +70,7 @@ send_dismissal() {
   [ -n "$target_sid" ] || return 1
   has_time_remaining || return 1
   is_bartender_alive || return 1
+  TOTAL_NETWORK_REQUESTS=$((TOTAL_NETWORK_REQUESTS + 1))
   local code
   code=$(curl -s -o /dev/null -w "%{http_code}" \
     --noproxy '*' \
@@ -272,8 +278,12 @@ retire_vendor_file() {
         local c_pid c_tty c_pid_json="" c_tty_json=""
         c_pid=$(cat "$claim" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | grep -o '[0-9]*' || true)
         c_tty=$(cat "$claim" 2>/dev/null | LC_ALL=C grep -o '"tty"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
-        [ -n "$c_pid" ] && c_pid_json=",\"pid\":${c_pid}"
-        [ -n "$c_tty" ] && c_tty_json=",\"tty\":\"${c_tty}\""
+        if printf '%s' "${c_pid:-}" | grep -Eq '^[0-9]{1,9}$'; then
+          c_pid_json=",\"pid\":${c_pid}"
+        fi
+        if printf '%s' "${c_tty:-}" | grep -Eq '^[a-zA-Z0-9/_.-]{1,32}$'; then
+          c_tty_json=",\"tty\":\"${c_tty}\""
+        fi
         if [ -z "$rest_u" ]; then
           printf '{"vendor_session_id":"%s"%s%s}\n' "$first_u" "$c_pid_json" "$c_tty_json" > "$claim" 2>/dev/null || true
         else
@@ -309,8 +319,12 @@ retire_vendor_file() {
             local c_pid c_tty c_pid_json="" c_tty_json=""
             c_pid=$(cat "$claim" "$target" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | grep -o '[0-9]*' || true)
             c_tty=$(cat "$claim" "$target" 2>/dev/null | LC_ALL=C grep -o '"tty"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
-            [ -n "$c_pid" ] && c_pid_json=",\"pid\":${c_pid}"
-            [ -n "$c_tty" ] && c_tty_json=",\"tty\":\"${c_tty}\""
+            if printf '%s' "${c_pid:-}" | grep -Eq '^[0-9]{1,9}$'; then
+              c_pid_json=",\"pid\":${c_pid}"
+            fi
+            if printf '%s' "${c_tty:-}" | grep -Eq '^[a-zA-Z0-9/_.-]{1,32}$'; then
+              c_tty_json=",\"tty\":\"${c_tty}\""
+            fi
             if [ -z "$rest_s" ]; then
               printf '{"vendor_session_id":"%s"%s%s}\n' "$first_s" "$c_pid_json" "$c_tty_json" > "$TMP_M" 2>/dev/null || true
             else
@@ -469,19 +483,7 @@ sweep_standalone_active() {
     fi
 
     if [ "$is_dead" -eq 1 ]; then
-      # Validate SIDs: filter to valid format ^[a-zA-Z0-9_-]{16,64}$ with noglob
-      set -f
-      local valid_sids=""
-      for s in $f_sid $f_pend; do
-        [ -n "$s" ] || continue
-        if printf '%s' "$s" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
-          case " $valid_sids " in
-            *" $s "*) ;;
-            *) valid_sids="${valid_sids:+${valid_sids} }${s}" ;;
-          esac
-        fi
-      done
-      set +f
+      valid_sids=$(extract_record_sids "$f")
 
       # If dead record contains no valid SIDs at all (corrupted or unparseable), retire it immediately
       if [ -z "$valid_sids" ]; then
@@ -489,21 +491,21 @@ sweep_standalone_active() {
         continue
       fi
 
-      local all_ok=1
+      local confirmed_sweep_sids=""
       for s in $valid_sids; do
         if [ "$sweep_requests" -ge "$max_sweep_requests" ] || ! has_time_remaining; then
-          all_ok=0
           break
         fi
         sweep_requests=$((sweep_requests + 1))
-        if ! send_dismissal "$s"; then
-          all_ok=0
+        if send_dismissal "$s"; then
+          confirmed_sweep_sids="${confirmed_sweep_sids:+${confirmed_sweep_sids} }${s}"
         fi
       done
 
-      # Retire record only on confirmed HTTP 200, 404, or 410 dismissal of all sessions
-      if [ "$all_ok" -eq 1 ]; then
-        retire_vendor_file "$f" "$f_sid"
+      # Retire record with all successfully confirmed SIDs. If all SIDs were dismissed,
+      # the file is removed; if only some were dismissed, the remaining unconfirmed SIDs are kept.
+      if [ -n "$confirmed_sweep_sids" ]; then
+        retire_vendor_file "$f" "$confirmed_sweep_sids"
       fi
     fi
   done
@@ -813,6 +815,7 @@ fi
 # Send event synchronously with tight timeout. Strictly loopback, no proxies, no redirects.
 http_code="000"
 if [ "$BARTENDER_UNREACHABLE" != "1" ] && has_time_remaining && is_bartender_alive; then
+  TOTAL_NETWORK_REQUESTS=$((TOTAL_NETWORK_REQUESTS + 1))
   http_code=$(curl -s -o /dev/null -w "%{http_code}" \
     --noproxy '*' \
     --max-redirs 0 \
@@ -923,6 +926,12 @@ if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEn
           disk_sids=$(extract_record_sids "$VENDOR_ACTIVE")
           disk_pid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | grep -o '[0-9]*' || true)
           disk_tty=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"tty"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+          if ! printf '%s' "${disk_pid:-}" | grep -Eq '^[0-9]{1,9}$'; then
+            disk_pid=""
+          fi
+          if ! printf '%s' "${disk_tty:-}" | grep -Eq '^[a-zA-Z0-9/_.-]{1,32}$'; then
+            disk_tty=""
+          fi
           [ -z "$AGENT_PID" ] && [ -n "$disk_pid" ] && AGENT_PID="$disk_pid"
           [ -z "$AGENT_TTY" ] && [ -n "$disk_tty" ] && AGENT_TTY="$disk_tty"
           set -f
@@ -944,9 +953,13 @@ if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEn
           done
         fi
         tty_json=""
-        [ -n "${AGENT_TTY:-}" ] && tty_json=",\"tty\":\"${AGENT_TTY}\""
+        if printf '%s' "${AGENT_TTY:-}" | grep -Eq '^[a-zA-Z0-9/_.-]{1,32}$'; then
+          tty_json=",\"tty\":\"${AGENT_TTY}\""
+        fi
         pid_json=""
-        [ -n "${AGENT_PID:-}" ] && pid_json=",\"pid\":${AGENT_PID}"
+        if printf '%s' "${AGENT_PID:-}" | grep -Eq '^[0-9]{1,9}$'; then
+          pid_json=",\"pid\":${AGENT_PID}"
+        fi
         if [ -z "$rest_f" ]; then
           printf '{"vendor_session_id":"%s"%s%s}\n' "$first_f" "$pid_json" "$tty_json" > "$TMP_VA" 2>/dev/null || true
         else
