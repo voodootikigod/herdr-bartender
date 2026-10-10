@@ -185,6 +185,10 @@ To enable standalone `agy` reporting, copy `scripts/agy-notify-hook.sh` to `~/Li
 }
 ```
 
+> [!NOTE]
+> **Antigravity Hook Protocol & Tool Admission**:
+> Antigravity's tool runner treats `PreToolUse` hooks as an admission filter. Unlike platforms where an empty `{}` is neutral, Antigravity requires a `PreToolUse` hook to return `{"decision":"allow"}` to permit tool execution; returning `{}` or an empty decision causes Antigravity's runner to abort the tool execution with `tool call denied by pre-tool hook:`. Returning `{"decision":"allow"}` allows the normal Antigravity execution to proceed without altering user confirmation or permission rules.
+
 ## CLI reference
 
 All flags are handled in [`herdr_bartender/cli.py`](herdr_bartender/cli.py). A first argument that is not an option is treated as an event invocation. `--help` (or `-h`) prints usage; any other unknown option (a typo such as `--install-hook`) prints usage to stderr and exits 2 without touching anything (R51).

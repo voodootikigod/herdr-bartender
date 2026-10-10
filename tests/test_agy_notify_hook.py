@@ -381,6 +381,23 @@ class AgyNotifyHookTests(SandboxTestCase):
         # .vendor_active must still contain cid_a because dismissal was not confirmed
         self.assertTrue(va_file.exists())
         self.assertIn(cid_a, va_file.read_text(), ".vendor_active must not be overwritten when dismissal fails")
+        # And delivery of B was skipped because dismissal of A failed
+        self.assertEqual(len(self.bridge.history), 1)
+
+        # Step 3: Now bridge recovers (200), and Stop arrives for B
+        self.bridge.return_code = 200
+        code, out, _ = self._run_hook(
+            "Stop",
+            payload={"conversationId": cid_b},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(3)
+        # Both B and A are dismissed!
+        dismissed_sids = {h.get("session_id") for h in self.bridge.history[1:]}
+        self.assertIn(cid_b, dismissed_sids)
+        self.assertIn(cid_a, dismissed_sids)
+        self.assertFalse(va_file.exists(), ".vendor_active must be retired after confirmed Stop")
 
     def test_stop_without_conv_id_reuses_stored_vendor_sid(self):
         """When Stop arrives without conversationId, it reuses the session ID recorded in .vendor_active."""

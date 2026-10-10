@@ -293,10 +293,10 @@ try:
             conv_id = None
 
     prev_sid = os.environ.get("PREV_VENDOR_SID") or ""
-    if event in ("Stop", "SessionEnd") and prev_sid and re.match(r"^[a-zA-Z0-9_-]{16,64}\Z", prev_sid):
-        session_id = prev_sid
-    elif conv_id:
+    if conv_id:
         session_id = conv_id
+    elif event in ("Stop", "SessionEnd") and prev_sid and re.match(r"^[a-zA-Z0-9_-]{16,64}\Z", prev_sid):
+        session_id = prev_sid
     elif parse_ok or event in ("Stop", "SessionEnd"):
         # Stable fallback session ID incorporating workspace, terminal session, TTY, and agent PID
         term_sess = os.environ.get("TERM_SESSION_ID", "")
@@ -399,6 +399,7 @@ if [ -z "${payload:-}" ]; then
 fi
 
 # On non-Stop events, record or update .vendor_active during fail-open window
+can_deliver=1
 if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVENT" != "SessionEnd" ]; then
   # Only record if SID matches standard vendor UUID regex (16-64 chars)
   if printf '%s' "$SID" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
@@ -417,9 +418,11 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVE
           --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${PREV_VENDOR_SID}\"}" 2>/dev/null || echo "000")
         if [ "$old_code" != "200" ]; then
           can_write_va=0
+          can_deliver=0
         fi
       else
         can_write_va=0
+        can_deliver=0
       fi
     fi
 
@@ -437,7 +440,7 @@ fi
 
 # Send event synchronously with tight timeout. Strictly loopback, no proxies, no redirects.
 http_code="000"
-if is_bartender_alive; then
+if is_bartender_alive && [ "$can_deliver" -eq 1 ]; then
   http_code=$(curl -s -o /dev/null -w "%{http_code}" \
     --noproxy '*' \
     --max-redirs 0 \
@@ -451,20 +454,27 @@ fi
 
 # On Stop/SessionEnd, retire .vendor_active ONLY if dismissal was confirmed by HTTP 200.
 # If delivery timed out or failed, keep .vendor_active intact so Herdr reconciler retries.
+# If PREV_VENDOR_SID differs from SID, both must be dismissed with HTTP 200 before retiring.
 if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEnd" ]; }; then
-  if [ -n "$PREV_VENDOR_SID" ] && [ "$PREV_VENDOR_SID" != "$SID" ] && is_bartender_alive; then
-    curl -s \
-      --noproxy '*' \
-      --max-redirs 0 \
-      --proto =http \
-      --connect-timeout 0.15 \
-      --max-time 0.5 \
-      -X POST "http://${HOST}:${PORT}/event" \
-      -H 'Content-Type: application/json' \
-      --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${PREV_VENDOR_SID}\"}" >/dev/null 2>&1 || true
+  old_code="200"
+  if [ -n "$PREV_VENDOR_SID" ] && [ "$PREV_VENDOR_SID" != "$SID" ]; then
+    if is_bartender_alive; then
+      old_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        --noproxy '*' \
+        --max-redirs 0 \
+        --proto =http \
+        --connect-timeout 0.15 \
+        --max-time 0.5 \
+        -X POST "http://${HOST}:${PORT}/event" \
+        -H 'Content-Type: application/json' \
+        --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${PREV_VENDOR_SID}\"}" 2>/dev/null || echo "000")
+    else
+      old_code="000"
+    fi
   fi
-  if [ "$http_code" = "200" ]; then
-    retire_vendor_file "$VENDOR_ACTIVE" "${PREV_VENDOR_SID:-$SID}"
+  if [ "$http_code" = "200" ] && [ "$old_code" = "200" ]; then
+    retire_vendor_file "$VENDOR_ACTIVE" "$PREV_VENDOR_SID"
+    retire_vendor_file "$VENDOR_ACTIVE" "$SID"
   fi
 fi
 
