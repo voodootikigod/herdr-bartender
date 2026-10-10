@@ -128,13 +128,19 @@ retire_vendor_file() {
 #   and retries dismissal under cache lock.
 # - Otherwise suppress standalone reporting to prevent duplicate entries.
 if is_herdr_owning_pane; then
-  if [ -n "$VENDOR_ACTIVE" ] && [ -f "$VENDOR_ACTIVE" ]; then
+  if [ -n "$VENDOR_ACTIVE" ] && [ -f "$VENDOR_ACTIVE" ] && [ "$EVENT" != "PreToolUse" ]; then
     prev_sid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
     pend_sid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"pending_dismissal_sid"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
     local_ok=1
+    attempt_count=0
     for s in $prev_sid $pend_sid; do
       [ -n "$s" ] || continue
-      if ! send_dismissal "$s"; then
+      if [ "$attempt_count" -lt 4 ]; then
+        attempt_count=$((attempt_count + 1))
+        if ! send_dismissal "$s"; then
+          local_ok=0
+        fi
+      else
         local_ok=0
       fi
     done
@@ -210,33 +216,53 @@ sweep_standalone_active() {
   for f in "$sa_dir"/*.active; do
     [ -f "$f" ] || continue
     [ -n "$VENDOR_ACTIVE" ] && [ "$f" = "$VENDOR_ACTIVE" ] && continue
-    if [ "$count" -ge 2 ]; then
-      break
-    fi
-    count=$((count + 1))
     local f_pid f_sid f_pend is_dead mtime age
     f_pid=$(cat "$f" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | tr -cd '0-9')
     f_sid=$(cat "$f" 2>/dev/null | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
     f_pend=$(cat "$f" 2>/dev/null | LC_ALL=C grep -o '"pending_dismissal_sid"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
 
+    # Determine age
+    mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
+    age=$(( now - mtime ))
+
     is_dead=0
     if [ -n "$f_pid" ]; then
       if ! kill -0 "$f_pid" 2>/dev/null; then
         is_dead=1
+      elif [ "$age" -ge 43200 ]; then
+        # 12h age horizon guards against PID reuse
+        is_dead=1
       fi
     else
       # PID-less record: check 12h (43200s) mtime horizon
-      mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
-      age=$(( now - mtime ))
       if [ "$age" -ge 43200 ]; then
         is_dead=1
       fi
     fi
 
     if [ "$is_dead" -eq 1 ]; then
-      local all_ok=1
+      # Validate SIDs: filter to valid format ^[a-zA-Z0-9_-]{16,64}$
+      local valid_sids=""
       for s in $f_sid $f_pend; do
         [ -n "$s" ] || continue
+        if printf '%s' "$s" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
+          valid_sids="${valid_sids:+${valid_sids} }${s}"
+        fi
+      done
+
+      # If dead record contains no valid SIDs at all (corrupted or unparseable), retire it immediately
+      if [ -z "$valid_sids" ]; then
+        retire_vendor_file "$f" ""
+        continue
+      fi
+
+      if [ "$count" -ge 2 ]; then
+        break
+      fi
+      count=$((count + 1))
+
+      local all_ok=1
+      for s in $valid_sids; do
         if ! send_dismissal "$s"; then
           all_ok=0
         fi
@@ -482,7 +508,7 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVE
   if printf '%s' "$SID" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
     to_dismiss=""
     local_count=0
-    for s in $PENDING_DISMISSAL_SID $PREV_VENDOR_SID; do
+    for s in $PREV_VENDOR_SID $PENDING_DISMISSAL_SID; do
       [ -n "$s" ] || continue
       [ "$s" = "$SID" ] && continue
       case " $to_dismiss " in
@@ -560,7 +586,7 @@ fi
 if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEnd" ]; }; then
   to_dismiss=""
   local_count=0
-  for s in $PENDING_DISMISSAL_SID $PREV_VENDOR_SID; do
+  for s in $PREV_VENDOR_SID $PENDING_DISMISSAL_SID; do
     [ -n "$s" ] || continue
     [ "$s" = "$SID" ] && continue
     case " $to_dismiss " in

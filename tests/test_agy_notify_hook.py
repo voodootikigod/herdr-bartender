@@ -518,6 +518,7 @@ class AgyNotifyHookTests(SandboxTestCase):
         va_data = json.loads(va_bytes.decode())
         pending = va_data.get("pending_dismissal_sid", "").split()
         self.assertLessEqual(len(pending), 8, "pending dismissals must be capped at 8")
+        self.assertIn("conv-cap-chain-0010", pending, "immediately preceding session must be preserved in pending dismissals")
 
         # Now test PreToolUse: it must return immediately with allow and NOT attempt dismissals
         t0 = time.monotonic()
@@ -533,6 +534,71 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out, '{"decision":"allow"}')
         self.assertLess(elapsed, 1.5, "PreToolUse must not be blocked by dismissal network calls")
+
+    def test_herdr_owning_pane_pretooluse_skips_dismissal_delays(self):
+        """When Herdr owns the pane, PreToolUse never runs serial dismissals even if .vendor_active has pending SIDs."""
+        pane_id = "ws1:pHandoffPreTool"
+        hex_pane = pane_id.encode("utf-8").hex()
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+        va_file.parent.mkdir(parents=True, exist_ok=True)
+        # Seed .vendor_active with a full pending list
+        va_file.write_text(json.dumps({
+            "vendor_session_id": "conv-handoff-prev-0001",
+            "pending_dismissal_sid": "p1 p2 p3 p4 p5 p6 p7 p8",
+        }))
+        self._fresh_marker(pane_id)
+        self.set_herdr_alive()
+
+        t0 = time.monotonic()
+        code, out, _ = self._run_hook(
+            "PreToolUse",
+            payload={"conversationId": "conv-handoff-curr-0001", "toolCall": {"name": "test_tool"}},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        elapsed = time.monotonic() - t0
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":"allow"}')
+        self.assertLess(elapsed, 1.0, "PreToolUse in handoff branch must return immediately without dismissal delays")
+
+    def test_sweep_standalone_skips_live_records_and_cleans_dead_records(self):
+        """Live standalone records do not consume the 2-file sweep budget, so dead records behind them are swept."""
+        sa_dir = self.state_dir / "standalone"
+        sa_dir.mkdir(parents=True, exist_ok=True)
+
+        my_pid = os.getpid()
+        # Create 2 live records with valid SIDs whose filenames sort before the dead record
+        live1 = sa_dir / "00_live1.active"
+        live1.write_text(json.dumps({"vendor_session_id": "conv-live-000000001", "pid": my_pid}))
+        live2 = sa_dir / "01_live2.active"
+        live2.write_text(json.dumps({"vendor_session_id": "conv-live-000000002", "pid": my_pid}))
+
+        # Dead record that sorts after
+        dead_pid = 99998
+        try:
+            os.kill(dead_pid, 0)
+            dead_pid = 99997
+        except OSError:
+            pass
+        dead_file = sa_dir / "02_dead.active"
+        dead_sid = "conv-dead-after-live-0001"
+        dead_file.write_text(json.dumps({"vendor_session_id": dead_sid, "pid": dead_pid}))
+
+        self.bridge.history.clear()
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "conv-current-run-0001"},
+            env_extra={"AGENT_PID": str(my_pid), "AGENT_TTY": "ttys001"},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(2)
+
+        # Assert dead record was swept and dismissed
+        history_sids = [h.get("session_id") for h in self.bridge.history]
+        self.assertIn(dead_sid, history_sids)
+        self.assertFalse(dead_file.exists(), "dead record must be retired even when preceded by live records")
+        # Live records must remain untouched
+        self.assertTrue(live1.exists())
+        self.assertTrue(live2.exists())
 
     def test_crashed_standalone_session_cleaned_up_on_subsequent_run(self):
         """When an earlier standalone agy process crashes/dies without Stop, the next hook run sweeps it."""
