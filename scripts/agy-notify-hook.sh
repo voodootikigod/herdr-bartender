@@ -183,62 +183,140 @@ is_herdr_owning_pane() {
   return 1
 }
 
+# Safely extract all valid vendor session IDs from a record file.
+# Avoids matching JSON keys (like vendor_session_id or pending_dismissal_sid)
+# and properly splits space- and comma-separated tokens.
+extract_record_sids() {
+  local target_file="$1"
+  [ -f "$target_file" ] || return 0
+  local content
+  content=$(cat "$target_file" 2>/dev/null || true)
+  [ -n "$content" ] || return 0
+  local v_sid p_sid arr_sids
+  v_sid=$(printf '%s' "$content" | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+  p_sid=$(printf '%s' "$content" | LC_ALL=C grep -o '"pending_dismissal_sid"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+  arr_sids=$(printf '%s' "$content" | LC_ALL=C grep -o '"pending_dismissal_sid"[[:space:]]*:[[:space:]]*\[[^]]*\]' 2>/dev/null | LC_ALL=C grep -o '"[a-zA-Z0-9_-]\{16,64\}"' 2>/dev/null | tr -d '"' || true)
+
+  local raw_tokens
+  raw_tokens=$(printf '%s %s %s' "$v_sid" "$p_sid" "$arr_sids" | tr ',' ' ')
+
+  set -f
+  local extracted=""
+  for token in $raw_tokens; do
+    [ -n "$token" ] || continue
+    [ "$token" = "vendor_session_id" ] && continue
+    [ "$token" = "pending_dismissal_sid" ] && continue
+    if printf '%s' "$token" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
+      case " $extracted " in
+        *" $token "*) ;;
+        *) extracted="${extracted:+${extracted} }${token}" ;;
+      esac
+    fi
+  done
+  set +f
+  printf '%s' "$extracted"
+}
+
 # Safely claim and retire a .vendor_active file (mirroring vendor.retire_vendor_file).
-# Checks that the claimed file still holds expected_sid; if rewritten concurrently,
-# restores the newer record so it is never lost.
+# Checks that the claimed file's SIDs are within the set of confirmed_sids;
+# if unconfirmed or newer SIDs exist, restores/merges them so they are never lost.
 retire_vendor_file() {
   local target="$1"
-  local expected_sid="${2:-}"
+  local confirmed_sids="${2:-}"
   [ -f "$target" ] || return 0
+  local t_dir
+  t_dir=$(dirname "$target")
   local claim="${target}.claim-$$-$(date +%s%N 2>/dev/null || date +%s 2>/dev/null || echo $$)"
   if mv -f "$target" "$claim" 2>/dev/null; then
-    if [ -z "$expected_sid" ] || grep -Fq "\"vendor_session_id\":\"${expected_sid}\"" "$claim" 2>/dev/null || grep -q "\"vendor_session_id\"[[:space:]]*:[[:space:]]*\"${expected_sid}\"" "$claim" 2>/dev/null; then
+    if [ -z "$confirmed_sids" ]; then
+      # Unconditional retirement (e.g. swept dead process)
+      rm -f "$claim" 2>/dev/null || true
+      return 0
+    fi
+
+    local claimed_sids
+    claimed_sids=$(extract_record_sids "$claim")
+    if [ -z "$claimed_sids" ]; then
+      # Empty or invalid record
+      rm -f "$claim" 2>/dev/null || true
+      return 0
+    fi
+
+    # Check for any SIDs in $claim that were NOT confirmed dismissed
+    local unconfirmed_sids=""
+    set -f
+    for s in $claimed_sids; do
+      case " $confirmed_sids " in
+        *" $s "*) ;;
+        *) unconfirmed_sids="${unconfirmed_sids:+${unconfirmed_sids} }${s}" ;;
+      esac
+    done
+    set +f
+
+    if [ -z "$unconfirmed_sids" ]; then
+      # All SIDs in claimed record were confirmed dismissed
       rm -f "$claim" 2>/dev/null || true
     else
-      # Newer record written concurrently: restore it so newer session is never lost.
+      # Some SIDs in $claim were not confirmed dismissed (concurrent write or un-attempted).
+      # Restore/merge remaining unconfirmed SIDs into $target.
       if [ ! -e "$target" ]; then
+        # Target has not been rewritten: rewrite $claim with remaining SIDs and restore
+        local first_u="" rest_u=""
+        for s in $unconfirmed_sids; do
+          if [ -z "$first_u" ]; then
+            first_u="$s"
+          else
+            rest_u="${rest_u:+${rest_u} }${s}"
+          fi
+        done
+        local c_pid c_tty c_pid_json="" c_tty_json=""
+        c_pid=$(cat "$claim" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | grep -o '[0-9]*' || true)
+        c_tty=$(cat "$claim" 2>/dev/null | LC_ALL=C grep -o '"tty"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+        [ -n "$c_pid" ] && c_pid_json=",\"pid\":${c_pid}"
+        [ -n "$c_tty" ] && c_tty_json=",\"tty\":\"${c_tty}\""
+        if [ -z "$rest_u" ]; then
+          printf '{"vendor_session_id":"%s"%s%s}\n' "$first_u" "$c_pid_json" "$c_tty_json" > "$claim" 2>/dev/null || true
+        else
+          printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"%s%s}\n' "$first_u" "$rest_u" "$c_pid_json" "$c_tty_json" > "$claim" 2>/dev/null || true
+        fi
         mv -f "$claim" "$target" 2>/dev/null || true
       else
         # Target was recreated concurrently by another invocation.
-        # Merge all SIDs from $claim into $target's pending_dismissal_sid so nothing is ever lost.
-        claimed_sids=$(cat "$claim" 2>/dev/null | LC_ALL=C grep -o '"[a-zA-Z0-9_-]\{16,64\}"' 2>/dev/null | tr -d '"' || true)
-        if [ -n "$claimed_sids" ] && [ -f "$target" ]; then
-          existing_sids=$(cat "$target" 2>/dev/null | LC_ALL=C grep -o '"[a-zA-Z0-9_-]\{16,64\}"' 2>/dev/null | tr -d '"' || true)
-          merged_sids=""
-          set -f
-          for s in $existing_sids $claimed_sids; do
-            case " $merged_sids " in
-              *" $s "*) ;;
-              *) merged_sids="${merged_sids:+${merged_sids} }${s}" ;;
-            esac
-          done
-          set +f
-          first_s=""
-          rest_s=""
-          for s in $merged_sids; do
-            if [ -z "$first_s" ]; then
-              first_s="$s"
+        # Merge unconfirmed SIDs from $claim into $target's pending_dismissal_sid so nothing is ever lost.
+        local existing_sids
+        existing_sids=$(extract_record_sids "$target")
+        local merged_sids=""
+        set -f
+        for s in $existing_sids $unconfirmed_sids; do
+          case " $merged_sids " in
+            *" $s "*) ;;
+            *) merged_sids="${merged_sids:+${merged_sids} }${s}" ;;
+          esac
+        done
+        set +f
+        local first_s="" rest_s=""
+        for s in $merged_sids; do
+          if [ -z "$first_s" ]; then
+            first_s="$s"
+          else
+            rest_s="${rest_s:+${rest_s} }${s}"
+          fi
+        done
+        if [ -n "$first_s" ]; then
+          local TMP_M
+          TMP_M=$(mktemp "${t_dir}/.va.tmp.XXXXXX" 2>/dev/null || true)
+          if [ -n "$TMP_M" ]; then
+            local c_pid c_tty c_pid_json="" c_tty_json=""
+            c_pid=$(cat "$claim" "$target" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | grep -o '[0-9]*' || true)
+            c_tty=$(cat "$claim" "$target" 2>/dev/null | LC_ALL=C grep -o '"tty"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+            [ -n "$c_pid" ] && c_pid_json=",\"pid\":${c_pid}"
+            [ -n "$c_tty" ] && c_tty_json=",\"tty\":\"${c_tty}\""
+            if [ -z "$rest_s" ]; then
+              printf '{"vendor_session_id":"%s"%s%s}\n' "$first_s" "$c_pid_json" "$c_tty_json" > "$TMP_M" 2>/dev/null || true
             else
-              rest_s="${rest_s:+${rest_s} }${s}"
+              printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"%s%s}\n' "$first_s" "$rest_s" "$c_pid_json" "$c_tty_json" > "$TMP_M" 2>/dev/null || true
             fi
-          done
-          if [ -n "$first_s" ]; then
-            t_dir=$(dirname "$target")
-            TMP_M=$(mktemp "${t_dir}/.va.tmp.XXXXXX" 2>/dev/null || true)
-            if [ -n "$TMP_M" ]; then
-              c_pid=$(cat "$claim" "$target" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | grep -o '[0-9]*' || true)
-              c_tty=$(cat "$claim" "$target" 2>/dev/null | LC_ALL=C grep -o '"tty"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
-              c_pid_json=""
-              [ -n "$c_pid" ] && c_pid_json=",\"pid\":${c_pid}"
-              c_tty_json=""
-              [ -n "$c_tty" ] && c_tty_json=",\"tty\":\"${c_tty}\""
-              if [ -z "$rest_s" ]; then
-                printf '{"vendor_session_id":"%s"%s%s}\n' "$first_s" "$c_pid_json" "$c_tty_json" > "$TMP_M" 2>/dev/null || true
-              else
-                printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"%s%s}\n' "$first_s" "$rest_s" "$c_pid_json" "$c_tty_json" > "$TMP_M" 2>/dev/null || true
-              fi
-              mv -f "$TMP_M" "$target" 2>/dev/null || rm -f "$TMP_M" 2>/dev/null || true
-            fi
+            mv -f "$TMP_M" "$target" 2>/dev/null || rm -f "$TMP_M" 2>/dev/null || true
           fi
         fi
         rm -f "$claim" 2>/dev/null || true
@@ -269,19 +347,7 @@ if is_herdr_owning_pane; then
     [ -z "$AGENT_PID" ] && AGENT_PID="$prev_pid"
     [ -z "$AGENT_TTY" ] && AGENT_TTY="$prev_tty"
 
-    # Disable globbing and validate SIDs
-    set -f
-    valid_candidates=""
-    for s in $prev_sid $pend_sid; do
-      [ -n "$s" ] || continue
-      if printf '%s' "$s" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
-        case " $valid_candidates " in
-          *" $s "*) ;;
-          *) valid_candidates="${valid_candidates:+${valid_candidates} }${s}" ;;
-        esac
-      fi
-    done
-    set +f
+    valid_candidates=$(extract_record_sids "$VENDOR_ACTIVE")
 
     remaining_sids=""
     attempt_count=0
@@ -297,7 +363,7 @@ if is_herdr_owning_pane; then
     done
 
     if [ -z "$remaining_sids" ]; then
-      retire_vendor_file "$VENDOR_ACTIVE" "$prev_sid"
+      retire_vendor_file "$VENDOR_ACTIVE" "$valid_candidates"
     else
       # Rewrite .vendor_active with remaining SIDs so progress is preserved across events
       va_dir=$(dirname "$VENDOR_ACTIVE")
@@ -468,13 +534,15 @@ PENDING_DISMISSAL_SID=""
 if [ -n "$VENDOR_ACTIVE" ] && [ -f "$VENDOR_ACTIVE" ]; then
   PREV_VENDOR_SID=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
   PENDING_DISMISSAL_SID=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"pending_dismissal_sid"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
-  if ! printf '%s' "${PREV_VENDOR_SID:-}" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
+  if [ "$PREV_VENDOR_SID" = "vendor_session_id" ] || ! printf '%s' "${PREV_VENDOR_SID:-}" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
     PREV_VENDOR_SID=""
   fi
   if [ -n "${PENDING_DISMISSAL_SID:-}" ]; then
     sanitized_pending=""
     set -f
     for s in $(printf '%s' "$PENDING_DISMISSAL_SID" | tr ',' ' '); do
+      [ "$s" = "pending_dismissal_sid" ] && continue
+      [ "$s" = "vendor_session_id" ] && continue
       if printf '%s' "$s" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
         sanitized_pending="${sanitized_pending:+${sanitized_pending} }${s}"
       fi
@@ -790,11 +858,14 @@ if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEn
   set +f
 
   failed_priors=""
+  succeeded_priors=""
   attempt_count=0
   for s in $to_dismiss; do
     if [ "$attempt_count" -lt 4 ] && has_time_remaining; then
       attempt_count=$((attempt_count + 1))
-      if ! send_dismissal "$s"; then
+      if send_dismissal "$s"; then
+        succeeded_priors="${succeeded_priors:+${succeeded_priors} }${s}"
+      else
         failed_priors="${failed_priors:+${failed_priors} }${s}"
       fi
     else
@@ -807,9 +878,24 @@ if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEn
     200|404|410) current_ok=1 ;;
   esac
 
+  confirmed_sids=""
+  [ "$current_ok" -eq 1 ] && confirmed_sids="$SID"
+  for s in $succeeded_priors; do
+    confirmed_sids="${confirmed_sids:+${confirmed_sids} }${s}"
+  done
+  if [ -n "$PREV_VENDOR_SID" ]; then
+    case " $confirmed_sids " in
+      *" $PREV_VENDOR_SID "*) ;;
+      *)
+        if [ "$current_ok" -eq 1 ] && [ "$PREV_VENDOR_SID" = "$SID" ]; then
+          confirmed_sids="${confirmed_sids:+${confirmed_sids} }${PREV_VENDOR_SID}"
+        fi
+        ;;
+    esac
+  fi
+
   if [ "$current_ok" -eq 1 ] && [ -z "$failed_priors" ]; then
-    retire_vendor_file "$VENDOR_ACTIVE" "$SID"
-    retire_vendor_file "$VENDOR_ACTIVE" "${PREV_VENDOR_SID:-$SID}"
+    retire_vendor_file "$VENDOR_ACTIVE" "$confirmed_sids"
   else
     # Some dismissals could not be confirmed: rewrite .vendor_active with remaining un-dismissed SIDs
     va_dir=$(dirname "$VENDOR_ACTIVE")
@@ -834,7 +920,7 @@ if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEn
       if [ -n "$first_f" ]; then
         # If $VENDOR_ACTIVE was rewritten concurrently on disk, merge concurrent SIDs so they are not lost
         if [ -f "$VENDOR_ACTIVE" ]; then
-          disk_sids=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"[a-zA-Z0-9_-]\{16,64\}"' 2>/dev/null | tr -d '"' || true)
+          disk_sids=$(extract_record_sids "$VENDOR_ACTIVE")
           disk_pid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | grep -o '[0-9]*' || true)
           disk_tty=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"tty"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
           [ -z "$AGENT_PID" ] && [ -n "$disk_pid" ] && AGENT_PID="$disk_pid"

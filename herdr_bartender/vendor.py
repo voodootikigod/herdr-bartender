@@ -109,6 +109,21 @@ def read_vendor_file(path: Path) -> Optional[VendorFile]:
     return VendorFile(path, content, (st.st_ino, st.st_mtime_ns))
 
 
+DISALLOWED_VENDOR_UUIDS = frozenset({
+    "vendor_session_id",
+    "pending_dismissal_sid",
+    "state",
+    "agent",
+    "event",
+    "session_id",
+    "cwd",
+    "title",
+    "terminal",
+    "pid",
+    "tty",
+})
+
+
 def parse_vendor_uuids(record: VendorFile) -> Tuple[str, ...]:
     """All valid vendor UUIDs in ``record`` (vendor_session_id and optional pending_dismissal_sid)."""
     try:
@@ -125,27 +140,34 @@ def parse_vendor_uuids(record: VendorFile) -> Tuple[str, ...]:
     if not isinstance(parsed, dict):
         return ()
     found = []
+
+    def _is_valid(candidate: str) -> bool:
+        return bool(
+            candidate not in DISALLOWED_VENDOR_UUIDS
+            and VENDOR_UUID_REGEX.match(candidate)
+        )
+
     # Primary vendor_session_id: must strictly match VENDOR_UUID_REGEX without whitespace/newlines
     vsid = parsed.get("vendor_session_id")
-    if isinstance(vsid, str) and VENDOR_UUID_REGEX.match(vsid):
+    if isinstance(vsid, str) and _is_valid(vsid):
         found.append(vsid)
     elif isinstance(vsid, list):
         for part in vsid:
-            if isinstance(part, str) and VENDOR_UUID_REGEX.match(part):
+            if isinstance(part, str) and _is_valid(part):
                 found.append(part)
 
     # Optional pending_dismissal_sid: single UUID, list, or space/comma-separated UUIDs
     pnd = parsed.get("pending_dismissal_sid")
     if isinstance(pnd, str):
-        if VENDOR_UUID_REGEX.match(pnd):
+        if _is_valid(pnd):
             found.append(pnd)
         else:
             for part in pnd.replace(",", " ").split(" "):
-                if part and VENDOR_UUID_REGEX.match(part):
+                if part and _is_valid(part):
                     found.append(part)
     elif isinstance(pnd, list):
         for part in pnd:
-            if isinstance(part, str) and VENDOR_UUID_REGEX.match(part):
+            if isinstance(part, str) and _is_valid(part):
                 found.append(part)
     return tuple(dict.fromkeys(found))
 

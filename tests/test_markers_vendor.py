@@ -234,6 +234,14 @@ class ParseVendorUuidsTests(unittest.TestCase):
         self.assertEqual(parse_vendor_uuids(f), ("test-uuid-valid-0002", "test-uuid-valid-0003"))
         self.assertEqual(parse_vendor_uuid(f), "test-uuid-valid-0002")
 
+    def test_disallowed_field_names_rejected(self):
+        f = self._file({
+            "vendor_session_id": "vendor_session_id",
+            "pending_dismissal_sid": "pending_dismissal_sid test-uuid-valid-0002 terminal",
+        })
+        self.assertEqual(parse_vendor_uuids(f), ("test-uuid-valid-0002",))
+        self.assertEqual(parse_vendor_uuid(f), "test-uuid-valid-0002")
+
     def test_empty_and_unreadable_records(self):
         self.assertEqual(parse_vendor_uuids(self._file(None)), ())
         self.assertIsNone(parse_vendor_uuid(self._file(None)))

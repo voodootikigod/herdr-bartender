@@ -1259,6 +1259,134 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(content.get("pid"), 55221)
         self.assertNotIn("tty", content)
 
+    def test_stop_failure_merges_concurrent_multi_pending_sids_without_key_names(self):
+        """When Stop dismissal fails, concurrent disk record with multi-SID pending list is merged without key names."""
+        pane_id = "ws1:pStopMergeMulti"
+        hex_pane = pane_id.encode("utf-8").hex()
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+        va_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Pre-seed .vendor_active with primary SID and multiple space-separated pending SIDs
+        va_file.write_text(json.dumps({
+            "vendor_session_id": "conv-stop-disk-0001",
+            "pending_dismissal_sid": "conv-stop-disk-0002 conv-stop-disk-0003",
+            "pid": 1111,
+            "tty": "ttys001",
+        }))
+
+        # Bartender dies so Stop delivery fails
+        self.clear_fake_processes()
+
+        code, out, _ = self._run_hook(
+            "Stop",
+            payload={"conversationId": "conv-stop-incoming-0000"},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":""}')
+
+        self.assertTrue(va_file.exists(), ".vendor_active must be preserved when Stop fails")
+        data = json.loads(va_file.read_text())
+        all_sids = [data.get("vendor_session_id")] + data.get("pending_dismissal_sid", "").split()
+
+        # All real SIDs must be preserved
+        for expected in ("conv-stop-incoming-0000", "conv-stop-disk-0001", "conv-stop-disk-0002", "conv-stop-disk-0003"):
+            self.assertIn(expected, all_sids)
+
+        # Neither JSON key name must appear as a session ID
+        self.assertNotIn("vendor_session_id", all_sids)
+        self.assertNotIn("pending_dismissal_sid", all_sids)
+
+    def test_stop_confirmed_preserves_unconfirmed_concurrent_sids(self):
+        """Confirmed Stop only retires matching SIDs; concurrent unconfirmed SIDs on disk are preserved."""
+        pane_id = "ws1:pStopPreserveUnconfirmed"
+        hex_pane = pane_id.encode("utf-8").hex()
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+        va_file.parent.mkdir(parents=True, exist_ok=True)
+
+        va_file.write_text(json.dumps({
+            "vendor_session_id": "conv-confirmed-stop-0001",
+            "pending_dismissal_sid": "conv-unconfirmed-concurrent-0099",
+            "pid": 2222,
+            "tty": "ttys002",
+        }))
+
+        # Invoke retire_vendor_file directly with only the confirmed SID
+        bash_test = f"""
+set -eu
+eval "$(sed -n '/^extract_record_sids()/,/^retire_vendor_file()/p' "{HOOK_SCRIPT}" | sed '/^retire_vendor_file()/d')"
+eval "$(sed -n '/^retire_vendor_file()/,/^# If Herdr actively/p' "{HOOK_SCRIPT}" | sed '/^# If Herdr actively/d')"
+
+TARGET="{va_file}"
+retire_vendor_file "$TARGET" "conv-confirmed-stop-0001"
+"""
+        proc = subprocess.run(["/bin/bash", "-c", bash_test], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, f"Bash test failed: {proc.stderr}")
+
+        # va_file MUST still exist because conv-unconfirmed-concurrent-0099 was NOT confirmed dismissed!
+        self.assertTrue(va_file.exists(), ".vendor_active must not be deleted if it holds unconfirmed SIDs")
+        data = json.loads(va_file.read_text())
+        all_sids = [data.get("vendor_session_id")] + data.get("pending_dismissal_sid", "").split()
+        self.assertIn("conv-unconfirmed-concurrent-0099", all_sids)
+        self.assertNotIn("conv-confirmed-stop-0001", all_sids)
+
+    def test_extract_record_sids_and_concurrent_merge_with_multi_pending_sids(self):
+        """extract_record_sids and retire_vendor_file correctly merge multi-pending SIDs without key names."""
+        pane_id = "ws1:pExtractAndMerge"
+        hex_pane = pane_id.encode("utf-8").hex()
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+        va_file.parent.mkdir(parents=True, exist_ok=True)
+
+        va_file.write_text(json.dumps({
+            "vendor_session_id": "conv-target-valid-0001",
+            "pending_dismissal_sid": "conv-target-valid-0002 conv-target-valid-0003",
+            "pid": 1111,
+            "tty": "ttys001",
+        }))
+
+        bash_test = f"""
+set -eu
+eval "$(sed -n '/^extract_record_sids()/,/^retire_vendor_file()/p' "{HOOK_SCRIPT}" | sed '/^retire_vendor_file()/d')"
+eval "$(sed -n '/^retire_vendor_file()/,/^# If Herdr actively/p' "{HOOK_SCRIPT}" | sed '/^# If Herdr actively/d')"
+
+TARGET="{va_file}"
+# 1. Test extract_record_sids on multi-pending record
+sids=$(extract_record_sids "$TARGET")
+for bad in vendor_session_id pending_dismissal_sid; do
+  if [[ " $sids " == *" $bad "* ]]; then
+    echo "FAIL: extract_record_sids leaked key $bad" >&2
+    exit 1
+  fi
+done
+
+# 2. Test retire_vendor_file when file has unconfirmed SIDs and target exists
+# Create a separate file to retire
+OTHER="{self.state_dir}/panes/other.vendor_active"
+cat << 'EOF' > "$OTHER"
+{{"vendor_session_id":"conv-other-valid-0004","pending_dismissal_sid":"conv-other-valid-0005 conv-other-valid-0006","pid":3333}}
+EOF
+
+# Call retire_vendor_file on OTHER with a confirmed SID that does not cover all SIDs
+retire_vendor_file "$OTHER" "conv-other-valid-0004"
+
+# OTHER must still exist with remaining unconfirmed SIDs 0005 and 0006
+if [ ! -f "$OTHER" ]; then
+  echo "FAIL: OTHER was deleted despite having unconfirmed SIDs" >&2
+  exit 2
+fi
+rem_sids=$(extract_record_sids "$OTHER")
+if [[ " $rem_sids " == *"conv-other-valid-0004"* ]]; then
+  echo "FAIL: confirmed SID was not removed from OTHER" >&2
+  exit 3
+fi
+if [[ " $rem_sids " != *"conv-other-valid-0005"* ]] || [[ " $rem_sids " != *"conv-other-valid-0006"* ]]; then
+  echo "FAIL: unconfirmed SIDs were not preserved in OTHER: $rem_sids" >&2
+  exit 4
+fi
+"""
+        proc = subprocess.run(["/bin/bash", "-c", bash_test], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, f"Bash test failed: {proc.stderr}")
+
 
 
 
