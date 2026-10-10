@@ -1548,6 +1548,93 @@ fi
         self.assertEqual(self.bridge.history[-1]["session_id"], "conv-shared-prefix-alpha")
         self.assertEqual(self.bridge.history[-1]["state"], "Idle")
 
+    def test_standalone_same_pwd_no_pid_tty_never_dismiss_each_other(self):
+        """Two standalone sessions in the exact same directory without PID/TTY/TERM_SESSION_ID never dismiss each other."""
+        self.bridge.history.clear()
+        shared_dir = self.tmp / "single-repo-directory"
+        shared_dir.mkdir(parents=True, exist_ok=True)
+
+        env = {
+            "HERDR_PANE_ID": "",
+            "AGY_HOOK_AGENT_PID": "none",
+            "AGENT_PID": "",
+            "AGY_HOOK_NO_TTY": "1",
+            "AGENT_TTY": "none",
+            "TERM_SESSION_ID": "",
+            "PWD": str(shared_dir),
+        }
+
+        # 1. Session A starts in shared_dir
+        code_a1, _, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "conv-same-pwd-session-aaa"},
+            env_extra=env,
+            cwd=shared_dir,
+        )
+        self.assertEqual(code_a1, 0)
+        self._wait_for_history(1)
+        self.assertEqual(len(self.bridge.history), 1)
+        self.assertEqual(self.bridge.history[-1]["session_id"], "conv-same-pwd-session-aaa")
+        self.assertEqual(self.bridge.history[-1]["state"], "Working")
+
+        # 2. Session B starts in the EXACT SAME shared_dir
+        code_b1, _, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "conv-same-pwd-session-bbb"},
+            env_extra=env,
+            cwd=shared_dir,
+        )
+        self.assertEqual(code_b1, 0)
+        self._wait_for_history(2)
+        # Bridge must have received Working for B. It must NEVER have received Ended for A!
+        self.assertEqual(len(self.bridge.history), 2)
+        self.assertEqual(self.bridge.history[-1]["session_id"], "conv-same-pwd-session-bbb")
+        self.assertEqual(self.bridge.history[-1]["state"], "Working")
+
+        # 3. Session A sends PostInvocation: must NOT dismiss session B
+        code_a2, _, _ = self._run_hook(
+            "PostInvocation",
+            payload={"conversationId": "conv-same-pwd-session-aaa"},
+            env_extra=env,
+            cwd=shared_dir,
+        )
+        self.assertEqual(code_a2, 0)
+        self._wait_for_history(3)
+        self.assertEqual(len(self.bridge.history), 3)
+        self.assertEqual(self.bridge.history[-1]["session_id"], "conv-same-pwd-session-aaa")
+        self.assertEqual(self.bridge.history[-1]["state"], "Idle")
+
+        # 4. Session B sends PostInvocation: must NOT dismiss session A
+        code_b2, _, _ = self._run_hook(
+            "PostInvocation",
+            payload={"conversationId": "conv-same-pwd-session-bbb"},
+            env_extra=env,
+            cwd=shared_dir,
+        )
+        self.assertEqual(code_b2, 0)
+        self._wait_for_history(4)
+        self.assertEqual(len(self.bridge.history), 4)
+        self.assertEqual(self.bridge.history[-1]["session_id"], "conv-same-pwd-session-bbb")
+        self.assertEqual(self.bridge.history[-1]["state"], "Idle")
+
+        # 5. Session A stops: must NOT dismiss session B
+        code_a3, _, _ = self._run_hook(
+            "Stop",
+            payload={"conversationId": "conv-same-pwd-session-aaa"},
+            env_extra=env,
+            cwd=shared_dir,
+        )
+        self.assertEqual(code_a3, 0)
+        self._wait_for_history(5)
+        self.assertEqual(len(self.bridge.history), 5)
+        self.assertEqual(self.bridge.history[-1]["session_id"], "conv-same-pwd-session-aaa")
+        self.assertEqual(self.bridge.history[-1]["state"], "Ended")
+
+        # Verify that session B was NEVER ended across any of these events
+        ended_sids = [h.get("session_id") for h in self.bridge.history if h.get("state") == "Ended"]
+        self.assertEqual(ended_sids, ["conv-same-pwd-session-aaa"], "Session B must never be dismissed by Session A")
+
+
 
 
 

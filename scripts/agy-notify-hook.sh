@@ -518,13 +518,12 @@ if is_herdr_owning_pane; then
   exit 0
 fi
 
-# In standalone mode (no HERDR_PANE_ID), track active session per process/TTY so Stop reuses the same SID
+# In standalone mode (no HERDR_PANE_ID), track active session per process/TTY/terminal session so Stop reuses the same SID.
+# Only track standalone active file when a reliable identifier (PID, real TTY, or TERM_SESSION_ID) is known,
+# preventing concurrent un-scoped sessions in the same directory from evicting each other.
 if [ -z "$CANONICAL_PANE" ]; then
-  sa_ident="${AGENT_PID:-}:${AGENT_TTY:-}:${TERM_SESSION_ID:-}"
-  if [ -z "$AGENT_PID" ] && [ -z "$AGENT_TTY" ]; then
-    sa_ident="${PWD:-}:${TERM_SESSION_ID:-}"
-  fi
-  if [ "$sa_ident" != ":" ] && [ -n "$sa_ident" ]; then
+  if [ -n "$AGENT_PID" ] || [ -n "$AGENT_TTY" ] || [ -n "$TERM_SESSION_ID" ]; then
+    sa_ident="${PWD:-}:${AGENT_PID:-}:${AGENT_TTY:-}:${TERM_SESSION_ID:-}"
     sa_hex=$(hash_identity_32 "$sa_ident")
     VENDOR_ACTIVE="${STATE_HOME}/standalone/${sa_hex}.active"
   fi
@@ -562,10 +561,16 @@ sweep_standalone_active() {
 
     is_dead=0
     if [ -n "$f_pid" ]; then
-      if ! kill -0 "$f_pid" 2>/dev/null; then
+      if kill -0 "$f_pid" 2>/dev/null; then
+        if [ "$age" -ge 43200 ]; then
+          # 12h age horizon guards against long-lived PID recycling
+          is_dead=1
+        fi
+      elif ! ps -p "$f_pid" >/dev/null 2>&1; then
+        # Process does not exist (ESRCH)
         is_dead=1
-      elif [ "$age" -ge 43200 ]; then
-        # 12h age horizon guards against PID reuse
+      else
+        # Process exists but kill -0 failed (EPERM): PID was reused by another user
         is_dead=1
       fi
     elif [ -n "$f_tty" ]; then
@@ -921,16 +926,7 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVE
           printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"%s}\n' "$SID" "$still_pending" "$tty_json" > "$TMP_VA" 2>/dev/null || true
         fi
       fi
-      confirmed_nonstop_sids=""
-      set -f
-      for s in $to_dismiss; do
-        case " $still_pending " in
-          *" $s "*) ;;
-          *) confirmed_nonstop_sids="${confirmed_nonstop_sids:+${confirmed_nonstop_sids} }${s}" ;;
-        esac
-      done
-      set +f
-      merge_and_commit_vendor_file "$TMP_VA" "$VENDOR_ACTIVE" "$confirmed_nonstop_sids"
+      mv -f "$TMP_VA" "$VENDOR_ACTIVE" 2>/dev/null || rm -f "$TMP_VA" 2>/dev/null || true
     fi
   fi
 fi
