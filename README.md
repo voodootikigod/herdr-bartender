@@ -1,148 +1,174 @@
 # Herdr Bartender Plugin
 
-A Herdr plugin that mirrors Herdr agent status into **Bartender Pro's Top Shelf** on macOS. Top Shelf exposes this status through its NotchBar AI Agent HTTP bridge.
+A lightweight, zero-dependency [Herdr](https://github.com/voodootikigod/herdr) plugin that mirrors AI coding agent activity into **[Bartender 6](https://www.macbartender.com/) Pro's Top Shelf** on macOS.
 
-The spec is [`herdr-bartender-plan.md`](herdr-bartender-plan.md). [`docs/plan-resolutions.md`](docs/plan-resolutions.md) amends it, and where the two disagree, the resolutions file wins.
+Top Shelf displays real-time agent status via its NotchBar AI Agent HTTP bridge, giving you glanceable visibility into your active agents right in your menu bar or notch.
 
-## What it does
+---
 
-| Herdr event | Top Shelf state |
-| :--- | :--- |
-| `pane.agent_status_changed`, `agent_status: working` | `Working` (spinner) |
-| `pane.agent_status_changed`, `agent_status: blocked` | `Waiting` (attention highlight) |
-| `pane.agent_status_changed`, `agent_status: done` | `Done` |
-| `pane.agent_status_changed`, `agent_status: idle` | `Idle` |
-| `pane.agent_status_changed` with `agent` null/empty (agent exited) | `Ended` |
-| `pane.closed`, `tab.closed`, `workspace.closed` | `Ended` (entry removed) |
+## Features
 
-- Agents show as `<Agent> (Herdr)`, for example `Antigravity (Herdr)`, `Claude (Herdr)`, `Codex (Herdr)`, `Gemini (Herdr)`, `Cursor (Herdr)`, `OpenCode (Herdr)`, or `GitHub Copilot (Herdr)`.
-- Each session is identified as `herdr:<host>:<workspace>:<pane>`.
-- Shell panes with no agent are ignored, and an `unknown` status never evicts a session.
-- Every delivery goes through one locked, sequenced sender. A failed delivery is retried at 0/1/2/4/8s.
-- A background reconciler owns retries, TTLs (Working 12h, Idle/Done 24h, Waiting 48h), restart re-syncs and orphan replay.
-- An optional guard patched into Bartender's own Claude/Codex hook scripts stops the same agent from showing twice. Standalone Antigravity (`agy`) sessions also report cleanly via `scripts/agy-notify-hook.sh` with automatic `HERDR_PANE_ID` deduplication.
-- The plugin is pure Python 3 (3.9+, stdlib only) plus bash hook guards. It has no external dependencies.
+- **Real-Time Status Sync**: Automatically maps Herdr agent states (`working`, `blocked`, `done`, `idle`, `closed`) to Bartender Top Shelf states (`Working`, `Waiting`, `Done`, `Idle`, `Ended`).
+- **Multi-Agent Support**: Out-of-the-box recognition for Antigravity (`agy`), Claude Code, OpenAI Codex, Gemini CLI, Cursor, OpenCode, GitHub Copilot, and more.
+- **Antigravity (`agy`) CLI Integration**: Native support both inside Herdr panes and standalone across Ghostty, iTerm2, Terminal.app, Warp, and VS Code.
+- **Vendor Hook Deduplication**: Patches Bartender's built-in Claude Code and Codex hooks so agents running inside Herdr never appear twice in your menu bar.
+- **Fail-Open & Resilient**: Background reconciler handles retries (exponential backoff), session TTL expiry, orphan recovery, and crash cleanup. If Herdr stops, vendor hooks fall through cleanly.
+- **Zero External Dependencies**: Pure Python 3 (3.9+, standard library only) plus POSIX shell scripts. No third-party packages or package managers required.
 
-## Scope and requirements
+---
 
-- **macOS**, with Bartender 6 (Pro) running and Top Shelf enabled. The bridge listens on `127.0.0.1:7823`.
-- **Herdr 0.9.x**. The manifest declares `min_herdr_version = "0.9.0"`. The plan's "Herdr 0.8.x" text describes the event/plugin contract, which 0.9.x keeps (R29).
-- **Single host, loopback only.** The plugin only ever connects to the literal `http://127.0.0.1:<port>`, ignores proxy variables, and never follows redirects. It also sends nothing unless a `Bartender 6`/`Bartender` process is running. Remote Herdr hosts, SSH reverse tunnels, Tailscale and `NOTCHBAR_AGENTS_HOST` are not supported in v1.0 (Plan §8, R22).
+## How It Works
 
-### Configuration
+### Status Mapping
 
-| Variable | Effect |
-| :--- | :--- |
-| `NOTCHBAR_AGENTS_PORT` | Bridge port. It must be an integer from 1024 to 65535. If it is unset or empty, the port is `7823`. Any other value (`abc`, `80`, `70000`, `7823x`) also falls back to `7823` and logs a `WARNING` to `plugin.log`. Set it in the environment Herdr runs plugins with. |
-| `HERDR_PLUGIN_STATE_DIR` | Overrides the state directory (see below). |
-| `HERDR_BARTENDER_VENDOR_HOOKS_DIR` | Overrides the vendor hooks directory. The default is `~/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks`. |
+| Herdr Event / Agent Status | Top Shelf State | Menu Bar Appearance | Description |
+| :--- | :--- | :--- | :--- |
+| `pane.agent_status_changed`, `working` | `Working` | Animated spinner | Agent is executing tools or generating code |
+| `pane.agent_status_changed`, `blocked` | `Waiting` | Attention highlight | Agent needs user input, confirmation, or review |
+| `pane.agent_status_changed`, `done` | `Done` | Completion icon | Task successfully completed |
+| `pane.agent_status_changed`, `idle` | `Idle` | Resting icon | Agent session open and awaiting commands |
+| `pane.agent_status_changed` (agent exited) | `Ended` | Dismissed | Agent process finished |
+| `pane.closed`, `tab.closed`, `workspace.closed` | `Ended` | Dismissed | Pane, tab, or workspace closed |
 
-### State directory
+### Agent Identity & Display
 
-The state directory is resolved identically by Python, the hook guard and `scripts/rollback.sh` (Plan §10.1 #66):
+- **Herdr Panes**: Agents display as `<Agent> (Herdr)` (e.g., `Antigravity (Herdr)`, `Claude (Herdr)`, `Codex (Herdr)`, `Gemini (Herdr)`, `Cursor (Herdr)`, `OpenCode (Herdr)`, `GitHub Copilot (Herdr)`).
+- **Session Keys**: Each Herdr session is uniquely tracked as `herdr:<host>:<workspace>:<pane>`. Shell panes without an active agent are ignored, and transient `unknown` statuses never evict an active session.
+- **Safe Delivery**: All updates pass through a locked, sequenced sender with retries at 0s, 1s, 2s, 4s, and 8s.
+- **Automatic Reconciliation**: A background reconciler manages session TTLs (Working: 12h, Idle/Done: 24h, Waiting: 48h), restarts, and unconfirmed orphan recovery.
 
-```
-${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/herdr-bartender}
-```
+---
 
-The directory is created `0700`, and its files `0600`. It holds:
+## Requirements
 
-- `active-sessions.json`: the session cache.
-- `plugin.log`, rotated at 1MB.
-- `panes/`: pane markers, `.failed` and `.vendor_active`.
-- `spool/` and `results/`: deferred work.
-- `vendor-hook-sha.json`
-- Flag files: `DISABLED`, `DELIVERY_DOWN`, `NO_HOOKS`, `HOOK_NEEDS_REVIEW` and `reconciler.pending`.
+- **macOS** (Apple Silicon or Intel)
+- **Bartender 6 (Pro)** with Top Shelf enabled (default bridge port: `127.0.0.1:7823`)
+- **Herdr >= 0.9.0**
+- **Python 3.9+** (pre-installed on macOS or via Homebrew)
 
-While `DISABLED` exists, every event and the reconciler do nothing. `--cleanup` and the explicit CLI commands still run. Delete the file to re-enable the plugin.
+> [!NOTE]
+> The plugin connects strictly to `http://127.0.0.1:<port>` over loopback, ignores system proxy variables, never follows redirects, and only communicates when a Bartender process is actively running.
 
-## Installation
+---
 
-1. Put the repository somewhere permanent, for example `~/Projects/herdr-bartender`.
-2. Link it into Herdr's plugin directory. The launcher resolves symlinks, so it runs from the repo.
-   ```bash
-   mkdir -p ~/.config/herdr/plugins
-   ln -s ~/Projects/herdr-bartender ~/.config/herdr/plugins/herdr-bartender
-   ```
-3. Restart Herdr, then check that `herdr plugin list` shows `herdr-bartender`.
+## Quick Start / Installation
 
-   [`herdr-plugin.toml`](herdr-plugin.toml) registers:
-   - a startup hook, `./bin/herdr-bartender --reconcile-background`, which starts the detached reconciler and exits;
-   - the four events above, each as `./bin/herdr-bartender <event-name>`.
-
-   Herdr streams the `{event, data, context}` JSON envelope on stdin. Each event invocation is bounded by a 1.5s watchdog, inside Herdr's 2.0s limit.
-4. Optional: install the dedup guard (next section).
-5. Check the setup with `./bin/herdr-bartender --health`. To exercise Top Shelf end to end, run `./bin/herdr-bartender --live-test`.
-
-### Upgrading in place
-
-A `git pull` does not reach a reconciler that is already running: it keeps its old code in memory and keeps
-`reconciler.lock` while any session is live, so the new reconciler cannot start (R38). After pulling, stop it:
+### 1. Clone the repository
+Clone the repository to a permanent location (for example, `~/Projects/herdr-bartender`):
 
 ```bash
-pkill -u "$(id -u)" -f '^[^ ]*[Pp]ython[^ /]* .*/herdr-bartender --reconcile-background( --[a-z-]+)*$'
+git clone https://github.com/voodootikigod/herdr-bartender.git ~/Projects/herdr-bartender
+cd ~/Projects/herdr-bartender
 ```
 
-The next Herdr event starts a reconciler with the new code. `--status` and the startup hook warn while an older
-reconciler (one without the current `reconciler.stamp`) still holds the lock. The stamp's version is a digest of the
-package sources, so this also fires after any later `git pull` that changed the code (R43). Hooks patched by the pre-package
-monolith (a blank line before the guard) are recognised: the reconciler re-lays them out with the current guard
-without asking for a review, and uninstall restores the original bytes (R37).
-
-## Vendor hook dedup guard
-
-Bartender ships its own hooks for Claude Code (`claude-event-hook.sh`) and Codex (`codex-notify-hook.sh`). Without the guard, an agent running in a Herdr pane shows up twice: once from Herdr and once from the vendor hook.
-
-The guard suppresses a vendor notification only while Herdr demonstrably owns that pane. In every other case it falls through to the vendor hook:
-- Herdr is dead.
-- The pane marker is stale (more than 60s old) or missing.
-- The pane has a `.failed` delivery.
-- `DISABLED` or `DELIVERY_DOWN` is set.
-- The event is session-terminal.
-- The event cannot be classified (awk missing, failing, or not done within its 1s deadline; R41).
+### 2. Symlink into Herdr's plugin directory
+Herdr loads plugins from `~/.config/herdr/plugins`. Symlink the repository:
 
 ```bash
-./bin/herdr-bartender --install-hooks     # patch both hooks; records their clean SHA-256 (approval)
-./bin/herdr-bartender --uninstall-hooks   # strip the guard byte-exactly; writes NO_HOOKS
-./bin/herdr-bartender --status            # sessions + HOOK_NEEDS_REVIEW warning
-./bin/herdr-bartender --health            # bridge /health + hooks_guard_intact
+mkdir -p ~/.config/herdr/plugins
+ln -s ~/Projects/herdr-bartender ~/.config/herdr/plugins/herdr-bartender
+```
+
+### 3. Verify plugin registration
+Restart Herdr, then verify that the plugin is recognized:
+
+```bash
+herdr plugin list
+```
+
+You should see `herdr-bartender` in the output.
+
+[`herdr-plugin.toml`](herdr-plugin.toml) registers:
+- A startup hook (`./bin/herdr-bartender --reconcile-background`) which spawns the background reconciler and exits.
+- Event handlers for `pane.agent_status_changed`, `pane.closed`, `tab.closed`, and `workspace.closed`. Each invocation is bounded by a 1.5s watchdog (well within Herdr's 2.0s timeout).
+
+### 4. Verify connectivity
+Verify that Bartender Top Shelf is running and reachable:
+
+```bash
+./bin/herdr-bartender --health
+```
+
+To run an end-to-end simulation that creates, cycles through states, and dismisses a test item on Top Shelf:
+
+```bash
+./bin/herdr-bartender --live-test
+```
+
+### 5. (Recommended) Install Vendor Hook Deduplication
+If you use Claude Code or Codex, install the deduplication guard so agents don't appear twice:
+
+```bash
+./bin/herdr-bartender --install-hooks
+```
+
+---
+
+## Vendor Hook Deduplication Guard
+
+Bartender ships built-in hooks for Claude Code (`claude-event-hook.sh`) and Codex (`codex-notify-hook.sh`). Without deduplication, an agent running inside a Herdr pane would be reported twice: once by Herdr and once by Bartender's native hook.
+
+### How it works
+The guard patches Bartender's vendor hooks non-destructively:
+- **Herdr Active**: While Herdr actively manages a pane, the guard intercepts the vendor hook and lets Herdr control Top Shelf.
+- **Fail-Open Fallback**: If Herdr is closed, a delivery fails, or a pane marker expires (after 60 seconds), the guard immediately falls through to the native vendor hook.
+
+### Managing Hook Patches
+
+```bash
+# Install the guard into vendor hooks and record clean SHA-256 signatures:
+./bin/herdr-bartender --install-hooks
+
+# Remove the guard cleanly (restores byte-for-byte original hooks):
+./bin/herdr-bartender --uninstall-hooks
+
+# Check hook status and detect upstream modifications:
+./bin/herdr-bartender --health
+./bin/herdr-bartender --status
 ```
 
 **`--install-hooks`**
-- Patches each hook atomically: it writes a temp file, checks it with `bash -n`, checks the hook was not changed concurrently, then `os.replace`s it. The mode is kept, with `orig_mode | 0o100`.
-- Keeps a `.pristine` backup of each hook.
+- Patches each hook atomically: writes a temporary file, validates syntax with `bash -n`, ensures no concurrent modification, and replaces the hook atomically while preserving executable permissions.
+- Keeps a `.pristine` backup of each original hook.
 - Records the clean SHA-256 of each hook in `vendor-hook-sha.json`.
-- Clears `NO_HOOKS`, `HOOK_NEEDS_REVIEW` and `.hook_review_alerted`.
-- Exits 0 only when every hook it found carries the current guard. It exits 1 if a hook could not be patched, or if no vendor hooks were found.
+- Clears warning flags (`NO_HOOKS`, `HOOK_NEEDS_REVIEW`).
 
 **`--uninstall-hooks`**
-- Writes `NO_HOOKS` first. This makes the uninstall sticky: the reconciler never re-patches, and queued vendor dismissals are cancelled.
-- Removes exactly the bytes the installer inserted, keeping the original mode.
-- Run `--install-hooks` to undo it.
+- Writes `NO_HOOKS` to disable future patching.
+- Removes exactly the injected bytes, restoring the original file and permissions byte-for-byte.
 
-**Hooks changed upstream (`HOOK_NEEDS_REVIEW`)**
-- The reconciler re-patches a hook automatically only when its guard-free content still matches its recorded SHA.
-- On any mismatch, it patches nothing and writes the per-hook causes to `HOOK_NEEDS_REVIEW`. It also shows a single macOS notification, gated on `.hook_review_alerted`. The log warning is written once per change of causes, not on every pass.
-- `--status` then prints `[WARNING] Vendor hook modified upstream (SHA mismatch). Run 'herdr-bartender --install-hooks' to re-verify and approve changes.`, followed by a `Review needed:` line naming each hook's cause.
-- If you never ran `--install-hooks` (no `vendor-hook-sha.json` and no guard in any hook), the guard is simply not installed (R42): nothing is flagged, alerted or logged.
-- Until you approve the change by re-running `--install-hooks`, the vendor hooks run unguarded, so you may see duplicate entries.
+### Upstream Hook Updates (`HOOK_NEEDS_REVIEW`)
+If Bartender updates its vendor hooks in a new release:
+1. The background reconciler detects the checksum change and leaves the hook untouched.
+2. `--status` displays a warning:
+   ```text
+   [WARNING] Vendor hook modified upstream (SHA mismatch). Run 'herdr-bartender --install-hooks' to re-verify and approve changes.
+   ```
+3. Run `./bin/herdr-bartender --install-hooks` to re-verify, patch, and approve the updated hooks.
 
-## Antigravity (`agy`) CLI support
+---
 
-Antigravity CLI sessions are fully supported both inside Herdr panes and standalone across Ghostty, iTerm2, Terminal.app, Warp, and VS Code:
+## Antigravity (`agy`) CLI Support
+
+Google Antigravity CLI sessions are fully supported both inside Herdr and standalone across Ghostty, iTerm2, Terminal.app, Warp, and VS Code:
 
 - **Inside Herdr**: Herdr natively detects `agy` and emits `pane.agent_status_changed`. The plugin translates this to `Antigravity (Herdr)` on Top Shelf.
-- **Standalone `agy`**: Standalone sessions report directly to Bartender Top Shelf via `scripts/agy-notify-hook.sh`. The hook integrates into Antigravity lifecycle events via `~/.gemini/config/hooks.json`:
-  - `PreInvocation`: Model generation starts / user submits prompt $\rightarrow$ `Working` (`"Thinking..."`)
-  - `PostInvocation`: Model completes its turn and awaits user input $\rightarrow$ `Idle`
-  - `Stop`: Agent execution loop terminates $\rightarrow$ `Ended` (dismisses Top Shelf item)
-- **Automatic Deduplication & Handoff**: If an `agy` session runs within Herdr (`HERDR_PANE_ID` is set):
+- **Standalone `agy`**: Sessions report directly to Bartender Top Shelf via `scripts/agy-notify-hook.sh`.
+- **Automatic Deduplication & Handoff**: If an `agy` session runs inside Herdr (`HERDR_PANE_ID` is set):
   - While Herdr is healthy, direct notifications are suppressed so `herdr-bartender` manages Top Shelf updates with zero duplicate entries.
   - If Herdr is temporarily down or recovering, the hook fails open, records `.vendor_active`, and preserves `Stop` to ensure direct entries are cleanly dismissed when the session exits.
 
 ### Standalone Hook Configuration (`~/.gemini/config/hooks.json`)
 
-To enable standalone `agy` reporting, copy `scripts/agy-notify-hook.sh` to `~/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks/agy-notify-hook.sh` (or keep it in the repo) and add the following entry to `~/.gemini/config/hooks.json`:
+To enable standalone `agy` reporting, copy `scripts/agy-notify-hook.sh` to Bartender's hooks directory (or keep it in the repo):
+
+```bash
+mkdir -p "$HOME/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks"
+cp scripts/agy-notify-hook.sh "$HOME/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks/agy-notify-hook.sh"
+chmod +x "$HOME/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks/agy-notify-hook.sh"
+```
+
+Then add the following configuration to `~/.gemini/config/hooks.json`:
 
 ```json
 {
@@ -174,93 +200,156 @@ To enable standalone `agy` reporting, copy `scripts/agy-notify-hook.sh` to `~/Li
 
 > [!NOTE]
 > **Antigravity Hook Protocol**:
-> Status-bar reporting is driven strictly by lifecycle status events: `PreInvocation` (`Working`), `PostInvocation` (`Idle`), and `Stop`/`SessionEnd` (`Ended`), keeping tool execution completely unaffected with zero overhead. `PreToolUse` should not be registered as a status hook since it functions as an authorization gate in Antigravity; any non-lifecycle event exits 0 immediately without side-effects or delay.
+> Status-bar reporting is driven strictly by lifecycle status events: `PreInvocation` (`Working`), `PostInvocation` (`Idle`), and `Stop`/`SessionEnd` (`Ended`), keeping tool execution completely unaffected with zero overhead. `PreToolUse` is not registered as a status hook since it functions as an authorization gate in Antigravity; any non-lifecycle event exits 0 immediately without side-effects or delay.
 
-## CLI reference
+---
 
-All flags are handled in [`herdr_bartender/cli.py`](herdr_bartender/cli.py). A first argument that is not an option is treated as an event invocation. `--help` (or `-h`) prints usage; any other unknown option (a typo such as `--install-hook`) prints usage to stderr and exits 2 without touching anything (R51).
+## CLI Reference
 
-| Command | Purpose | Exit code |
+All flags are handled in [`herdr_bartender/cli.py`](herdr_bartender/cli.py). Running without arguments or with `--help` prints usage.
+
+| Command | Purpose | Exit Code |
 | :--- | :--- | :--- |
-| `herdr-bartender <event>` (stdin envelope) | Herdr event path, bounded to 1.5s. The event name comes from the envelope, then from argv, then from the legacy `HERDR_PLUGIN_EVENT*` variables (R20). | 0 |
-| `--reconcile-background` | Startup hook: spawns the singleton reconciler detached (`--foreground` is the internal child flag). | 0, or 1 if the spawn failed |
-| `--health` | Prints bridge `/health` JSON plus `hooks_guard_intact` (false for a missing, stale or legacy-layout guard). On failure it prints `{"error": <reason>}`: `bartender_not_running` (no Bartender process found, nothing sent), `invalid_bridge_url`, or `unreachable` (the request failed, or the process probe failed) (R51). | 0 |
-| `--status` | Prints the active session count and each session's state and delivery status, plus the `HOOK_NEEDS_REVIEW` and outdated-reconciler (R38) warnings. | 0, or 1 if the cache is unavailable |
-| `--sessions` | Dumps the session cache as JSON. | 0, or 1 if the cache is unavailable |
-| `--install-hooks` / `--uninstall-hooks` | See above. | 0 on success, 1 otherwise |
-| `--cleanup` | Ends every tracked session on Top Shelf (see below). | 0, 2 or 1 |
-| `--replay-orphans <file>` | Replays an orphan export (see below). | 0 when every record is cleared, otherwise 1 |
-| `--live-test` (alias `--test`) | Live acceptance check against the real bridge (see below). | 0 PASS, 1 FAIL |
-| `--unit-test` | Runs the unittest suite. | 0 pass, 1 fail, 2 if `tests/` is missing |
+| `herdr-bartender <event>` | Handles Herdr plugin event envelope from `stdin` (bounded to 1.5s). | `0` |
+| `--health` | Prints bridge `/health` JSON plus `hooks_guard_intact`. | `0` (or `{"error": ...}`) |
+| `--status` | Prints active session count, session states, delivery status, and warnings. | `0` on success, `1` on error |
+| `--sessions` | Dumps the active session cache as JSON. | `0` on success, `1` on error |
+| `--install-hooks` | Patches vendor hooks with deduplication guard. | `0` on success, `1` on error |
+| `--uninstall-hooks` | Restores original unpatched vendor hooks. | `0` on success, `1` on error |
+| `--cleanup` | Ends every tracked session on Top Shelf. | `0` (success), `2` (partial), `1` (fatal) |
+| `--replay-orphans <file>` | Replays an orphan export file after Bartender restart. | `0` on completion, `1` on error |
+| `--live-test` (alias `--test`) | Runs an end-to-end integration check against the live Bartender bridge. | `0` (PASS), `1` (FAIL) |
+| `--unit-test` | Runs the full unit test suite with hang watchdog. | `0` (PASS), `1` (FAIL) |
+| `--reconcile-background` | Startup hook: spawns the detached background reconciler and exits. | `0` on spawn, `1` on failure |
 
-### `--cleanup` and orphans
+### `--cleanup` and Orphan Recovery
 
-`--cleanup` stages `Ended` for every cached session, salvaged ones included, and delivers each through the normal sender with a 0.15s socket timeout. The whole run gets a budget of `max(10s, 0.15s × sessions)`. It ignores the 1.5s watchdog and runs even while `DISABLED` exists, because rollback sets that flag first.
+`--cleanup` stages `Ended` for every cached session and delivers each through the normal sender with a 0.15s socket timeout:
+- **Exit 0:** Every session was confirmed Ended (HTTP 200).
+- **Exit 2:** At least one session was not confirmed (bridge unreachable or rejected). Unconfirmed sessions are exported to `~/.herdr-bartender-orphans.json` (mode `0600`, outside the state directory).
+- **Exit 1:** Fatal error.
 
-- **Exit 0:** every session was confirmed Ended (HTTP 200).
-- **Exit 2:** at least one session was not confirmed. The bridge was unreachable, rejected the session, ran out of retries, or a session was re-admitted while cleanup ran (R31). The unconfirmed Endeds are exported to `~/.herdr-bartender-orphans.json` (mode `0600`, outside the state dir).
-- **Exit 1:** fatal error.
-
-Once Bartender is running again, replay the export:
+Once Bartender is running again, replay the unconfirmed sessions:
 
 ```bash
 ./bin/herdr-bartender --replay-orphans ~/.herdr-bartender-orphans.json
 ```
 
-Replay works on the file under its `.lock`, at most 256 records per run (R33).
-- A record whose session is live again in the cache is dropped without being sent.
-- Every other record is sent as `Ended`, retried once with the minimal payload if needed.
-- Confirmed records are removed from the file, and unconfirmed ones are kept. The file is unlinked once it is empty.
+The background reconciler also automatically replays the orphan file whenever `/health` succeeds, with an exponential backoff between attempts.
 
-The reconciler also replays the file automatically whenever `/health` is ok, with a per-record backoff of 20s doubling to 300s (R27). Replay never touches `DISABLED` or the state dir.
+---
 
-## Rollback
+## Configuration & State
+
+### Environment Variables
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `NOTCHBAR_AGENTS_PORT` | `7823` | Port for the Bartender NotchBar HTTP bridge (`1024-65535`). If invalid or unset, defaults to `7823` and logs a warning. Set in Herdr's environment if non-default. |
+| `HERDR_PLUGIN_STATE_DIR` | `~/.local/state/herdr/plugins/herdr-bartender` | Overrides the plugin's runtime state directory. |
+| `HERDR_BARTENDER_VENDOR_HOOKS_DIR` | `~/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks` | Overrides Bartender's vendor hooks directory. |
+
+### State Directory
+
+The state directory is resolved identically by Python, the hook guard, and [`scripts/rollback.sh`](scripts/rollback.sh):
+
+```bash
+${HERDR_PLUGIN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/herdr-bartender}
+```
+
+The directory is created with `0700` permissions and files with `0600`:
+
+```text
+herdr-bartender/
+├── active-sessions.json      # Session cache
+├── plugin.log                # Diagnostics log (rotated at 1MB)
+├── vendor-hook-sha.json      # Approved SHA-256 hashes of vendor hooks
+├── panes/                    # Pane markers (.failed, .vendor_active)
+├── spool/ & results/         # Spooled events and deferred reconciler work
+└── DISABLED                  # Flag file: when present, all plugin events are no-ops
+```
+
+> [!TIP]
+> While `DISABLED` exists, all events and the background reconciler do nothing. `--cleanup` and CLI commands still operate. Delete the file to re-enable the plugin.
+
+---
+
+## Upgrading
+
+To update the plugin to the latest version:
+
+```bash
+cd ~/Projects/herdr-bartender
+git pull
+```
+
+Because the background reconciler keeps running in the background and holds `reconciler.lock`, stop it after pulling so the new code is loaded on the next event:
+
+```bash
+pkill -u "$(id -u)" -f '^[^ ]*[Pp]ython[^ /]* .*/herdr-bartender --reconcile-background( --[a-z-]+)*$'
+```
+
+The next Herdr event will automatically start a reconciler with the updated code. Run `./bin/herdr-bartender --status` and `./bin/herdr-bartender --health` to confirm the update.
+
+---
+
+## Uninstallation / Rollback
+
+To cleanly uninstall the plugin, remove all hooks, and reset Top Shelf state, run the automated rollback script:
 
 ```bash
 scripts/rollback.sh
 ```
 
-It runs these steps, in order (Plan §9.1):
-1. Touches `DISABLED`.
-2. Removes the plugin symlinks, both `~/.config/herdr/plugins/herdr-bartender` and `.../plugins/local/herdr-bartender`. If `herdr` is on PATH, it runs `herdr plugin unlink` and checks that `herdr plugin list` no longer shows the plugin.
-3. Waits up to 3s for event handlers that were already running when `DISABLED` appeared (each is bounded by the 1.5s event deadline). If one is still running, it stops there with exit 1 and keeps everything, so re-run it later (R68). Otherwise it kills this user's reconcilers.
-4. Runs `--cleanup`.
-5. Runs `--uninstall-hooks`. If the launcher is unusable, it falls back to a byte-exact strip.
-6. Deletes the state dir, but only if every step succeeded and the directory is the plugin's own: a real directory named `herdr-bartender`, with no symlink anywhere on its path (R53, R59). With a `HERDR_PLUGIN_STATE_DIR` override it must also be one the plugin created itself, which carries `.herdr-bartender-owned` (R72). Anything else, such as `/tmp` or a pre-existing shared directory, is kept, and the script exits 1 so you can check it and remove it by hand.
+The rollback script runs these steps in order:
+1. Creates the `DISABLED` flag to halt incoming events.
+2. Removes plugin symlinks (`~/.config/herdr/plugins/herdr-bartender`).
+3. Waits for any active event handlers to exit and terminates running reconcilers.
+4. Runs `--cleanup` to dismiss all active sessions on Top Shelf.
+5. Runs `--uninstall-hooks` to cleanly remove the vendor deduplication guard.
+6. Safely deletes the plugin state directory.
 
-It exits 0 when everything was removed. Otherwise it exits 1, keeps `DISABLED`, and prints the `--replay-orphans` command if an orphan file exists. Set `HERDR_BARTENDER_BIN` to use a different launcher. The script honours `HERDR_PLUGIN_STATE_DIR`, `XDG_STATE_HOME` and `HERDR_BARTENDER_VENDOR_HOOKS_DIR`.
+---
 
-## Tests
+## Development & Testing
+
+### Running Tests
 
 ```bash
-./bin/herdr-bartender --unit-test                 # verbose run, with a hang watchdog
-python3 -m unittest discover -s tests -t .        # same suite, plain unittest
+# Verbose run with hang watchdog:
+./bin/herdr-bartender --unit-test
+
+# Or run via standard unittest:
+python3 -m unittest discover -s tests -t .
 ```
 
-The suite is stdlib `unittest` and runs on Linux and macOS. Every test runs in a sandbox from `tests/support`:
-- a temporary `HOME`, `XDG_STATE_HOME`, state dir and vendor hooks dir;
-- PATH shims for `pgrep`, `ps`, `osascript` and `herdr`;
-- a scriptable mock bridge on an ephemeral port;
-- an injectable fake clock;
-- a recording spawner in place of the real reconciler spawn.
+The test suite uses standard library `unittest` and runs on macOS and Linux. Every test runs in an isolated sandbox (`tests/support`):
+- Temporary `HOME`, `XDG_STATE_HOME`, state directory, and vendor hooks directory.
+- PATH shims for `pgrep`, `ps`, `osascript`, and `herdr`.
+- Scriptable mock bridge on an ephemeral port.
+- Injectable fake clock and recording process spawner.
 
-No test touches your real home directory, the real hooks, a real Herdr or Bartender process, or real `osascript`. Each §10.1 invariant has a test whose docstring starts `Plan §10.1 #N`.
+No test touches your real home directory, live Bartender process, or installed hooks.
 
-## Live acceptance checklist (Plan §10.2)
+### Live Acceptance Checklist
 
-Run these by hand on the Mac, against the real software:
+To test against live software on macOS:
 
-1. **Bridge (Bartender 6 with Top Shelf enabled):**
-   - Run `./bin/herdr-bartender --live-test`. It reads the `/health` session-count baseline, then POSTs `Working`, `Waiting`, `Done` and `Idle` 1s apart for a unique `herdr:<host>:hb-livetest:<id>` session, then `Ended` (R34).
-   - Watch the entry appear in Top Shelf, change state, and disappear.
-   - The command checks that every POST returned `ok:true` and that the `/health` count returns to the baseline. It prints `RESULT: PASS` or `RESULT: FAIL`.
-   - Keep other agents quiet while it runs, since they move the count too.
-2. **Herdr 0.9.x integration:**
-   - With the plugin linked as above, start Herdr and run Claude Code in a pane.
-   - Check that Working, Waiting, Done and Idle reflect in Top Shelf, and that closing the pane removes the entry.
-3. **Vendor handover:**
-   - With hooks installed, run `claude` in a Herdr pane, then `killall herdr`.
-   - Check that the vendor hook falls through and Top Shelf shows the native (UUID) entry.
-   - Restart Herdr. Check that `cleanup_vendor_active` dismisses the vendor entry and Herdr owns the pane again.
+1. **Bridge Verification (Bartender 6 with Top Shelf enabled):**
+   - Run `./bin/herdr-bartender --live-test`.
+   - Watch the test entry appear in Top Shelf, cycle through `Working`, `Waiting`, `Done`, `Idle`, and dismiss (`Ended`).
+   - Confirms `RESULT: PASS (7/7 checks)`.
+2. **Herdr Integration:**
+   - Link the plugin into Herdr and launch an agent (e.g. Claude Code or Antigravity) in a pane.
+   - Verify that status changes reflect in Top Shelf and closing the pane dismisses the entry.
+3. **Vendor Handover:**
+   - With vendor hooks installed (`--install-hooks`), start `claude` in a Herdr pane, then stop Herdr.
+   - Verify that the vendor hook falls through and Top Shelf shows the native entry.
+   - Restart Herdr and verify that Herdr reclaims the pane and clears any duplicate vendor entry.
 
-Diagnostics: `--status`, `--sessions`, `--health`, and `plugin.log` in the state dir.
+### Architectural Specifications
+
+For comprehensive architectural design records, see:
+- [`herdr-bartender-plan.md`](herdr-bartender-plan.md) — Comprehensive technical architecture specification.
+- [`docs/plan-resolutions.md`](docs/plan-resolutions.md) — Architectural resolutions and invariant catalog.
+- [`docs/traceability.md`](docs/traceability.md) — Invariant-to-test traceability matrix.
