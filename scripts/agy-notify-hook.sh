@@ -171,7 +171,7 @@ if [ -z "$CANONICAL_PANE" ]; then
   sa_ident="${AGENT_PID:-}:${AGENT_TTY:-}:${TERM_SESSION_ID:-}"
   if [ "$sa_ident" != "::" ]; then
     sa_hex=$(printf '%s' "$sa_ident" | LC_ALL=C od -An -v -tx1 | tr -d ' \t\n' | cut -c1-32)
-    VENDOR_ACTIVE="${STATE_HOME}/panes/sa_${sa_hex}.vendor_active"
+    VENDOR_ACTIVE="${STATE_HOME}/standalone/${sa_hex}.active"
   fi
 fi
 
@@ -416,7 +416,7 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVE
           -X POST "http://${HOST}:${PORT}/event" \
           -H 'Content-Type: application/json' \
           --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${PREV_VENDOR_SID}\"}" 2>/dev/null || echo "000")
-        if [ "$old_code" != "200" ]; then
+        if [ "$old_code" != "200" ] && [ "$old_code" != "404" ]; then
           can_write_va=0
           can_deliver=0
         fi
@@ -427,8 +427,9 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVE
     fi
 
     if [ "$can_write_va" -eq 1 ]; then
-      mkdir -m 700 -p "${STATE_HOME}/panes" 2>/dev/null || true
-      TMP_VA=$(mktemp "${STATE_HOME}/panes/.va.tmp.XXXXXX" 2>/dev/null || true)
+      va_dir=$(dirname "$VENDOR_ACTIVE")
+      mkdir -m 700 -p "$va_dir" 2>/dev/null || true
+      TMP_VA=$(mktemp "${va_dir}/.va.tmp.XXXXXX" 2>/dev/null || true)
       if [ -n "$TMP_VA" ]; then
         chmod 0600 "$TMP_VA" 2>/dev/null || true
         printf '{"vendor_session_id":"%s"}\n' "$SID" > "$TMP_VA" 2>/dev/null || true
