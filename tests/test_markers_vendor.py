@@ -18,7 +18,13 @@ from herdr_bartender.markers import (
     touch_pane_marker,
 )
 from herdr_bartender.sanitize import get_hex_pane_id
-from herdr_bartender.vendor import cleanup_vendor_active
+from herdr_bartender.vendor import (
+    VendorFile,
+    cleanup_vendor_active,
+    parse_vendor_uuid,
+    parse_vendor_uuids,
+    resolve_vendor_cleanups,
+)
 from tests.support import SandboxTestCase
 
 
@@ -175,5 +181,114 @@ class MarkerVendorTests(SandboxTestCase):
         self.assertFalse(bare_file.exists(), "Bare touch must be unlinked on pane close")
 
 
+class ParseVendorUuidsTests(unittest.TestCase):
+    def _file(self, content_dict: dict | None) -> VendorFile:
+        from pathlib import Path
+        raw = json.dumps(content_dict).encode("utf-8") if content_dict is not None else None
+        return VendorFile(path=Path("/tmp/fake.vendor_active"), content=raw, identity=(1, 1))
+
+    def test_single_vendor_session_id_string(self):
+        f = self._file({"vendor_session_id": "test-uuid-valid-0001"})
+        self.assertEqual(parse_vendor_uuids(f), ("test-uuid-valid-0001",))
+        self.assertEqual(parse_vendor_uuid(f), "test-uuid-valid-0001")
+
+    def test_pending_dismissal_space_and_comma_separated(self):
+        f = self._file({
+            "vendor_session_id": "test-uuid-valid-0001",
+            "pending_dismissal_sid": "test-uuid-valid-0002, test-uuid-valid-0003 test-uuid-valid-0004",
+        })
+        expected = (
+            "test-uuid-valid-0001",
+            "test-uuid-valid-0002",
+            "test-uuid-valid-0003",
+            "test-uuid-valid-0004",
+        )
+        self.assertEqual(parse_vendor_uuids(f), expected)
+        self.assertEqual(parse_vendor_uuid(f), "test-uuid-valid-0001")
+
+    def test_list_formats(self):
+        f = self._file({
+            "vendor_session_id": ["test-uuid-valid-0001", "test-uuid-valid-0002"],
+            "pending_dismissal_sid": ["test-uuid-valid-0003", "test-uuid-valid-0004"],
+        })
+        expected = (
+            "test-uuid-valid-0001",
+            "test-uuid-valid-0002",
+            "test-uuid-valid-0003",
+            "test-uuid-valid-0004",
+        )
+        self.assertEqual(parse_vendor_uuids(f), expected)
+
+    def test_deduplication_preserves_order(self):
+        f = self._file({
+            "vendor_session_id": "test-uuid-valid-0001",
+            "pending_dismissal_sid": "test-uuid-valid-0002 test-uuid-valid-0001 test-uuid-valid-0003",
+        })
+        self.assertEqual(parse_vendor_uuids(f), ("test-uuid-valid-0001", "test-uuid-valid-0002", "test-uuid-valid-0003"))
+
+    def test_invalid_parts_and_sanitization(self):
+        f = self._file({
+            "vendor_session_id": "bad!char",
+            "pending_dismissal_sid": "short test-uuid-valid-0002 invalid;semicolon test-uuid-valid-0003",
+        })
+        self.assertEqual(parse_vendor_uuids(f), ("test-uuid-valid-0002", "test-uuid-valid-0003"))
+        self.assertEqual(parse_vendor_uuid(f), "test-uuid-valid-0002")
+
+    def test_empty_and_unreadable_records(self):
+        self.assertEqual(parse_vendor_uuids(self._file(None)), ())
+        self.assertIsNone(parse_vendor_uuid(self._file(None)))
+        self.assertEqual(parse_vendor_uuids(self._file({})), ())
+        self.assertIsNone(parse_vendor_uuid(self._file({})))
+
+
+class MultiUuidReconcilerStagingTests(SandboxTestCase):
+    def test_resolve_vendor_cleanups_multi_uuid(self):
+        """resolve_vendor_cleanups stages all valid UUIDs from a multi-UUID record."""
+        pane = "w1:pMultiStage"
+        hex_p = get_hex_pane_id(pane)
+        va_file = self.state_dir / "panes" / f"{hex_p}.vendor_active"
+        va_file.parent.mkdir(parents=True, exist_ok=True)
+        va_file.write_text(json.dumps({
+            "vendor_session_id": "test-stage-uuid-0001",
+            "pending_dismissal_sid": "test-stage-uuid-0002 test-stage-uuid-0003",
+        }))
+
+        with self.cache_mgr as data:
+            res = resolve_vendor_cleanups(data, [pane], now=100.0)
+            self.assertEqual(
+                res.dismissals,
+                ("test-stage-uuid-0001", "test-stage-uuid-0002", "test-stage-uuid-0003"),
+            )
+            for sid in ("test-stage-uuid-0001", "test-stage-uuid-0002", "test-stage-uuid-0003"):
+                self.assertIn(sid, data["dismissed_vendor_uuids"])
+            res.commit()
+
+        self.assertFalse(va_file.exists())
+
+    def test_stage_stale_multi_uuid(self):
+        """_stage_stale stages all UUIDs from an orphaned stale vendor file before retiring it."""
+        from herdr_bartender.dismissals import _stage_stale
+        from herdr_bartender.vendor import retire_vendor_file
+        pane = "w1:pStaleMulti"
+        hex_p = get_hex_pane_id(pane)
+        va_file = self.state_dir / "panes" / f"{hex_p}.vendor_active"
+        va_file.parent.mkdir(parents=True, exist_ok=True)
+        va_file.write_text(json.dumps({
+            "vendor_session_id": "test-stale-uuid-0001",
+            "pending_dismissal_sid": "test-stale-uuid-0002, test-stale-uuid-0003",
+        }))
+
+        with self.cache_mgr as data:
+            retired = _stage_stale(data, [va_file], now=200.0)
+            self.assertEqual(len(retired), 1)
+            for sid in ("test-stale-uuid-0001", "test-stale-uuid-0002", "test-stale-uuid-0003"):
+                self.assertIn(sid, data["dismissed_vendor_uuids"])
+            for rec in retired:
+                retire_vendor_file(rec)
+
+        self.assertFalse(va_file.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
+

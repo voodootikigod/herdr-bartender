@@ -261,23 +261,32 @@ find_agent_pid() {
   return 0
 }
 
-AGENT_PID="${AGENT_PID:-$(find_agent_pid 2>/dev/null || true)}"
-if ! printf '%s' "${AGENT_PID:-}" | grep -Eq '^[0-9]+$'; then
+AGENT_PID="${AGY_HOOK_AGENT_PID:-${AGENT_PID:-$(find_agent_pid 2>/dev/null || true)}}"
+if ! printf '%s' "${AGENT_PID:-}" | grep -Eq '^[0-9]{1,9}$'; then
   AGENT_PID=""
 fi
 
 # Resolve controlling terminal for multi-session collision avoidance
-AGENT_TTY="${AGENT_TTY:-}"
-if [ -z "$AGENT_TTY" ] || [ "$AGENT_TTY" = "?" ] || [ "$AGENT_TTY" = "??" ]; then
-  if [ -n "$AGENT_PID" ]; then
-    AGENT_TTY=$(ps -o tty= -p "$AGENT_PID" 2>/dev/null | tr -d ' \t\n' || true)
-  fi
+if [ "${AGY_HOOK_NO_TTY:-0}" = "1" ] || [ "${AGENT_TTY:-}" = "none" ]; then
+  AGENT_TTY=""
+else
+  AGENT_TTY="${AGY_HOOK_AGENT_TTY:-${AGENT_TTY:-}}"
   if [ -z "$AGENT_TTY" ] || [ "$AGENT_TTY" = "?" ] || [ "$AGENT_TTY" = "??" ]; then
-    AGENT_TTY=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' \t\n' || true)
+    if [ -n "$AGENT_PID" ]; then
+      AGENT_TTY=$(ps -o tty= -p "$AGENT_PID" 2>/dev/null | tr -d ' \t\n' || true)
+    fi
+    if [ -z "$AGENT_TTY" ] || [ "$AGENT_TTY" = "?" ] || [ "$AGENT_TTY" = "??" ]; then
+      AGENT_TTY=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' \t\n' || true)
+    fi
+    if [ "$AGENT_TTY" = "?" ] || [ "$AGENT_TTY" = "??" ]; then
+      AGENT_TTY=""
+    fi
   fi
-  if [ "$AGENT_TTY" = "?" ] || [ "$AGENT_TTY" = "??" ]; then
-    AGENT_TTY=""
-  fi
+fi
+
+# Validate AGENT_TTY strictly to prevent JSON / path injection
+if ! printf '%s' "${AGENT_TTY:-}" | grep -Eq '^[a-zA-Z0-9/_.-]{1,32}$'; then
+  AGENT_TTY=""
 fi
 
 # In standalone mode (no HERDR_PANE_ID), track active session per process/TTY so Stop reuses the same SID
@@ -339,8 +348,8 @@ sweep_standalone_active() {
         is_dead=1
       fi
     else
-      # PID-less, TTY-less record: 24h (86400s) age horizon
-      if [ "$age" -ge 86400 ]; then
+      # PID-less, TTY-less record: 12h (43200s) age horizon
+      if [ "$age" -ge 43200 ]; then
         is_dead=1
       fi
     fi
@@ -662,7 +671,7 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVE
     TMP_VA=$(mktemp "${va_dir}/.va.tmp.XXXXXX" 2>/dev/null || true)
     if [ -n "$TMP_VA" ]; then
       chmod 0600 "$TMP_VA" 2>/dev/null || true
-      local tty_json=""
+      tty_json=""
       [ -n "${AGENT_TTY:-}" ] && tty_json=",\"tty\":\"${AGENT_TTY}\""
       if [ -z "$still_pending" ]; then
         if [ -n "$AGENT_PID" ]; then

@@ -1195,5 +1195,60 @@ class AgyNotifyHookTests(SandboxTestCase):
         # dead_file must be unlinked because /dev/nonexistent_term_9999 does not exist
         self.assertFalse(dead_file.exists(), "dead TTY standalone record must be swept")
 
+    def test_headless_tty_less_hook_execution_succeeds_without_error(self):
+        """In a headless environment without TTY (CI/IDE), hook runs without 'local' or unbound errors."""
+        pane_id = "ws1:pHeadless"
+        hex_pane = pane_id.encode("utf-8").hex()
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+        self.bridge.history.clear()
+
+        code, out, err = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "conv-headless-0001"},
+            env_extra={
+                "HERDR_PANE_ID": pane_id,
+                "AGY_HOOK_NO_TTY": "1",
+                "AGENT_TTY": "none",
+                "AGENT_PID": "44112",
+            },
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "{}")
+        self.assertNotIn("local: can only be used in a function", err)
+        self.assertNotIn("unbound variable", err)
+        self._wait_for_history(1)
+        self.assertEqual(len(self.bridge.history), 1)
+        self.assertEqual(self.bridge.history[-1].get("session_id"), "conv-headless-0001")
+        self.assertTrue(va_file.exists(), ".vendor_active must be created in headless mode")
+        content = json.loads(va_file.read_text())
+        self.assertEqual(content.get("vendor_session_id"), "conv-headless-0001")
+        self.assertEqual(content.get("pid"), 44112)
+        self.assertNotIn("tty", content)
+
+    def test_malformed_agent_tty_does_not_inject_or_corrupt_json(self):
+        """Unsanitized AGENT_TTY containing quotes or JSON characters is rejected and does not corrupt JSON."""
+        pane_id = "ws1:pInjection"
+        hex_pane = pane_id.encode("utf-8").hex()
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+
+        code, out, err = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "conv-inject-0001"},
+            env_extra={
+                "HERDR_PANE_ID": pane_id,
+                "AGENT_TTY": 'evil"quoted,injection:true',
+                "AGENT_PID": "55221",
+            },
+        )
+        self.assertEqual(code, 0)
+        self.assertTrue(va_file.exists())
+        # The file content must be valid parseable JSON without any corruption
+        raw = va_file.read_text()
+        content = json.loads(raw)
+        self.assertEqual(content.get("vendor_session_id"), "conv-inject-0001")
+        self.assertEqual(content.get("pid"), 55221)
+        self.assertNotIn("tty", content)
+
+
 
 
