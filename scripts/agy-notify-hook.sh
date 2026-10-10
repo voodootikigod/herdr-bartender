@@ -74,13 +74,14 @@ send_dismissal() {
     --max-time 0.5 \
     -X POST "http://${HOST}:${PORT}/event" \
     -H 'Content-Type: application/json' \
-    --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${target_sid}\"}" 2>/dev/null || echo "000")
-  if [ "$code" = "000" ]; then
-    # Connection failure or timeout: short-circuit all later requests in this invocation
-    BARTENDER_UNREACHABLE=1
-  fi
+    --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${target_sid}\"}" 2>/dev/null || true)
   case "$code" in
     200|404|410) return 0 ;;
+    000*|"")
+      # Connection failure or timeout: short-circuit all later requests in this invocation
+      BARTENDER_UNREACHABLE=1
+      return 1
+      ;;
     *) return 1 ;;
   esac
 }
@@ -344,7 +345,7 @@ sweep_standalone_active() {
 
       local all_ok=1
       for s in $valid_sids; do
-        if [ "$sweep_requests" -ge "$max_sweep_requests" ]; then
+        if [ "$sweep_requests" -ge "$max_sweep_requests" ] || ! has_time_remaining; then
           all_ok=0
           break
         fi
@@ -605,6 +606,8 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVE
             if [ "$local_count" -lt 32 ]; then
               to_dismiss="${to_dismiss:+${to_dismiss} }${s}"
               local_count=$((local_count + 1))
+            else
+              printf '[herdr-bartender] Warning: pending dismissal cap (32) reached; dropping oldest SID %s\n' "$s" >&2
             fi
             ;;
         esac
@@ -658,7 +661,7 @@ fi
 
 # Send event synchronously with tight timeout. Strictly loopback, no proxies, no redirects.
 http_code="000"
-if is_bartender_alive; then
+if [ "$BARTENDER_UNREACHABLE" != "1" ] && has_time_remaining && is_bartender_alive; then
   http_code=$(curl -s -o /dev/null -w "%{http_code}" \
     --noproxy '*' \
     --max-redirs 0 \
@@ -667,7 +670,14 @@ if is_bartender_alive; then
     --max-time 0.5 \
     -X POST "http://${HOST}:${PORT}/event" \
     -H 'Content-Type: application/json' \
-    --data-raw "$payload" 2>/dev/null || echo "000")
+    --data-raw "$payload" 2>/dev/null || true)
+  case "$http_code" in
+    200|404|410) ;;
+    000*|"")
+      http_code="000"
+      BARTENDER_UNREACHABLE=1
+      ;;
+  esac
 fi
 
 # On Stop/SessionEnd, retire .vendor_active ONLY if dismissal was confirmed by HTTP 200, 404, or 410.
@@ -687,6 +697,8 @@ if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEn
           if [ "$local_count" -lt 32 ]; then
             to_dismiss="${to_dismiss:+${to_dismiss} }${s}"
             local_count=$((local_count + 1))
+          else
+            printf '[herdr-bartender] Warning: pending dismissal cap (32) reached; dropping oldest SID %s\n' "$s" >&2
           fi
           ;;
       esac

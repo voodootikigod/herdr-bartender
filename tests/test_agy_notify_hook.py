@@ -1079,3 +1079,67 @@ class AgyNotifyHookTests(SandboxTestCase):
         self._wait_for_history(1)
         self.assertEqual(len(self.bridge.history), 1)
         self.assertEqual(self.bridge.history[-1].get("session_id"), "conv-loopback-001")
+
+    def test_unreachable_port_short_circuits_immediately(self):
+        """When Bartender port is unreachable, failure on first request short-circuits all subsequent requests."""
+        self.add_fake_process("Bartender 6", pid=424200)
+        pane_id = "ws1:pUnreach"
+        hex_pane = pane_id.encode("utf-8").hex()
+        vendor_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+        vendor_file.parent.mkdir(parents=True, exist_ok=True)
+        sids = [f"conv-unreach-{i:04d}-xxxx" for i in range(4)]
+        vendor_file.write_text(json.dumps({
+            "vendor_session_id": "conv-unreach-main-0000",
+            "pending_dismissal_sid": " ".join(sids),
+        }))
+
+        t0 = time.monotonic()
+        code, out, err = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "conv-unreach-new-0001"},
+            env_extra={"HERDR_PANE_ID": pane_id, "NOTCHBAR_AGENTS_PORT": "65530"},
+        )
+        elapsed = time.monotonic() - t0
+
+        self.assertEqual(code, 0)
+        self.assertLess(elapsed, 0.8, f"expected fast short-circuit, took {elapsed:.2f}s")
+        content = json.loads(vendor_file.read_text())
+        self.assertEqual(content.get("vendor_session_id"), "conv-unreach-new-0001")
+        pending = content.get("pending_dismissal_sid", "").split()
+        self.assertIn("conv-unreach-main-0000", pending)
+        for s in sids:
+            self.assertIn(s, pending)
+
+    def test_pending_dismissal_cap_warning_logged_to_stderr(self):
+        """When pending dismissal list exceeds 32 SIDs, a warning is logged to stderr."""
+        pane_id = "ws1:pCapWarn"
+        hex_pane = pane_id.encode("utf-8").hex()
+        vendor_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+        vendor_file.parent.mkdir(parents=True, exist_ok=True)
+        many_sids = [f"conv-cap-test-{i:04d}-xxxx" for i in range(35)]
+        vendor_file.write_text(json.dumps({
+            "vendor_session_id": "conv-cap-main-0000",
+            "pending_dismissal_sid": " ".join(many_sids),
+        }))
+
+        code, _, err = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "conv-cap-new-0001"},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("[herdr-bartender] Warning: pending dismissal cap (32) reached", err)
+
+        vendor_file.write_text(json.dumps({
+            "vendor_session_id": "conv-cap-stop-0000",
+            "pending_dismissal_sid": " ".join(many_sids),
+        }))
+        code, _, err = self._run_hook(
+            "Stop",
+            payload={"conversationId": "conv-cap-stop-0000"},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("[herdr-bartender] Warning: pending dismissal cap (32) reached", err)
+
+
