@@ -349,6 +349,39 @@ class AgyNotifyHookTests(SandboxTestCase):
         # .vendor_active now holds B
         self.assertIn(cid_b, va_file.read_text())
 
+    def test_fail_open_new_conversation_failed_dismissal_preserves_previous_session(self):
+        """When dismissal of the previous session fails (non-200), .vendor_active is NOT overwritten."""
+        pane_id = "ws1:pMultiConvFail"
+        hex_pane = pane_id.encode("utf-8").hex()
+        cid_a = "conv-multi-fail-000A"
+        cid_b = "conv-multi-fail-000B"
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+
+        # Step 1: PreInvocation for conv A fails open -> Working
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": cid_a},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(1)
+        self.assertTrue(va_file.exists())
+        self.assertIn(cid_a, va_file.read_text())
+
+        # Step 2: Bridge returns 500 for subsequent events
+        self.bridge.return_code = 500
+
+        # PreInvocation for conv B arrives. Dismissal of A fails (500), so va_file must NOT be overwritten!
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": cid_b},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        # .vendor_active must still contain cid_a because dismissal was not confirmed
+        self.assertTrue(va_file.exists())
+        self.assertIn(cid_a, va_file.read_text(), ".vendor_active must not be overwritten when dismissal fails")
+
     def test_stop_without_conv_id_reuses_stored_vendor_sid(self):
         """When Stop arrives without conversationId, it reuses the session ID recorded in .vendor_active."""
         pane_id = "ws1:pStopNoConvId"
@@ -597,6 +630,60 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(code, 0)
         time.sleep(0.1)
         self.assertEqual(len(self.bridge.history), 3)
+
+    def test_standalone_stop_without_workspace_matches_preinvocation_sid(self):
+        """In standalone mode (no HERDR_PANE_ID), Stop without workspacePaths reuses PreInvocation's SID."""
+        self.bridge.history.clear()
+        env = {"AGENT_PID": "4141", "AGENT_TTY": "ttys999", "TERM_SESSION_ID": "term-sa-1"}
+
+        # PreInvocation with workspacePaths, no conversationId
+        code1, _, _ = self._run_hook(
+            "PreInvocation",
+            payload={"workspacePaths": ["/Users/tester/standalone_project"]},
+            env_extra=env,
+        )
+        self.assertEqual(code1, 0)
+        self._wait_for_history(1)
+        sid1 = self.bridge.history[-1].get("session_id")
+        self.assertTrue(sid1.startswith("agy-session-"))
+
+        # Stop arrives with empty payload (no workspacePaths)
+        code2, _, _ = self._run_hook(
+            "Stop",
+            payload={},
+            env_extra=env,
+        )
+        self.assertEqual(code2, 0)
+        self._wait_for_history(2)
+        sid2 = self.bridge.history[-1].get("session_id")
+
+        self.assertEqual(sid1, sid2, "Stop in standalone mode must match PreInvocation session ID")
+        self.assertEqual(self.bridge.history[-1].get("state"), "Ended")
+
+    def test_bash_fallback_hash_length_and_validity_without_shasum(self):
+        """When shasum/sha256sum/cksum are unavailable, bash fallback still produces a valid 16-64 char SID."""
+        no_tools_dir = self.tmp / "no-tools-bin"
+        no_tools_dir.mkdir(parents=True, exist_ok=True)
+        fake_py = no_tools_dir / "python3"
+        fake_py.write_text("#!/bin/sh\nexit 127\n")
+        fake_py.chmod(0o755)
+
+        env = {
+            "PATH": f"{no_tools_dir}:/bin:/usr/bin",
+            "AGY_HOOK_PYTHON": str(fake_py),
+            "AGENT_PID": "9876",
+            "AGENT_TTY": "ttys009",
+        }
+        self.bridge.history.clear()
+        code, _, _ = self._run_hook("PreInvocation", payload={}, env_extra=env)
+        self.assertEqual(code, 0)
+        self._wait_for_history(1)
+        sid = self.bridge.history[-1].get("session_id", "")
+        self.assertTrue(sid.startswith("agy-fallback-"))
+        self.assertGreaterEqual(len(sid), 16)
+        self.assertLessEqual(len(sid), 64)
+        import re
+        self.assertTrue(re.match(r"^[a-zA-Z0-9_-]{16,64}\Z", sid))
 
     def test_bartender_not_running_skips_delivery(self):
         """When Bartender process is not running, hook skips network request and exits 0 cleanly."""

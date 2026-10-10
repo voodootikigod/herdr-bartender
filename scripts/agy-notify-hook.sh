@@ -166,6 +166,15 @@ if [ -z "$AGENT_TTY" ]; then
   fi
 fi
 
+# In standalone mode (no HERDR_PANE_ID), track active session per process/TTY so Stop reuses the same SID
+if [ -z "$CANONICAL_PANE" ]; then
+  sa_ident="${AGENT_PID:-}:${AGENT_TTY:-}:${TERM_SESSION_ID:-}"
+  if [ "$sa_ident" != "::" ]; then
+    sa_hex=$(printf '%s' "$sa_ident" | LC_ALL=C od -An -v -tx1 | tr -d ' \t\n' | cut -c1-32)
+    VENDOR_ACTIVE="${STATE_HOME}/panes/sa_${sa_hex}.vendor_active"
+  fi
+fi
+
 # Resolve Python interpreter safely:
 # On macOS, /usr/bin/python3 is an xcrun stub that triggers GUI installation prompts
 # if Command Line Tools are missing. We verify CLT before invoking /usr/bin/python3.
@@ -219,116 +228,123 @@ def sanitize_str(raw: object, max_len: int = 120) -> str:
     return strip_controls(raw).strip()[:max_len]
 
 raw_input = sys.stdin.read()
-parse_ok = False
 try:
-    d = json.loads(raw_input) if raw_input.strip() else {}
-    if isinstance(d, dict):
-        parse_ok = True
-    else:
+    parse_ok = False
+    try:
+        d = json.loads(raw_input) if raw_input.strip() else {}
+        if isinstance(d, dict):
+            parse_ok = True
+        else:
+            d = {}
+    except Exception:
         d = {}
-except Exception:
-    d = {}
 
-event = os.environ.get("EVENT") or ""
-if not event:
-    sys.stdout.write("SKIP")
-    sys.exit(0)
+    event = os.environ.get("EVENT") or ""
+    if not event:
+        sys.stdout.write("SKIP")
+        sys.exit(0)
 
-# Antigravity lifecycle mapping:
-# PreInvocation -> turn starts, model thinking -> Working
-# PreToolUse -> tool call started -> Working
-# PostInvocation -> tool calls finished, model turn complete -> Idle
-# Stop / SessionEnd -> execution terminated -> Ended
-if event == "PreInvocation":
-    state = "Working"
-    title = "Thinking..."
-elif event == "PreToolUse":
-    state = "Working"
-    tool_call = d.get("toolCall")
-    tool_name = tool_call.get("name") if isinstance(tool_call, dict) else ""
-    clean_tool = sanitize_str(tool_name, 64)
-    title = f"Tool: {clean_tool}" if clean_tool else "Working"
-elif event == "PostInvocation":
-    state = "Idle"
-    title = ""
-elif event in ("Stop", "SessionEnd"):
-    state = "Ended"
-    title = ""
-else:
-    state = "Working" if "Pre" in event else "Idle"
-    title = ""
-
-try:
-    raw_pid = os.environ.get("AGENT_PID")
-    pid = int(raw_pid) if raw_pid and raw_pid.isdigit() else None
-except Exception:
-    pid = None
-
-# Working directory
-ws = d.get("workspacePaths")
-if isinstance(ws, list) and ws and isinstance(ws[0], str):
-    raw_cwd = ws[0]
-else:
-    raw_cwd = d.get("cwd") or os.getcwd()
-cwd = sanitize_str(raw_cwd, 256)
-
-# Conversation / Session ID
-conv_id = d.get("conversationId")
-if not (isinstance(conv_id, str) and re.match(r"^[a-zA-Z0-9_-]{16,64}\Z", conv_id)):
-    pattern = chr(34) + "conversationId" + chr(34) + r"\s*:\s*" + chr(34) + r"([a-zA-Z0-9_-]{16,64})" + chr(34)
-    m = re.search(pattern, raw_input)
-    if m:
-        conv_id = m.group(1)
+    # Antigravity lifecycle mapping:
+    # PreInvocation -> turn starts, model thinking -> Working
+    # PreToolUse -> tool call started -> Working
+    # PostInvocation -> tool calls finished, model turn complete -> Idle
+    # Stop / SessionEnd -> execution terminated -> Ended
+    if event == "PreInvocation":
+        state = "Working"
+        title = "Thinking..."
+    elif event == "PreToolUse":
+        state = "Working"
+        tool_call = d.get("toolCall")
+        tool_name = tool_call.get("name") if isinstance(tool_call, dict) else ""
+        clean_tool = sanitize_str(tool_name, 64)
+        title = f"Tool: {clean_tool}" if clean_tool else "Working"
+    elif event == "PostInvocation":
+        state = "Idle"
+        title = ""
+    elif event in ("Stop", "SessionEnd"):
+        state = "Ended"
+        title = ""
     else:
-        conv_id = None
+        state = "Working" if "Pre" in event else "Idle"
+        title = ""
 
-prev_sid = os.environ.get("PREV_VENDOR_SID") or ""
-if conv_id:
-    session_id = conv_id
-elif event in ("Stop", "SessionEnd") and prev_sid and re.match(r"^[a-zA-Z0-9_-]{16,64}\Z", prev_sid):
-    session_id = prev_sid
-elif parse_ok or event in ("Stop", "SessionEnd"):
-    # Stable fallback session ID incorporating workspace, terminal session, TTY, and agent PID
-    term_sess = os.environ.get("TERM_SESSION_ID", "")
-    agent_tty = os.environ.get("AGENT_TTY", "")
-    pid_str = str(pid) if pid else ""
-    seed = f"{cwd}:{term_sess}:{agent_tty}:{pid_str}"
-    h = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
-    session_id = f"agy-session-{h}"
-else:
-    # Corrupted / unparseable payload on a non-Stop event without conversationId.
-    # Output SKIP so the hook cleanly ignores it without inventing a phantom session.
+    try:
+        raw_pid = os.environ.get("AGENT_PID")
+        pid = int(raw_pid) if raw_pid and raw_pid.isdigit() else None
+    except Exception:
+        pid = None
+
+    # Working directory
+    ws = d.get("workspacePaths")
+    if isinstance(ws, list) and ws and isinstance(ws[0], str):
+        raw_cwd = ws[0]
+    else:
+        raw_cwd = d.get("cwd") or os.getcwd()
+    cwd = sanitize_str(raw_cwd, 256)
+
+    # Conversation / Session ID
+    conv_id = d.get("conversationId")
+    if not (isinstance(conv_id, str) and re.match(r"^[a-zA-Z0-9_-]{16,64}\Z", conv_id)):
+        pattern = chr(34) + "conversationId" + chr(34) + r"\s*:\s*" + chr(34) + r"([a-zA-Z0-9_-]{16,64})" + chr(34)
+        m = re.search(pattern, raw_input)
+        if m:
+            conv_id = m.group(1)
+        else:
+            conv_id = None
+
+    prev_sid = os.environ.get("PREV_VENDOR_SID") or ""
+    if event in ("Stop", "SessionEnd") and prev_sid and re.match(r"^[a-zA-Z0-9_-]{16,64}\Z", prev_sid):
+        session_id = prev_sid
+    elif conv_id:
+        session_id = conv_id
+    elif parse_ok or event in ("Stop", "SessionEnd"):
+        # Stable fallback session ID incorporating workspace, terminal session, TTY, and agent PID
+        term_sess = os.environ.get("TERM_SESSION_ID", "")
+        agent_tty = os.environ.get("AGENT_TTY", "")
+        pid_str = str(pid) if pid else ""
+        if term_sess or agent_tty or pid_str:
+            seed = f"{term_sess}:{agent_tty}:{pid_str}"
+        else:
+            seed = f"{cwd}:{term_sess}:{agent_tty}:{pid_str}"
+        h = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+        session_id = f"agy-session-{h}"
+    else:
+        # Corrupted / unparseable payload on a non-Stop event without conversationId.
+        # Output SKIP so the hook cleanly ignores it without inventing a phantom session.
+        sys.stdout.write("SKIP")
+        sys.exit(0)
+
+    # Terminal mapping
+    term_map = {
+        "iTerm.app": "iTerm",
+        "Apple_Terminal": "Terminal",
+        "vscode": "VS Code",
+        "WarpTerminal": "Warp",
+        "ghostty": "Ghostty",
+        "Hyper": "Hyper",
+        "WezTerm": "WezTerm",
+        "kitty": "kitty",
+        "tabby": "Tabby",
+        "alacritty": "Alacritty",
+    }
+    raw_term = os.environ.get("TERM_PROGRAM") or ""
+    clean_term = sanitize_str(term_map.get(raw_term, raw_term), 64)
+
+    payload_json = json.dumps({
+        "state": state,
+        "agent": "Antigravity",
+        "event": event,
+        "session_id": session_id,
+        "cwd": cwd,
+        "title": title,
+        "terminal": clean_term,
+        "pid": pid,
+    })
+
+    sys.stdout.write(f"{session_id}\n{payload_json}")
+except Exception:
     sys.stdout.write("SKIP")
     sys.exit(0)
-
-# Terminal mapping
-term_map = {
-    "iTerm.app": "iTerm",
-    "Apple_Terminal": "Terminal",
-    "vscode": "VS Code",
-    "WarpTerminal": "Warp",
-    "ghostty": "Ghostty",
-    "Hyper": "Hyper",
-    "WezTerm": "WezTerm",
-    "kitty": "kitty",
-    "tabby": "Tabby",
-    "alacritty": "Alacritty",
-}
-raw_term = os.environ.get("TERM_PROGRAM") or ""
-clean_term = sanitize_str(term_map.get(raw_term, raw_term), 64)
-
-payload_json = json.dumps({
-    "state": state,
-    "agent": "Antigravity",
-    "event": event,
-    "session_id": session_id,
-    "cwd": cwd,
-    "title": title,
-    "terminal": clean_term,
-    "pid": pid,
-})
-
-sys.stdout.write(f"{session_id}\n{payload_json}")
 ' 2>/dev/null || true)
   if [ "$py_output" = "SKIP" ]; then
     case "$EVENT" in
@@ -364,7 +380,18 @@ if [ -z "${payload:-}" ]; then
     FALLBACK_SID="$PREV_VENDOR_SID"
   else
     seed_str="${PWD:-}:${AGENT_PID:-}:${AGENT_TTY:-}:${TERM_SESSION_ID:-}"
-    h=$(printf '%s' "$seed_str" | shasum -a 256 2>/dev/null | cut -c1-24 || echo "default-fallback")
+    h=""
+    if command -v shasum >/dev/null 2>&1; then
+      h=$(printf '%s' "$seed_str" | shasum -a 256 2>/dev/null | cut -c1-24)
+    elif command -v sha256sum >/dev/null 2>&1; then
+      h=$(printf '%s' "$seed_str" | sha256sum 2>/dev/null | cut -c1-24)
+    elif command -v cksum >/dev/null 2>&1; then
+      h=$(printf '%s' "$seed_str" | cksum 2>/dev/null | tr -cd '0-9')
+    fi
+    if ! printf '%s' "$h" | LC_ALL=C grep -Eq '^[0-9a-zA-Z]{16,64}$'; then
+      h="fb$(printf '%s' "$seed_str" | LC_ALL=C od -An -v -tx1 | tr -d ' \t\n')0123456789abcdef"
+      h=$(printf '%s' "$h" | cut -c1-24)
+    fi
     FALLBACK_SID="agy-fallback-${h}"
   fi
   SID="$FALLBACK_SID"
@@ -373,25 +400,38 @@ fi
 
 # On non-Stop events, record or update .vendor_active during fail-open window
 if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVENT" != "SessionEnd" ]; then
-  # If an existing record holds an older, different session ID, dismiss the older session first
-  if [ -n "$PREV_VENDOR_SID" ] && [ "$PREV_VENDOR_SID" != "$SID" ] && is_bartender_alive; then
-    curl -s \
-      --noproxy '*' \
-      --max-redirs 0 \
-      --proto =http \
-      --connect-timeout 0.15 \
-      --max-time 0.5 \
-      -X POST "http://${HOST}:${PORT}/event" \
-      -H 'Content-Type: application/json' \
-      --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${PREV_VENDOR_SID}\"}" >/dev/null 2>&1 || true
-  fi
+  # Only record if SID matches standard vendor UUID regex (16-64 chars)
+  if printf '%s' "$SID" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
+    can_write_va=1
+    # If an existing record holds an older, different session ID, dismiss the older session first
+    if [ -n "$PREV_VENDOR_SID" ] && [ "$PREV_VENDOR_SID" != "$SID" ]; then
+      if is_bartender_alive; then
+        old_code=$(curl -s -o /dev/null -w "%{http_code}" \
+          --noproxy '*' \
+          --max-redirs 0 \
+          --proto =http \
+          --connect-timeout 0.15 \
+          --max-time 0.5 \
+          -X POST "http://${HOST}:${PORT}/event" \
+          -H 'Content-Type: application/json' \
+          --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${PREV_VENDOR_SID}\"}" 2>/dev/null || echo "000")
+        if [ "$old_code" != "200" ]; then
+          can_write_va=0
+        fi
+      else
+        can_write_va=0
+      fi
+    fi
 
-  mkdir -m 700 -p "${STATE_HOME}/panes" 2>/dev/null || true
-  TMP_VA=$(mktemp "${STATE_HOME}/panes/.va.tmp.XXXXXX" 2>/dev/null || true)
-  if [ -n "$TMP_VA" ]; then
-    chmod 0600 "$TMP_VA" 2>/dev/null || true
-    printf '{"vendor_session_id":"%s"}\n' "$SID" > "$TMP_VA" 2>/dev/null || true
-    mv -f "$TMP_VA" "$VENDOR_ACTIVE" 2>/dev/null || rm -f "$TMP_VA" 2>/dev/null || true
+    if [ "$can_write_va" -eq 1 ]; then
+      mkdir -m 700 -p "${STATE_HOME}/panes" 2>/dev/null || true
+      TMP_VA=$(mktemp "${STATE_HOME}/panes/.va.tmp.XXXXXX" 2>/dev/null || true)
+      if [ -n "$TMP_VA" ]; then
+        chmod 0600 "$TMP_VA" 2>/dev/null || true
+        printf '{"vendor_session_id":"%s"}\n' "$SID" > "$TMP_VA" 2>/dev/null || true
+        mv -f "$TMP_VA" "$VENDOR_ACTIVE" 2>/dev/null || rm -f "$TMP_VA" 2>/dev/null || true
+      fi
+    fi
   fi
 fi
 
@@ -411,8 +451,21 @@ fi
 
 # On Stop/SessionEnd, retire .vendor_active ONLY if dismissal was confirmed by HTTP 200.
 # If delivery timed out or failed, keep .vendor_active intact so Herdr reconciler retries.
-if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEnd" ]; } && [ "$http_code" = "200" ]; then
-  retire_vendor_file "$VENDOR_ACTIVE" "$SID"
+if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEnd" ]; }; then
+  if [ -n "$PREV_VENDOR_SID" ] && [ "$PREV_VENDOR_SID" != "$SID" ] && is_bartender_alive; then
+    curl -s \
+      --noproxy '*' \
+      --max-redirs 0 \
+      --proto =http \
+      --connect-timeout 0.15 \
+      --max-time 0.5 \
+      -X POST "http://${HOST}:${PORT}/event" \
+      -H 'Content-Type: application/json' \
+      --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${PREV_VENDOR_SID}\"}" >/dev/null 2>&1 || true
+  fi
+  if [ "$http_code" = "200" ]; then
+    retire_vendor_file "$VENDOR_ACTIVE" "${PREV_VENDOR_SID:-$SID}"
+  fi
 fi
 
 # Emit expected JSON response to stdout for Antigravity lifecycle
