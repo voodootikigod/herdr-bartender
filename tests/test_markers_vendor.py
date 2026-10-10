@@ -288,33 +288,36 @@ class MultiUuidReconcilerStagingTests(SandboxTestCase):
 
         self.assertFalse(va_file.exists())
 
-    def test_cap_pruning_prevents_file_retirement_when_uuids_dropped(self):
-        """When dismissal queue cap (64) prunes any UUID from a record, that file is NOT unlinked."""
-        pane = "w1:pOverflow"
+    def test_multi_pass_reconciler_unlinks_record_and_terminates(self):
+        """Processing a vendor active file unlinks the file and bounds dismissals so no unbounded retry loop occurs."""
+        pane = "w1:pMultiPass"
         hex_p = get_hex_pane_id(pane)
         va_file = self.state_dir / "panes" / f"{hex_p}.vendor_active"
         va_file.parent.mkdir(parents=True, exist_ok=True)
-        # Record with 70 UUIDs (exceeding the 64 queue cap)
-        uuids = [f"test-overflow-{i:04d}-xxxx" for i in range(70)]
         va_file.write_text(json.dumps({
-            "vendor_session_id": uuids[0],
-            "pending_dismissal_sid": " ".join(uuids[1:]),
+            "vendor_session_id": "test-multipass-0001",
+            "pending_dismissal_sid": "test-multipass-0002",
         }))
 
         with self.cache_mgr as data:
-            res = resolve_vendor_cleanups(data, [pane], now=300.0)
-            self.assertEqual(len(res.unlink), 0, "file must NOT be marked for unlinking when UUIDs are pruned")
+            res = resolve_vendor_cleanups(data, [pane], now=100.0)
+            self.assertEqual(len(res.unlink), 1, "file must be unlinked after staging")
             res.commit()
 
-        # The file MUST still exist so a subsequent pass can retry
-        self.assertTrue(va_file.exists(), ".vendor_active must be preserved when UUIDs were pruned by queue cap")
+        self.assertFalse(va_file.exists(), ".vendor_active must be unlinked to prevent re-reading on subsequent passes")
 
-    def test_stage_dismissal_hex_merges_and_refreshes_existing_entry(self):
-        """Re-staging an existing UUID refreshes timestamp and attempts, and upgrades pane_closed via OR."""
+        # Second pass over same pane sees no file and does not re-stage
+        with self.cache_mgr as data:
+            res2 = resolve_vendor_cleanups(data, [pane], now=101.0)
+            self.assertEqual(len(res2.unlink), 0)
+            self.assertEqual(len(res2.dismissals), 0)
+
+    def test_stage_dismissal_hex_preserves_attempts_and_upgrades_closed(self):
+        """Re-staging an existing UUID preserves timestamp and attempts to bound retries, and upgrades pane_closed via OR."""
         from herdr_bartender.vendor import stage_dismissal_hex
         data = {
             "dismissed_vendor_uuids": {
-                "test-uuid-refresh": {
+                "test-uuid-bound": {
                     "timestamp": 10.0,
                     "pane_hex": "aa",
                     "attempts": 3,
@@ -324,16 +327,16 @@ class MultiUuidReconcilerStagingTests(SandboxTestCase):
             }
         }
         # Re-stage with pane_closed=True at now=20.0
-        entry = stage_dismissal_hex(data, "test-uuid-refresh", "aa", now=20.0, pane_closed=True)
-        self.assertEqual(entry["timestamp"], 20.0)
-        self.assertEqual(entry["attempts"], 0)
-        self.assertEqual(entry["last_attempt"], 0.0)
-        self.assertTrue(entry["pane_closed"])
+        entry = stage_dismissal_hex(data, "test-uuid-bound", "aa", now=20.0, pane_closed=True)
+        self.assertEqual(entry["timestamp"], 10.0, "timestamp must NOT be reset to bound retries")
+        self.assertEqual(entry["attempts"], 3, "attempts must NOT be reset to bound retries")
+        self.assertEqual(entry["last_attempt"], 12.0)
+        self.assertTrue(entry["pane_closed"], "pane_closed must be upgraded to True via OR")
 
         # Re-stage again with pane_closed=False at now=25.0: pane_closed must remain True
-        entry2 = stage_dismissal_hex(data, "test-uuid-refresh", "aa", now=25.0, pane_closed=False)
-        self.assertEqual(entry2["timestamp"], 25.0)
-        self.assertEqual(entry2["attempts"], 0)
+        entry2 = stage_dismissal_hex(data, "test-uuid-bound", "aa", now=25.0, pane_closed=False)
+        self.assertEqual(entry2["timestamp"], 10.0)
+        self.assertEqual(entry2["attempts"], 3)
         self.assertTrue(entry2["pane_closed"])
 
 

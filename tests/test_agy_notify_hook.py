@@ -70,7 +70,6 @@ class AgyNotifyHookTests(SandboxTestCase):
 
         for event, expected_stdout in (
             ("PreInvocation", "{}"),
-            ("PreToolUse", '{"decision":"allow"}'),
             ("PostInvocation", "{}"),
             ("Stop", '{"decision":""}'),
         ):
@@ -527,7 +526,7 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(len(pending), 8, "pending dismissals must be exactly capped at 8")
         self.assertIn("conv-cap-chain-0010", pending, "immediately preceding session must be preserved in pending dismissals")
 
-        # Now test PreToolUse: it must return immediately with allow and NOT attempt dismissals
+        # Unsupported events (like PreToolUse) must exit 0 immediately with empty output and NOT attempt dismissals
         t0 = time.monotonic()
         code, out, _ = self._run_hook(
             "PreToolUse",
@@ -539,11 +538,11 @@ class AgyNotifyHookTests(SandboxTestCase):
         )
         elapsed = time.monotonic() - t0
         self.assertEqual(code, 0)
-        self.assertEqual(out, '{"decision":"allow"}')
-        self.assertLess(elapsed, 1.5, "PreToolUse must not be blocked by dismissal network calls")
+        self.assertEqual(out, "")
+        self.assertLess(elapsed, 0.5, "Unsupported events must not be blocked by dismissal network calls")
 
-    def test_herdr_owning_pane_pretooluse_skips_dismissal_delays(self):
-        """When Herdr owns the pane, PreToolUse never runs serial dismissals even if .vendor_active has pending SIDs."""
+    def test_herdr_owning_pane_unsupported_event_skips_dismissal_delays(self):
+        """When Herdr owns the pane, unsupported events like PreToolUse exit immediately without dismissal delays."""
         pane_id = "ws1:pHandoffPreTool"
         hex_pane = pane_id.encode("utf-8").hex()
         va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
@@ -566,9 +565,9 @@ class AgyNotifyHookTests(SandboxTestCase):
         )
         elapsed = time.monotonic() - t0
         self.assertEqual(code, 0)
-        self.assertEqual(out, '{"decision":"allow"}')
-        self.assertLess(elapsed, 1.0, "PreToolUse in handoff branch must return immediately without dismissal delays")
-        self.assertEqual(len(self.bridge.history), 0, "No dismissal requests should be made during PreToolUse")
+        self.assertEqual(out, "")
+        self.assertLess(elapsed, 0.5, "Unsupported event in handoff branch must return immediately without dismissal delays")
+        self.assertEqual(len(self.bridge.history), 0, "No dismissal requests should be made during unsupported events")
 
     def test_handoff_and_stop_with_more_than_4_pending_sids_dismisses_all(self):
         """When .vendor_active has more than 4 pending SIDs, handoff and Stop dismiss all of them across events."""
@@ -802,21 +801,20 @@ class AgyNotifyHookTests(SandboxTestCase):
 
     def test_event_resolved_from_json_body_alone(self):
         """When AGY_HOOK_EVENT and argv are unset, EVENT is correctly resolved from hook_event_name in JSON."""
-        # 1. PreToolUse in JSON
+        # 1. PreInvocation in JSON
         self.bridge.history.clear()
         code, out, _ = self._run_hook(
             None,
             payload={
-                "hook_event_name": "PreToolUse",
+                "hook_event_name": "PreInvocation",
                 "conversationId": "conv-json-event-001",
-                "toolCall": {"name": "run_command"},
             },
         )
         self.assertEqual(code, 0)
-        self.assertEqual(out, '{"decision":"allow"}')
+        self.assertEqual(out, "{}")
         self._wait_for_history(1)
         self.assertEqual(self.bridge.history[-1].get("state"), "Working")
-        self.assertEqual(self.bridge.history[-1].get("title"), "Tool: run_command")
+        self.assertEqual(self.bridge.history[-1].get("title"), "Thinking...")
 
         # 2. Stop in JSON
         code, out, _ = self._run_hook(
@@ -833,22 +831,22 @@ class AgyNotifyHookTests(SandboxTestCase):
 
     def test_string_sanitization_and_length_caps(self):
         """OSC, ANSI CSI, bidi overrides, and invalid controls are stripped; lengths are capped."""
-        dirty_tool = "\x1b]0;pwn\x07\u202eexe.txt\u202c\x1b[31mrun_command\x1b[0m"
-        long_cwd = "/dir/" + "x" * 500
+        dirty_cwd = "/dir/\x1b]0;pwn\x07\u202eexe.txt\u202c\x1b[31m" + ("x" * 500)
 
         code, out, _ = self._run_hook(
-            "PreToolUse",
+            "PreInvocation",
             payload={
                 "conversationId": "valid-conv-uuid-0001",
-                "toolCall": {"name": dirty_tool},
-                "workspacePaths": [long_cwd],
+                "workspacePaths": [dirty_cwd],
             },
+            env_extra={"TERM_PROGRAM": "\x1b[31miTerm.app\x1b[0m"},
         )
         self.assertEqual(code, 0)
         self._wait_for_history(1)
         ev = self.bridge.history[-1]
-        self.assertEqual(ev.get("title"), "Tool: exe.txtrun_command")
         self.assertEqual(len(ev.get("cwd")), 256)
+        self.assertNotIn("\x1b", ev.get("cwd"))
+        self.assertEqual(ev.get("terminal"), "iTerm")
         self.assertEqual(ev.get("session_id"), "valid-conv-uuid-0001")
 
     def test_invalid_conversation_id_falls_back_to_safe_deterministic_id(self):
@@ -892,25 +890,25 @@ class AgyNotifyHookTests(SandboxTestCase):
         large_content = "x" * (128 * 1024)
         payload = {
             "conversationId": "conv-large-payload-0001",
-            "hook_event_name": "PreToolUse",
-            "toolCall": {"name": "write_file", "args": {"content": large_content}},
+            "hook_event_name": "PreInvocation",
+            "extra_large_data": large_content,
             "workspacePaths": ["/Users/tester/proj"],
         }
         code, out, _ = self._run_hook(None, payload=payload)
         self.assertEqual(code, 0)
-        self.assertEqual(out, '{"decision":"allow"}')
+        self.assertEqual(out, "{}")
         self._wait_for_history(1)
         self.assertEqual(len(self.bridge.history), 1)
         self.assertEqual(self.bridge.history[-1].get("session_id"), "conv-large-payload-0001")
-        self.assertEqual(self.bridge.history[-1].get("title"), "Tool: write_file")
+        self.assertEqual(self.bridge.history[-1].get("state"), "Working")
 
     def test_corrupted_payload_without_conv_id_skips_delivery(self):
         """Corrupted / unparseable payload without conversationId on non-Stop event skips delivery to avoid phantom sessions."""
         self.bridge.history.clear()
         broken_payload = '{"broken_json": true, "partial": ' + ("x" * 1000)
-        code, out, _ = self._run_hook("PreToolUse", payload=broken_payload)
+        code, out, _ = self._run_hook("PreInvocation", payload=broken_payload)
         self.assertEqual(code, 0)
-        self.assertEqual(out, '{"decision":"allow"}')
+        self.assertEqual(out, "{}")
         time.sleep(0.1)
         # Must NOT deliver anything to bridge or mint a phantom session ID
         self.assertEqual(len(self.bridge.history), 0)
@@ -1149,15 +1147,27 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(code, 0)
         self.assertIn("[herdr-bartender] Warning: pending dismissal cap (8) reached", err)
 
-    def test_pretooluse_guarantee_outputs_allow_even_when_home_unset(self):
-        """PreToolUse guarantees {"decision":"allow"} output even when HOME is unset under set -u."""
+    def test_hook_guarantee_outputs_json_even_when_home_unset(self):
+        """Supported lifecycle event guarantees {} output even when HOME is unset under set -u."""
         code, out, _ = self._run_hook(
-            "PreToolUse",
-            payload={"toolCall": {"name": "test_cmd"}},
+            "PreInvocation",
+            payload={"conversationId": "conv-no-home-0001"},
             env_extra={"HOME": ""},
         )
         self.assertEqual(code, 0)
-        self.assertEqual(out, '{"decision":"allow"}')
+        self.assertEqual(out, "{}")
+
+    def test_unsupported_events_exit_zero_immediately(self):
+        """Unsupported events (e.g. PreToolUse, PostToolUse) exit 0 immediately with empty output."""
+        for event in ("PreToolUse", "PostToolUse", "Notification", "Unknown"):
+            with self.subTest(event=event):
+                code, out, _ = self._run_hook(
+                    event,
+                    payload={"conversationId": "conv-unsupported-0001", "toolCall": {"name": "test_cmd"}},
+                    env_extra={"HOME": ""},
+                )
+                self.assertEqual(code, 0)
+                self.assertEqual(out, "")
 
     def test_standalone_sweep_preserves_live_tty_session(self):
         """Standalone sweep does not purge a PID-less session if its TTY device still exists."""

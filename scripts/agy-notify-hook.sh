@@ -10,10 +10,10 @@ if [ -z "$EVENT" ]; then
   EVENT=$(printf '%s' "$RAW_INPUT" | LC_ALL=C grep -o '"hook_event_name"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
 fi
 
-# Whitelist EVENT strictly to prevent injection into JSON or logic
+# Whitelist EVENT strictly to supported lifecycle status events
 case "$EVENT" in
-  PreInvocation|PreToolUse|PostInvocation|Stop|SessionEnd) ;;
-  *) EVENT="" ;;
+  PreInvocation|PostInvocation|Stop|SessionEnd) ;;
+  *) exit 0 ;;
 esac
 
 # Strictly loopback only (Plan §8: literal loopback, no hostname resolution, no remote proxy)
@@ -32,24 +32,12 @@ has_time_remaining() {
   [ $(( now - START_TIME )) -lt 3 ]
 }
 
-# Cleanup trap and PreToolUse guarantee
+# Cleanup trap for temporary scratch files
 TMP_VA=""
-PRETOOLUSE_EMITTED=0
-
-emit_pretooluse() {
-  if [ "$PRETOOLUSE_EMITTED" -eq 0 ]; then
-    PRETOOLUSE_EMITTED=1
-    printf '{"decision":"allow"}\n'
-  fi
-}
-
-cleanup_and_guarantee_pretooluse() {
+cleanup_temp_files() {
   [ -n "${TMP_VA:-}" ] && rm -f "$TMP_VA" 2>/dev/null || true
-  if [ "$EVENT" = "PreToolUse" ] && [ "$PRETOOLUSE_EMITTED" -eq 0 ]; then
-    emit_pretooluse
-  fi
 }
-trap cleanup_and_guarantee_pretooluse EXIT INT TERM
+trap cleanup_temp_files EXIT INT TERM
 
 # Check if Bartender 6 / Bartender is running (memoised per invocation)
 BARTENDER_ALIVE_STATUS=""
@@ -238,11 +226,16 @@ retire_vendor_file() {
             t_dir=$(dirname "$target")
             TMP_M=$(mktemp "${t_dir}/.va.tmp.XXXXXX" 2>/dev/null || true)
             if [ -n "$TMP_M" ]; then
-              chmod 0600 "$TMP_M" 2>/dev/null || true
+              c_pid=$(cat "$claim" "$target" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | grep -o '[0-9]*' || true)
+              c_tty=$(cat "$claim" "$target" 2>/dev/null | LC_ALL=C grep -o '"tty"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+              c_pid_json=""
+              [ -n "$c_pid" ] && c_pid_json=",\"pid\":${c_pid}"
+              c_tty_json=""
+              [ -n "$c_tty" ] && c_tty_json=",\"tty\":\"${c_tty}\""
               if [ -z "$rest_s" ]; then
-                printf '{"vendor_session_id":"%s"}\n' "$first_s" > "$TMP_M" 2>/dev/null || true
+                printf '{"vendor_session_id":"%s"%s%s}\n' "$first_s" "$c_pid_json" "$c_tty_json" > "$TMP_M" 2>/dev/null || true
               else
-                printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"}\n' "$first_s" "$rest_s" > "$TMP_M" 2>/dev/null || true
+                printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"%s%s}\n' "$first_s" "$rest_s" "$c_pid_json" "$c_tty_json" > "$TMP_M" 2>/dev/null || true
               fi
               mv -f "$TMP_M" "$target" 2>/dev/null || rm -f "$TMP_M" 2>/dev/null || true
             fi
@@ -261,7 +254,7 @@ retire_vendor_file() {
 #   and retries dismissal under cache lock.
 # - Otherwise suppress standalone reporting to prevent duplicate entries.
 if is_herdr_owning_pane; then
-  if [ -n "$VENDOR_ACTIVE" ] && [ -f "$VENDOR_ACTIVE" ] && [ "$EVENT" != "PreToolUse" ]; then
+  if [ -n "$VENDOR_ACTIVE" ] && [ -f "$VENDOR_ACTIVE" ]; then
     prev_sid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
     pend_sid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"pending_dismissal_sid"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
     prev_pid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | grep -o '[0-9]*' || true)
@@ -338,7 +331,6 @@ if is_herdr_owning_pane; then
   fi
 
   case "$EVENT" in
-    PreToolUse) emit_pretooluse ;;
     Stop|SessionEnd) printf '{"decision":""}\n' ;;
     *) printf '{}\n' ;;
   esac
@@ -357,9 +349,9 @@ fi
 
 # Sweep orphaned standalone .active files whose recording process has died or aged out
 sweep_standalone_active() {
-  # Never run sweep on PreToolUse (avoid tool latency) or Stop/SessionEnd (prioritize stopping session)
+  # Never run sweep on Stop/SessionEnd (prioritize stopping session)
   case "$EVENT" in
-    PreToolUse|Stop|SessionEnd) return 0 ;;
+    Stop|SessionEnd) return 0 ;;
   esac
   local sa_dir="${STATE_HOME}/standalone"
   [ -d "$sa_dir" ] || return 0
@@ -539,18 +531,11 @@ try:
 
     # Antigravity lifecycle mapping:
     # PreInvocation -> turn starts, model thinking -> Working
-    # PreToolUse -> tool call started -> Working
     # PostInvocation -> tool calls finished, model turn complete -> Idle
     # Stop / SessionEnd -> execution terminated -> Ended
     if event == "PreInvocation":
         state = "Working"
         title = "Thinking..."
-    elif event == "PreToolUse":
-        state = "Working"
-        tool_call = d.get("toolCall")
-        tool_name = tool_call.get("name") if isinstance(tool_call, dict) else ""
-        clean_tool = sanitize_str(tool_name, 64)
-        title = f"Tool: {clean_tool}" if clean_tool else "Working"
     elif event == "PostInvocation":
         state = "Idle"
         title = ""
@@ -621,7 +606,8 @@ try:
         "alacritty": "Alacritty",
     }
     raw_term = os.environ.get("TERM_PROGRAM") or ""
-    clean_term = sanitize_str(term_map.get(raw_term, raw_term), 64)
+    sanitized_term = sanitize_str(raw_term, 64)
+    clean_term = sanitize_str(term_map.get(sanitized_term, sanitized_term), 64)
 
     payload_json = json.dumps({
         "state": state,
@@ -641,7 +627,6 @@ except Exception:
 ' 2>/dev/null || true)
   if [ "$py_output" = "SKIP" ]; then
     case "$EVENT" in
-      PreToolUse) emit_pretooluse ;;
       Stop|SessionEnd) printf '{"decision":""}\n' ;;
       *) printf '{}\n' ;;
     esac
@@ -657,7 +642,6 @@ fi
 if [ -z "${payload:-}" ]; then
   if [ -z "$EVENT" ]; then
     case "$EVENT" in
-      PreToolUse) emit_pretooluse ;;
       Stop|SessionEnd) printf '{"decision":""}\n' ;;
       *) printf '{}\n' ;;
     esac
@@ -718,23 +702,18 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVE
     set +f
 
     still_pending=""
-    if [ "$EVENT" = "PreToolUse" ]; then
-      # On PreToolUse, preserve pending dismissals without spending network time so tool admission is never delayed
-      still_pending="$to_dismiss"
-    else
-      # Attempt dismissal for up to 4 SIDs per event, preserving any remaining (un-attempted or failed) ones
-      attempt_count=0
-      for s in $to_dismiss; do
-        if [ "$attempt_count" -lt 4 ] && has_time_remaining; then
-          attempt_count=$((attempt_count + 1))
-          if ! send_dismissal "$s"; then
-            still_pending="${still_pending:+${still_pending} }${s}"
-          fi
-        else
+    # Attempt dismissal for up to 4 SIDs per event, preserving any remaining (un-attempted or failed) ones
+    attempt_count=0
+    for s in $to_dismiss; do
+      if [ "$attempt_count" -lt 4 ] && has_time_remaining; then
+        attempt_count=$((attempt_count + 1))
+        if ! send_dismissal "$s"; then
           still_pending="${still_pending:+${still_pending} }${s}"
         fi
-      done
-    fi
+      else
+        still_pending="${still_pending:+${still_pending} }${s}"
+      fi
+    done
 
     va_dir=$(dirname "$VENDOR_ACTIVE")
     mkdir -m 700 -p "$va_dir" 2>/dev/null || true
@@ -853,6 +832,31 @@ if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEn
         fi
       done
       if [ -n "$first_f" ]; then
+        # If $VENDOR_ACTIVE was rewritten concurrently on disk, merge concurrent SIDs so they are not lost
+        if [ -f "$VENDOR_ACTIVE" ]; then
+          disk_sids=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"[a-zA-Z0-9_-]\{16,64\}"' 2>/dev/null | tr -d '"' || true)
+          disk_pid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | grep -o '[0-9]*' || true)
+          disk_tty=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"tty"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+          [ -z "$AGENT_PID" ] && [ -n "$disk_pid" ] && AGENT_PID="$disk_pid"
+          [ -z "$AGENT_TTY" ] && [ -n "$disk_tty" ] && AGENT_TTY="$disk_tty"
+          set -f
+          for s in $disk_sids; do
+            case " $all_failed " in
+              *" $s "*) ;;
+              *) all_failed="${all_failed:+${all_failed} }${s}" ;;
+            esac
+          done
+          set +f
+          first_f=""
+          rest_f=""
+          for s in $all_failed; do
+            if [ -z "$first_f" ]; then
+              first_f="$s"
+            else
+              rest_f="${rest_f:+${rest_f} }${s}"
+            fi
+          done
+        fi
         tty_json=""
         [ -n "${AGENT_TTY:-}" ] && tty_json=",\"tty\":\"${AGENT_TTY}\""
         pid_json=""
@@ -870,7 +874,6 @@ fi
 
 # Emit expected JSON response to stdout for Antigravity lifecycle
 case "$EVENT" in
-  PreToolUse) emit_pretooluse ;;
   Stop|SessionEnd) printf '{"decision":""}\n' ;;
   *) printf '{}\n' ;;
 esac
