@@ -92,6 +92,27 @@ send_dismissal() {
   esac
 }
 
+# Deterministic 32-character hex hash of an identity string (PWD, TTY, PID, etc.)
+hash_identity_32() {
+  local str="$1"
+  local h=""
+  if command -v shasum >/dev/null 2>&1; then
+    h=$(printf '%s' "$str" | shasum -a 256 2>/dev/null | awk '{print $1}' | cut -c1-32)
+  elif command -v sha256sum >/dev/null 2>&1; then
+    h=$(printf '%s' "$str" | sha256sum 2>/dev/null | awk '{print $1}' | cut -c1-32)
+  elif command -v cksum >/dev/null 2>&1; then
+    local c
+    c=$(printf '%s' "$str" | cksum 2>/dev/null | awk '{print $1}')
+    h=$(printf '%08x%08x%08x%08x' "$c" "$c" "$c" "$c" 2>/dev/null | cut -c1-32)
+  fi
+  if ! printf '%s' "$h" | LC_ALL=C grep -Eq '^[0-9a-fA-F]{32}$'; then
+    local raw_hex
+    raw_hex=$(printf '%s' "$str" | LC_ALL=C od -An -v -tx1 | tr -d ' \t\n')
+    h=$(printf '%s0123456789abcdef0123456789abcdef' "$raw_hex" | cut -c1-32)
+  fi
+  printf '%s' "$h"
+}
+
 # Resolve canonical pane ID and paths if HERDR_PANE_ID is set
 CANONICAL_PANE=""
 HEX_PANE=""
@@ -504,7 +525,7 @@ if [ -z "$CANONICAL_PANE" ]; then
     sa_ident="${PWD:-}:${TERM_SESSION_ID:-}"
   fi
   if [ "$sa_ident" != ":" ] && [ -n "$sa_ident" ]; then
-    sa_hex=$(printf '%s' "$sa_ident" | LC_ALL=C od -An -v -tx1 | tr -d ' \t\n' | cut -c1-32)
+    sa_hex=$(hash_identity_32 "$sa_ident")
     VENDOR_ACTIVE="${STATE_HOME}/standalone/${sa_hex}.active"
   fi
 fi
@@ -834,7 +855,18 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVE
     set -f
     to_dismiss=""
     local_count=0
-    for s in $PREV_VENDOR_SID $PENDING_DISMISSAL_SID; do
+    priors_candidate="$PREV_VENDOR_SID"
+    if [ -z "$CANONICAL_PANE" ]; then
+      rec_pid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | tr -cd '0-9')
+      rec_tty=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"tty"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+      matched=0
+      [ -n "$AGENT_PID" ] && [ -n "$rec_pid" ] && [ "$AGENT_PID" = "$rec_pid" ] && matched=1
+      [ -n "$AGENT_TTY" ] && [ -n "$rec_tty" ] && [ "$AGENT_TTY" = "$rec_tty" ] && matched=1
+      if [ "$matched" -eq 0 ]; then
+        priors_candidate=""
+      fi
+    fi
+    for s in $priors_candidate $PENDING_DISMISSAL_SID; do
       [ -n "$s" ] || continue
       [ "$s" = "$SID" ] && continue
       if printf '%s' "$s" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
@@ -932,7 +964,18 @@ if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEn
   set -f
   to_dismiss=""
   local_count=0
-  for s in $PREV_VENDOR_SID $PENDING_DISMISSAL_SID; do
+  priors_candidate="$PREV_VENDOR_SID"
+  if [ -z "$CANONICAL_PANE" ]; then
+    rec_pid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | tr -cd '0-9')
+    rec_tty=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"tty"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+    matched=0
+    [ -n "$AGENT_PID" ] && [ -n "$rec_pid" ] && [ "$AGENT_PID" = "$rec_pid" ] && matched=1
+    [ -n "$AGENT_TTY" ] && [ -n "$rec_tty" ] && [ "$AGENT_TTY" = "$rec_tty" ] && matched=1
+    if [ "$matched" -eq 0 ]; then
+      priors_candidate=""
+    fi
+  fi
+  for s in $priors_candidate $PENDING_DISMISSAL_SID; do
     [ -n "$s" ] || continue
     [ "$s" = "$SID" ] && continue
     if printf '%s' "$s" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then

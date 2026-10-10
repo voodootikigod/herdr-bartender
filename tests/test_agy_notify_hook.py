@@ -21,6 +21,7 @@ class AgyNotifyHookTests(SandboxTestCase):
         event: str | None,
         payload: dict | str | None = None,
         env_extra: dict[str, str] | None = None,
+        cwd: str | Path | None = None,
     ) -> tuple[int, str, str]:
         env = {
             **os.environ,
@@ -48,6 +49,7 @@ class AgyNotifyHookTests(SandboxTestCase):
             text=True,
             capture_output=True,
             env=env,
+            cwd=str(cwd) if cwd is not None else None,
             timeout=5,
         )
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
@@ -1471,6 +1473,81 @@ fi
         # Active file must be retired after successful Stop
         remaining_actives = list(sa_dir.glob("*.active"))
         self.assertEqual(len(remaining_actives), 0, "standalone active file must be retired on confirmed Ended")
+
+    def test_standalone_prefix_sharing_pwds_produce_distinct_keys_and_no_mutual_dismissal(self):
+        """Two standalone sessions in directories sharing a long prefix produce distinct .active files and do not evict each other."""
+        self.bridge.history.clear()
+        base_dir = self.tmp / "long-shared-prefix-workspace-directory"
+        dir_a = base_dir / "project-alpha"
+        dir_b = base_dir / "project-beta"
+        dir_a.mkdir(parents=True, exist_ok=True)
+        dir_b.mkdir(parents=True, exist_ok=True)
+
+        env_a = {
+            "HERDR_PANE_ID": "",
+            "AGY_HOOK_AGENT_PID": "none",
+            "AGENT_PID": "",
+            "AGY_HOOK_NO_TTY": "1",
+            "AGENT_TTY": "none",
+            "PWD": str(dir_a),
+            "TERM_SESSION_ID": "term-session-shared",
+        }
+        env_b = {
+            "HERDR_PANE_ID": "",
+            "AGY_HOOK_AGENT_PID": "none",
+            "AGENT_PID": "",
+            "AGY_HOOK_NO_TTY": "1",
+            "AGENT_TTY": "none",
+            "PWD": str(dir_b),
+            "TERM_SESSION_ID": "term-session-shared",
+        }
+
+        # Session A starts
+        code_a, _, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "conv-shared-prefix-alpha"},
+            env_extra=env_a,
+            cwd=dir_a,
+        )
+        self.assertEqual(code_a, 0)
+        self._wait_for_history(1)
+        self.assertEqual(len(self.bridge.history), 1)
+        self.assertEqual(self.bridge.history[-1]["session_id"], "conv-shared-prefix-alpha")
+
+        # Session B starts in project-beta (shares prefix with project-alpha)
+        code_b, _, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "conv-shared-prefix-beta"},
+            env_extra=env_b,
+            cwd=dir_b,
+        )
+        self.assertEqual(code_b, 0)
+        self._wait_for_history(2)
+        # Bridge must receive Working for B, and MUST NOT receive Ended for A!
+        self.assertEqual(len(self.bridge.history), 2)
+        self.assertEqual(self.bridge.history[-1]["session_id"], "conv-shared-prefix-beta")
+        self.assertEqual(self.bridge.history[-1]["state"], "Working")
+
+        # Confirm distinct .active files exist for both
+        sa_dir = self.state_dir / "standalone"
+        active_files = list(sa_dir.glob("*.active"))
+        self.assertEqual(len(active_files), 2, "must create two distinct .active files, not collide on prefix")
+        sids = {json.loads(f.read_text()).get("vendor_session_id") for f in active_files}
+        self.assertEqual(sids, {"conv-shared-prefix-alpha", "conv-shared-prefix-beta"})
+
+        # Session A sends PostInvocation: must NOT dismiss session B
+        code_a2, _, _ = self._run_hook(
+            "PostInvocation",
+            payload={"conversationId": "conv-shared-prefix-alpha"},
+            env_extra=env_a,
+            cwd=dir_a,
+        )
+        self.assertEqual(code_a2, 0)
+        self._wait_for_history(3)
+        self.assertEqual(len(self.bridge.history), 3)
+        self.assertEqual(self.bridge.history[-1]["session_id"], "conv-shared-prefix-alpha")
+        self.assertEqual(self.bridge.history[-1]["state"], "Idle")
+
 
 
 

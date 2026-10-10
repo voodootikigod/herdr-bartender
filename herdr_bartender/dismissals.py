@@ -37,6 +37,8 @@ from .config import VENDOR_UUID_REGEX
 from .log import log_debug
 from .vendor import (
     VENDOR_ACTIVE_SUFFIX,
+    DISMISSAL_MAX_ATTEMPTS,
+    DISMISSAL_WINDOW_SECONDS,
     VendorFile,
     cap_dismissals,
     parse_vendor_uuid,
@@ -47,8 +49,6 @@ from .vendor import (
 )
 
 DISMISSAL_INTERVAL_SECONDS = 2.0
-DISMISSAL_WINDOW_SECONDS = 10.0
-DISMISSAL_MAX_ATTEMPTS = 5
 VENDOR_ACTIVE_HORIZON_SECONDS = 43200.0
 DUE_TOLERANCE_SECONDS = 1e-3   # wall-clock float rounding must not push a due entry past its tick
 

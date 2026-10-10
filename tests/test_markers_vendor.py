@@ -385,7 +385,27 @@ class MultiUuidReconcilerStagingTests(SandboxTestCase):
         self.assertEqual(entry2["attempts"], 0, "exhausted entry must reset attempts to 0")
         self.assertEqual(entry2["pane_hex"], "cc")
 
+    def test_stage_dismissal_hex_malformed_and_future_timestamps_handled_safely(self):
+        """stage_dismissal_hex never crashes on string, None, or future timestamps/attempts, resetting budget."""
+        from herdr_bartender.vendor import stage_dismissal_hex
+        bad_cases = [
+            {"timestamp": "bad_string", "attempts": 1},
+            {"timestamp": None, "attempts": 1},
+            {"timestamp": True, "attempts": 1},
+            {"timestamp": 10.0, "attempts": "five"},
+            {"timestamp": 10.0, "attempts": None},
+            {"timestamp": 50.0, "attempts": 1},  # future timestamp: now=20.0, now - ts = -30.0 < 0
+        ]
+        for i, bad in enumerate(bad_cases):
+            with self.subTest(case=i):
+                data = {"dismissed_vendor_uuids": {"test-uuid-bad": {**bad, "pane_hex": "aa", "pane_closed": False}}}
+                entry = stage_dismissal_hex(data, "test-uuid-bad", "aa", now=20.0, pane_closed=True)
+                self.assertEqual(entry["timestamp"], 20.0, "malformed or future entry must reset timestamp to now")
+                self.assertEqual(entry["attempts"], 0, "malformed or future entry must reset attempts to 0")
+                self.assertTrue(entry["pane_closed"])
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

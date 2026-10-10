@@ -53,6 +53,7 @@ VENDOR_FILE_MAX_BYTES = 4096   # R63: a real record is ~100 bytes; larger is unu
 CLAIM_INFIX = ".claim-"              # <hex>.vendor_active.claim-<pid>-<ns>: being retired (leftovers swept)
 DISMISSAL_AGENT = "Herdr"            # R19
 DISMISSAL_MAX_ATTEMPTS = 5           # R11: sends at t=0, 2, 4, 6, 8
+DISMISSAL_WINDOW_SECONDS = 10.0
 NETWORK_RESERVE_SECONDS = 0.3
 
 
@@ -263,20 +264,27 @@ def cap_dismissals(queue: dict, keep: Optional[str] = None) -> dict:
     return {uuid: entry for uuid, entry in queue.items() if uuid not in dropped}
 
 
+def _safe_number(value: object) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 def stage_dismissal_hex(data: dict, uuid: str, pane_hex: str, now: float, pane_closed: bool = False) -> dict:
     """Queue ``uuid`` in ``dismissed_vendor_uuids`` before anything is sent (attempts 0), within the 64 cap.
 
     If ``uuid`` was already queued and still within its retry window (< 10s and < 5 attempts), preserves
     the existing timestamp and attempt counter so retries are bounded, while upgrading ``pane_closed``
-    via logical OR. If the existing entry was already expired or exhausted, resets to a fresh retry budget.
+    via logical OR. If the existing entry was already expired, exhausted, or malformed, resets to a fresh retry budget.
     """
     queue = dict(data.get("dismissed_vendor_uuids") or {})
     if uuid in queue:
         existing = queue[uuid]
         if isinstance(existing, dict):
-            age = now - existing.get("timestamp", 0.0)
-            attempts = existing.get("attempts", 0)
-            if age < 10.0 and attempts < DISMISSAL_MAX_ATTEMPTS:
+            ts = _safe_number(existing.get("timestamp"))
+            att = _safe_number(existing.get("attempts"))
+            attempts = int(att) if att is not None and att > 0 else 0
+            if ts is not None and 0.0 <= (now - ts) < DISMISSAL_WINDOW_SECONDS and attempts < DISMISSAL_MAX_ATTEMPTS:
                 merged = {**existing, "pane_closed": bool(existing.get("pane_closed") or pane_closed)}
                 queue[uuid] = merged
                 data["dismissed_vendor_uuids"] = queue
