@@ -185,11 +185,16 @@ if [ -z "$PYTHON_BIN" ]; then
   fi
 fi
 
+PREV_VENDOR_SID=""
+if [ -n "$VENDOR_ACTIVE" ] && [ -f "$VENDOR_ACTIVE" ]; then
+  PREV_VENDOR_SID=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+fi
+
 SID=""
 payload=""
 
 if [ -n "$PYTHON_BIN" ]; then
-  py_output=$(printf '%s' "$RAW_INPUT" | EVENT="$EVENT" AGENT_PID="${AGENT_PID:-}" AGENT_TTY="${AGENT_TTY:-}" TERM_PROGRAM="${TERM_PROGRAM:-}" "$PYTHON_BIN" -c '
+  py_output=$(printf '%s' "$RAW_INPUT" | EVENT="$EVENT" AGENT_PID="${AGENT_PID:-}" AGENT_TTY="${AGENT_TTY:-}" PREV_VENDOR_SID="${PREV_VENDOR_SID:-}" TERM_PROGRAM="${TERM_PROGRAM:-}" "$PYTHON_BIN" -c '
 import hashlib, json, os, re, sys
 
 CSI_RE = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]")
@@ -277,8 +282,11 @@ if not (isinstance(conv_id, str) and re.match(r"^[a-zA-Z0-9_-]{16,64}\Z", conv_i
     else:
         conv_id = None
 
+prev_sid = os.environ.get("PREV_VENDOR_SID") or ""
 if conv_id:
     session_id = conv_id
+elif event in ("Stop", "SessionEnd") and prev_sid and re.match(r"^[a-zA-Z0-9_-]{16,64}\Z", prev_sid):
+    session_id = prev_sid
 elif parse_ok or event in ("Stop", "SessionEnd"):
     # Stable fallback session ID incorporating workspace, terminal session, TTY, and agent PID
     term_sess = os.environ.get("TERM_SESSION_ID", "")
@@ -351,16 +359,33 @@ if [ -z "${payload:-}" ]; then
     PostInvocation) FB_STATE="Idle" ;;
     *) FB_STATE="Working" ;;
   esac
-  # Compute unique per-process fallback session ID (>= 16 chars)
-  seed_str="${PWD:-}:${AGENT_PID:-}:${AGENT_TTY:-}:${TERM_SESSION_ID:-}"
-  h=$(printf '%s' "$seed_str" | shasum -a 256 2>/dev/null | cut -c1-24 || echo "default-fallback")
-  FALLBACK_SID="agy-fallback-${h}"
+  # Reuse PREV_VENDOR_SID for Stop/SessionEnd if available
+  if { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEnd" ]; } && [ -n "$PREV_VENDOR_SID" ]; then
+    FALLBACK_SID="$PREV_VENDOR_SID"
+  else
+    seed_str="${PWD:-}:${AGENT_PID:-}:${AGENT_TTY:-}:${TERM_SESSION_ID:-}"
+    h=$(printf '%s' "$seed_str" | shasum -a 256 2>/dev/null | cut -c1-24 || echo "default-fallback")
+    FALLBACK_SID="agy-fallback-${h}"
+  fi
   SID="$FALLBACK_SID"
   payload="{\"state\":\"${FB_STATE}\",\"agent\":\"Antigravity\",\"event\":\"${EVENT}\",\"session_id\":\"${FALLBACK_SID}\"}"
 fi
 
 # On non-Stop events, record or update .vendor_active during fail-open window
 if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVENT" != "SessionEnd" ]; then
+  # If an existing record holds an older, different session ID, dismiss the older session first
+  if [ -n "$PREV_VENDOR_SID" ] && [ "$PREV_VENDOR_SID" != "$SID" ] && is_bartender_alive; then
+    curl -s \
+      --noproxy '*' \
+      --max-redirs 0 \
+      --proto =http \
+      --connect-timeout 0.15 \
+      --max-time 0.5 \
+      -X POST "http://${HOST}:${PORT}/event" \
+      -H 'Content-Type: application/json' \
+      --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${PREV_VENDOR_SID}\"}" >/dev/null 2>&1 || true
+  fi
+
   mkdir -m 700 -p "${STATE_HOME}/panes" 2>/dev/null || true
   TMP_VA=$(mktemp "${STATE_HOME}/panes/.va.tmp.XXXXXX" 2>/dev/null || true)
   if [ -n "$TMP_VA" ]; then

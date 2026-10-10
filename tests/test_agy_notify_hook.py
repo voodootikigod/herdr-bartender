@@ -306,6 +306,83 @@ class AgyNotifyHookTests(SandboxTestCase):
         # .vendor_active should now be retired
         self.assertFalse(va_file.exists())
 
+    def test_fail_open_new_conversation_dismisses_previous_session(self):
+        """When a new conversation starts in a fail-open pane, the older session is dismissed before updating .vendor_active."""
+        pane_id = "ws1:pMultiConv"
+        hex_pane = pane_id.encode("utf-8").hex()
+        cid_a = "conv-multi-failopen-000A"
+        cid_b = "conv-multi-failopen-000B"
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+
+        # Step 1: PreInvocation for conv A fails open -> Working
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": cid_a},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(1)
+        self.assertEqual(self.bridge.history[-1].get("session_id"), cid_a)
+        self.assertEqual(self.bridge.history[-1].get("state"), "Working")
+        self.assertTrue(va_file.exists())
+        self.assertIn(cid_a, va_file.read_text())
+
+        # Step 2: PreInvocation for conv B starts in the same pane before A stopped.
+        # It must dismiss conv A (Ended) and then post Working for conv B!
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": cid_b},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(3)
+        self.assertEqual(len(self.bridge.history), 3)
+
+        # Event 2 should be dismissal of A
+        self.assertEqual(self.bridge.history[1].get("session_id"), cid_a)
+        self.assertEqual(self.bridge.history[1].get("state"), "Ended")
+
+        # Event 3 should be Working for B
+        self.assertEqual(self.bridge.history[2].get("session_id"), cid_b)
+        self.assertEqual(self.bridge.history[2].get("state"), "Working")
+
+        # .vendor_active now holds B
+        self.assertIn(cid_b, va_file.read_text())
+
+    def test_stop_without_conv_id_reuses_stored_vendor_sid(self):
+        """When Stop arrives without conversationId, it reuses the session ID recorded in .vendor_active."""
+        pane_id = "ws1:pStopNoConvId"
+        hex_pane = pane_id.encode("utf-8").hex()
+        cid = "conv-reuse-sid-000001"
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+
+        # Step 1: PreInvocation with conversationId
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": cid},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(1)
+        self.assertEqual(self.bridge.history[-1].get("session_id"), cid)
+        self.assertTrue(va_file.exists())
+
+        # Step 2: Stop arrives with empty payload (no conversationId)
+        code, out, _ = self._run_hook(
+            "Stop",
+            payload={},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":""}')
+        self._wait_for_history(2)
+        self.assertEqual(len(self.bridge.history), 2)
+
+        # Must have sent Ended for cid (from .vendor_active) rather than an unrelated hash!
+        self.assertEqual(self.bridge.history[-1].get("session_id"), cid)
+        self.assertEqual(self.bridge.history[-1].get("state"), "Ended")
+        self.assertFalse(va_file.exists(), ".vendor_active must be retired after confirmed Stop")
+
     def test_subshell_wrapper_preserves_stable_session_id(self):
         """Spawning via the README sh -c wrapper produces stable session IDs across invocations without conversationId."""
         self.bridge.history.clear()
