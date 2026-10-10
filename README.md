@@ -53,23 +53,21 @@ Top Shelf displays real-time agent status via its NotchBar AI Agent HTTP bridge,
 
 ## Quick Start / Installation
 
-### 1. Clone the repository
-Clone the repository to a permanent location (for example, `~/Projects/herdr-bartender`):
+### 1. Install via Herdr Plugin Manager
+Install directly from GitHub via the Herdr CLI:
 
 ```bash
-git clone https://github.com/voodootikigod/herdr-bartender.git ~/Projects/herdr-bartender
-cd ~/Projects/herdr-bartender
+herdr plugin install voodootikigod/herdr-bartender
 ```
 
-### 2. Symlink into Herdr's plugin directory
-Herdr loads plugins from `~/.config/herdr/plugins`. Symlink the repository:
+> [!TIP]
+> **Developing locally?** You can clone the repository and link it into Herdr instead:
+> ```bash
+> git clone https://github.com/voodootikigod/herdr-bartender.git ~/Projects/herdr-bartender
+> herdr plugin link ~/Projects/herdr-bartender
+> ```
 
-```bash
-mkdir -p ~/.config/herdr/plugins
-ln -s ~/Projects/herdr-bartender ~/.config/herdr/plugins/herdr-bartender
-```
-
-### 3. Verify plugin registration
+### 2. Verify plugin registration
 Restart Herdr, then verify that the plugin is recognized:
 
 ```bash
@@ -82,7 +80,7 @@ You should see `herdr-bartender` in the output.
 - A startup hook (`./bin/herdr-bartender --reconcile-background`) which spawns the background reconciler and exits.
 - Event handlers for `pane.agent_status_changed`, `pane.closed`, `tab.closed`, and `workspace.closed`. Each invocation is bounded by a 1.5s watchdog (well within Herdr's 2.0s timeout).
 
-### 4. Verify connectivity
+### 3. Verify connectivity
 Verify that Bartender Top Shelf is running and reachable:
 
 ```bash
@@ -95,7 +93,7 @@ To run an end-to-end simulation that creates, cycles through states, and dismiss
 ./bin/herdr-bartender --live-test
 ```
 
-### 5. (Recommended) Install Vendor Hook Deduplication
+### 4. (Recommended) Install Vendor Hook Deduplication
 If you use Claude Code or Codex, install the deduplication guard so agents don't appear twice:
 
 ```bash
@@ -353,3 +351,10 @@ For comprehensive architectural design records, see:
 - [`herdr-bartender-plan.md`](herdr-bartender-plan.md) — Comprehensive technical architecture specification.
 - [`docs/plan-resolutions.md`](docs/plan-resolutions.md) — Architectural resolutions and invariant catalog.
 - [`docs/traceability.md`](docs/traceability.md) — Invariant-to-test traceability matrix.
+
+---
+
+## License
+
+[MIT](LICENSE) © 2026 Chris Williams
+
