@@ -118,6 +118,53 @@ if [ -n "${HERDR_PANE_ID:-}" ] && printf '%s' "$HERDR_PANE_ID" | LC_ALL=C grep -
   fi
 fi
 
+# Find agent PID: match ONLY binary basename (agy, antigravity, Antigravity),
+# NEVER matching wrapper shells (sh, bash, zsh) whose arguments may contain the script path.
+find_agent_pid() {
+  local pid=$PPID
+  local max=8
+  while [ "$max" -gt 0 ] && [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+    local comm base_comm
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null || true)
+    base_comm=$(basename "$comm" 2>/dev/null || echo "$comm")
+    case "$base_comm" in
+      agy|antigravity|Antigravity) echo "$pid"; return 0 ;;
+    esac
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    max=$((max - 1))
+  done
+  echo ""
+  return 0
+}
+
+AGENT_PID="${AGY_HOOK_AGENT_PID:-${AGENT_PID:-$(find_agent_pid 2>/dev/null || true)}}"
+if ! printf '%s' "${AGENT_PID:-}" | grep -Eq '^[0-9]{1,9}$'; then
+  AGENT_PID=""
+fi
+
+# Resolve controlling terminal for multi-session collision avoidance
+if [ "${AGY_HOOK_NO_TTY:-0}" = "1" ] || [ "${AGENT_TTY:-}" = "none" ]; then
+  AGENT_TTY=""
+else
+  AGENT_TTY="${AGY_HOOK_AGENT_TTY:-${AGENT_TTY:-}}"
+  if [ -z "$AGENT_TTY" ] || [ "$AGENT_TTY" = "?" ] || [ "$AGENT_TTY" = "??" ]; then
+    if [ -n "$AGENT_PID" ]; then
+      AGENT_TTY=$(ps -o tty= -p "$AGENT_PID" 2>/dev/null | tr -d ' \t\n' || true)
+    fi
+    if [ -z "$AGENT_TTY" ] || [ "$AGENT_TTY" = "?" ] || [ "$AGENT_TTY" = "??" ]; then
+      AGENT_TTY=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' \t\n' || true)
+    fi
+    if [ "$AGENT_TTY" = "?" ] || [ "$AGENT_TTY" = "??" ]; then
+      AGENT_TTY=""
+    fi
+  fi
+fi
+
+# Validate AGENT_TTY strictly to prevent JSON / path injection
+if ! printf '%s' "${AGENT_TTY:-}" | grep -Eq '^[a-zA-Z0-9/_.-]{1,32}$'; then
+  AGENT_TTY=""
+fi
+
 # Check if Herdr is demonstrably healthy and actively owns this pane.
 is_herdr_owning_pane() {
   [ -n "$CANONICAL_PANE" ] || return 1
@@ -176,6 +223,17 @@ if is_herdr_owning_pane; then
   if [ -n "$VENDOR_ACTIVE" ] && [ -f "$VENDOR_ACTIVE" ] && [ "$EVENT" != "PreToolUse" ]; then
     prev_sid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
     pend_sid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"pending_dismissal_sid"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+    prev_pid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | grep -o '[0-9]*' || true)
+    prev_tty=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"tty"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+
+    if ! printf '%s' "${prev_pid:-}" | grep -Eq '^[0-9]{1,9}$'; then
+      prev_pid=""
+    fi
+    if ! printf '%s' "${prev_tty:-}" | grep -Eq '^[a-zA-Z0-9/_.-]{1,32}$'; then
+      prev_tty=""
+    fi
+    [ -z "$AGENT_PID" ] && AGENT_PID="$prev_pid"
+    [ -z "$AGENT_TTY" ] && AGENT_TTY="$prev_tty"
 
     # Disable globbing and validate SIDs
     set -f
@@ -244,53 +302,6 @@ if is_herdr_owning_pane; then
     *) printf '{}\n' ;;
   esac
   exit 0
-fi
-
-# Find agent PID: match ONLY binary basename (agy, antigravity, Antigravity),
-# NEVER matching wrapper shells (sh, bash, zsh) whose arguments may contain the script path.
-find_agent_pid() {
-  local pid=$PPID
-  local max=8
-  while [ "$max" -gt 0 ] && [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
-    local comm base_comm
-    comm=$(ps -o comm= -p "$pid" 2>/dev/null || true)
-    base_comm=$(basename "$comm" 2>/dev/null || echo "$comm")
-    case "$base_comm" in
-      agy|antigravity|Antigravity) echo "$pid"; return 0 ;;
-    esac
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-    max=$((max - 1))
-  done
-  echo ""
-  return 0
-}
-
-AGENT_PID="${AGY_HOOK_AGENT_PID:-${AGENT_PID:-$(find_agent_pid 2>/dev/null || true)}}"
-if ! printf '%s' "${AGENT_PID:-}" | grep -Eq '^[0-9]{1,9}$'; then
-  AGENT_PID=""
-fi
-
-# Resolve controlling terminal for multi-session collision avoidance
-if [ "${AGY_HOOK_NO_TTY:-0}" = "1" ] || [ "${AGENT_TTY:-}" = "none" ]; then
-  AGENT_TTY=""
-else
-  AGENT_TTY="${AGY_HOOK_AGENT_TTY:-${AGENT_TTY:-}}"
-  if [ -z "$AGENT_TTY" ] || [ "$AGENT_TTY" = "?" ] || [ "$AGENT_TTY" = "??" ]; then
-    if [ -n "$AGENT_PID" ]; then
-      AGENT_TTY=$(ps -o tty= -p "$AGENT_PID" 2>/dev/null | tr -d ' \t\n' || true)
-    fi
-    if [ -z "$AGENT_TTY" ] || [ "$AGENT_TTY" = "?" ] || [ "$AGENT_TTY" = "??" ]; then
-      AGENT_TTY=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' \t\n' || true)
-    fi
-    if [ "$AGENT_TTY" = "?" ] || [ "$AGENT_TTY" = "??" ]; then
-      AGENT_TTY=""
-    fi
-  fi
-fi
-
-# Validate AGENT_TTY strictly to prevent JSON / path injection
-if ! printf '%s' "${AGENT_TTY:-}" | grep -Eq '^[a-zA-Z0-9/_.-]{1,32}$'; then
-  AGENT_TTY=""
 fi
 
 # In standalone mode (no HERDR_PANE_ID), track active session per process/TTY so Stop reuses the same SID

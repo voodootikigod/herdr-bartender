@@ -243,9 +243,11 @@ def cap_dismissals(queue: dict, keep: Optional[str] = None) -> dict:
 
 def stage_dismissal_hex(data: dict, uuid: str, pane_hex: str, now: float, pane_closed: bool = False) -> dict:
     """Queue ``uuid`` in ``dismissed_vendor_uuids`` before anything is sent (attempts 0), within the 64 cap."""
+    queue = dict(data.get("dismissed_vendor_uuids") or {})
+    if uuid in queue:
+        return queue[uuid]
     entry = {"timestamp": now, "pane_hex": pane_hex, "attempts": 0, "last_attempt": 0.0,
              "pane_closed": bool(pane_closed)}
-    queue = dict(data.get("dismissed_vendor_uuids") or {})
     queue[uuid] = entry
     data["dismissed_vendor_uuids"] = cap_dismissals(queue, keep=uuid)
     return entry
@@ -336,7 +338,7 @@ def resolve_vendor_cleanups(data: dict, panes: Sequence[str], now: float,
         for uuid in uuids:
             stage_dismissal(data, uuid, pane, now, pane_closed=pane in closed)
             dismissals.append(uuid)
-        if all(uuid in data.get("dismissed_vendor_uuids", {}) for uuid in uuids):
+        if not uuids or all(uuid in data.get("dismissed_vendor_uuids", {}) for uuid in uuids):
             unlink.append(record)
     return VendorResolution(tuple(dict.fromkeys(dismissals)), tuple(unlink), tuple(resolved))
 

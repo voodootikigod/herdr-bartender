@@ -134,7 +134,6 @@ Antigravity CLI sessions are fully supported both inside Herdr panes and standal
 - **Inside Herdr**: Herdr natively detects `agy` and emits `pane.agent_status_changed`. The plugin translates this to `Antigravity (Herdr)` on Top Shelf.
 - **Standalone `agy`**: Standalone sessions report directly to Bartender Top Shelf via `scripts/agy-notify-hook.sh`. The hook integrates into Antigravity lifecycle events via `~/.gemini/config/hooks.json`:
   - `PreInvocation`: Model generation starts / user submits prompt $\rightarrow$ `Working` (`"Thinking..."`)
-  - `PreToolUse`: Model starts executing a tool step $\rightarrow$ `Working` (`"Tool: <tool_name>"`)
   - `PostInvocation`: Model completes its turn and awaits user input $\rightarrow$ `Idle`
   - `Stop`: Agent execution loop terminates $\rightarrow$ `Ended` (dismisses Top Shelf item)
 - **Automatic Deduplication & Handoff**: If an `agy` session runs within Herdr (`HERDR_PANE_ID` is set):
@@ -174,8 +173,8 @@ To enable standalone `agy` reporting, copy `scripts/agy-notify-hook.sh` to `~/Li
 ```
 
 > [!NOTE]
-> **Antigravity Hook Protocol & Tool Admission**:
-> Status-bar reporting is driven by `PreInvocation` (`Working`), `PostInvocation` (`Idle`), and `Stop` (`Ended`), keeping tool execution completely unaffected. If you optionally choose to register `PreToolUse` to display active tool names on Top Shelf (`"Tool: <tool_name>"`), the hook responds with `{"decision":"ask"}`—the Antigravity protocol's standard neutral decision that strictly preserves user confirmation prompts and respects the "Always Allow" cache, ensuring the hook never grants blanket auto-approval.
+> **Antigravity Hook Protocol**:
+> Status-bar reporting is driven by `PreInvocation` (`Working`), `PostInvocation` (`Idle`), and `Stop` (`Ended`), keeping tool execution completely unaffected with zero overhead.
 
 ## CLI reference
 
