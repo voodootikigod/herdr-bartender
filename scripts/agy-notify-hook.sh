@@ -23,11 +23,38 @@ if ! printf '%s' "$PORT" | grep -Eq '^[0-9]{1,5}$' || [ "$PORT" -lt 1024 ] || [ 
   PORT=7823
 fi
 
-# Check if Bartender 6 / Bartender is running (matching Python is_bartender_alive)
+# Record invocation start for hard deadline checking (well under 5s hook timeout)
+START_TIME=$(date +%s 2>/dev/null || echo 0)
+has_time_remaining() {
+  [ "$START_TIME" -eq 0 ] && return 0
+  local now
+  now=$(date +%s 2>/dev/null || echo 0)
+  [ $(( now - START_TIME )) -lt 3 ]
+}
+
+# Cleanup trap for temporary files
+TMP_VA=""
+cleanup_tmp_va() {
+  [ -n "${TMP_VA:-}" ] && rm -f "$TMP_VA" 2>/dev/null || true
+}
+trap cleanup_tmp_va EXIT INT TERM
+
+# Check if Bartender 6 / Bartender is running (memoised per invocation)
+BARTENDER_ALIVE_STATUS=""
+BARTENDER_UNREACHABLE=0
+
 is_bartender_alive() {
-  pgrep -xi "Bartender 6" >/dev/null 2>&1 \
-    || pgrep -xi "Bartender" >/dev/null 2>&1 \
-    || pgrep -f '^[^[:space:]]*/Bartender( 6)?\.app/Contents/MacOS/' >/dev/null 2>&1
+  [ "$BARTENDER_UNREACHABLE" -eq 1 ] && return 1
+  if [ -z "$BARTENDER_ALIVE_STATUS" ]; then
+    if pgrep -xi "Bartender 6" >/dev/null 2>&1 \
+      || pgrep -xi "Bartender" >/dev/null 2>&1 \
+      || pgrep -f '^[^[:space:]]*/Bartender( 6)?\.app/Contents/MacOS/' >/dev/null 2>&1; then
+      BARTENDER_ALIVE_STATUS="1"
+    else
+      BARTENDER_ALIVE_STATUS="0"
+    fi
+  fi
+  [ "$BARTENDER_ALIVE_STATUS" = "1" ]
 }
 
 # Dismiss a session ID directly via Bartender HTTP endpoint.
@@ -36,6 +63,7 @@ is_bartender_alive() {
 send_dismissal() {
   local target_sid="$1"
   [ -n "$target_sid" ] || return 1
+  has_time_remaining || return 1
   is_bartender_alive || return 1
   local code
   code=$(curl -s -o /dev/null -w "%{http_code}" \
@@ -47,6 +75,10 @@ send_dismissal() {
     -X POST "http://${HOST}:${PORT}/event" \
     -H 'Content-Type: application/json' \
     --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${target_sid}\"}" 2>/dev/null || echo "000")
+  if [ "$code" = "000" ]; then
+    # Connection failure or timeout: short-circuit all later requests in this invocation
+    BARTENDER_UNREACHABLE=1
+  fi
   case "$code" in
     200|404|410) return 0 ;;
     *) return 1 ;;
@@ -149,7 +181,7 @@ if is_herdr_owning_pane; then
     remaining_sids=""
     attempt_count=0
     for s in $valid_candidates; do
-      if [ "$attempt_count" -lt 8 ]; then
+      if [ "$attempt_count" -lt 4 ] && has_time_remaining; then
         attempt_count=$((attempt_count + 1))
         if ! send_dismissal "$s"; then
           remaining_sids="${remaining_sids:+${remaining_sids} }${s}"
@@ -570,7 +602,7 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVE
         case " $to_dismiss " in
           *" $s "*) ;;
           *)
-            if [ "$local_count" -lt 8 ]; then
+            if [ "$local_count" -lt 32 ]; then
               to_dismiss="${to_dismiss:+${to_dismiss} }${s}"
               local_count=$((local_count + 1))
             fi
@@ -585,10 +617,10 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVE
       # On PreToolUse, preserve pending dismissals without spending network time so tool admission is never delayed
       still_pending="$to_dismiss"
     else
-      # Attempt dismissal for up to 8 SIDs per event, preserving any remaining or failed ones
+      # Attempt dismissal for up to 4 SIDs per event, preserving any remaining (un-attempted or failed) ones
       attempt_count=0
       for s in $to_dismiss; do
-        if [ "$attempt_count" -lt 8 ]; then
+        if [ "$attempt_count" -lt 4 ] && has_time_remaining; then
           attempt_count=$((attempt_count + 1))
           if ! send_dismissal "$s"; then
             still_pending="${still_pending:+${still_pending} }${s}"
@@ -652,7 +684,7 @@ if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEn
       case " $to_dismiss " in
         *" $s "*) ;;
         *)
-          if [ "$local_count" -lt 8 ]; then
+          if [ "$local_count" -lt 32 ]; then
             to_dismiss="${to_dismiss:+${to_dismiss} }${s}"
             local_count=$((local_count + 1))
           fi
@@ -665,7 +697,7 @@ if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEn
   failed_priors=""
   attempt_count=0
   for s in $to_dismiss; do
-    if [ "$attempt_count" -lt 8 ]; then
+    if [ "$attempt_count" -lt 4 ] && has_time_remaining; then
       attempt_count=$((attempt_count + 1))
       if ! send_dismissal "$s"; then
         failed_priors="${failed_priors:+${failed_priors} }${s}"

@@ -517,7 +517,7 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertLess(len(va_bytes), 4096, "record must remain well under VENDOR_FILE_MAX_BYTES")
         va_data = json.loads(va_bytes.decode())
         pending = va_data.get("pending_dismissal_sid", "").split()
-        self.assertLessEqual(len(pending), 8, "pending dismissals must be capped at 8")
+        self.assertLessEqual(len(pending), 32, "pending dismissals must be capped at 32")
         self.assertIn("conv-cap-chain-0010", pending, "immediately preceding session must be preserved in pending dismissals")
 
         # Now test PreToolUse: it must return immediately with allow and NOT attempt dismissals
@@ -541,14 +541,16 @@ class AgyNotifyHookTests(SandboxTestCase):
         hex_pane = pane_id.encode("utf-8").hex()
         va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
         va_file.parent.mkdir(parents=True, exist_ok=True)
-        # Seed .vendor_active with a full pending list
+        # Seed .vendor_active with valid 16-64 char pending SIDs
+        sids = [f"conv-handoff-pend-{i:04d}" for i in range(8)]
         va_file.write_text(json.dumps({
             "vendor_session_id": "conv-handoff-prev-0001",
-            "pending_dismissal_sid": "p1 p2 p3 p4 p5 p6 p7 p8",
+            "pending_dismissal_sid": " ".join(sids),
         }))
         self._fresh_marker(pane_id)
         self.set_herdr_alive()
 
+        self.bridge.history.clear()
         t0 = time.monotonic()
         code, out, _ = self._run_hook(
             "PreToolUse",
@@ -559,9 +561,10 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out, '{"decision":"allow"}')
         self.assertLess(elapsed, 1.0, "PreToolUse in handoff branch must return immediately without dismissal delays")
+        self.assertEqual(len(self.bridge.history), 0, "No dismissal requests should be made during PreToolUse")
 
     def test_handoff_and_stop_with_more_than_4_pending_sids_dismisses_all(self):
-        """When .vendor_active has more than 4 pending SIDs, handoff and Stop dismiss all of them without stalling."""
+        """When .vendor_active has more than 4 pending SIDs, handoff and Stop dismiss all of them across events."""
         pane_id = "ws1:pHandoffMany"
         hex_pane = pane_id.encode("utf-8").hex()
         va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
@@ -576,9 +579,20 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.set_herdr_alive()
 
         self.bridge.history.clear()
-        # PostInvocation in Herdr pane runs handoff dismissals
+        # Event 1: PostInvocation runs first batch of handoff dismissals (up to 4)
         code, out, _ = self._run_hook(
             "PostInvocation",
+            payload={"conversationId": "conv-current-post-001"},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(4)
+        self.assertEqual(len(self.bridge.history), 4)
+        self.assertTrue(va_file.exists(), ".vendor_active must exist with remaining un-dismissed SIDs")
+
+        # Event 2: Stop runs remaining dismissals (3) and retires the file
+        code, out, _ = self._run_hook(
+            "Stop",
             payload={"conversationId": "conv-current-post-001"},
             env_extra={"HERDR_PANE_ID": pane_id},
         )
@@ -592,7 +606,7 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertFalse(va_file.exists(), ".vendor_active must be retired after all SIDs are dismissed")
 
     def test_sweep_standalone_skips_live_records_and_cleans_dead_records(self):
-        """Live standalone records do not consume the 2-file sweep budget, so dead records behind them are swept."""
+        """Live standalone records do not consume the 4-request sweep budget, so dead records behind them are swept."""
         sa_dir = self.state_dir / "standalone"
         sa_dir.mkdir(parents=True, exist_ok=True)
 
