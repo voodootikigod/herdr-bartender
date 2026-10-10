@@ -131,21 +131,61 @@ if is_herdr_owning_pane; then
   if [ -n "$VENDOR_ACTIVE" ] && [ -f "$VENDOR_ACTIVE" ] && [ "$EVENT" != "PreToolUse" ]; then
     prev_sid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
     pend_sid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"pending_dismissal_sid"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
-    local_ok=1
-    attempt_count=0
+
+    # Disable globbing and validate SIDs
+    set -f
+    valid_candidates=""
     for s in $prev_sid $pend_sid; do
       [ -n "$s" ] || continue
-      if [ "$attempt_count" -lt 4 ]; then
-        attempt_count=$((attempt_count + 1))
-        if ! send_dismissal "$s"; then
-          local_ok=0
-        fi
-      else
-        local_ok=0
+      if printf '%s' "$s" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
+        case " $valid_candidates " in
+          *" $s "*) ;;
+          *) valid_candidates="${valid_candidates:+${valid_candidates} }${s}" ;;
+        esac
       fi
     done
-    if [ "$local_ok" -eq 1 ]; then
+    set +f
+
+    remaining_sids=""
+    attempt_count=0
+    for s in $valid_candidates; do
+      if [ "$attempt_count" -lt 8 ]; then
+        attempt_count=$((attempt_count + 1))
+        if ! send_dismissal "$s"; then
+          remaining_sids="${remaining_sids:+${remaining_sids} }${s}"
+        fi
+      else
+        remaining_sids="${remaining_sids:+${remaining_sids} }${s}"
+      fi
+    done
+
+    if [ -z "$remaining_sids" ]; then
       retire_vendor_file "$VENDOR_ACTIVE" "$prev_sid"
+    else
+      # Rewrite .vendor_active with remaining SIDs so progress is preserved across events
+      va_dir=$(dirname "$VENDOR_ACTIVE")
+      mkdir -m 700 -p "$va_dir" 2>/dev/null || true
+      TMP_VA=$(mktemp "${va_dir}/.va.tmp.XXXXXX" 2>/dev/null || true)
+      if [ -n "$TMP_VA" ]; then
+        chmod 0600 "$TMP_VA" 2>/dev/null || true
+        first_rem=""
+        rest_rem=""
+        for s in $remaining_sids; do
+          if [ -z "$first_rem" ]; then
+            first_rem="$s"
+          else
+            rest_rem="${rest_rem:+${rest_rem} }${s}"
+          fi
+        done
+        if [ -n "$first_rem" ]; then
+          if [ -z "$rest_rem" ]; then
+            printf '{"vendor_session_id":"%s"}\n' "$first_rem" > "$TMP_VA" 2>/dev/null || true
+          else
+            printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"}\n' "$first_rem" "$rest_rem" > "$TMP_VA" 2>/dev/null || true
+          fi
+          mv -f "$TMP_VA" "$VENDOR_ACTIVE" 2>/dev/null || rm -f "$TMP_VA" 2>/dev/null || true
+        fi
+      fi
     fi
   fi
 
@@ -207,15 +247,24 @@ fi
 
 # Sweep orphaned standalone .active files whose recording process has died or aged out
 sweep_standalone_active() {
-  [ "$EVENT" = "PreToolUse" ] && return 0
+  # Never run sweep on PreToolUse (avoid tool latency) or Stop/SessionEnd (prioritize stopping session)
+  case "$EVENT" in
+    PreToolUse|Stop|SessionEnd) return 0 ;;
+  esac
   local sa_dir="${STATE_HOME}/standalone"
   [ -d "$sa_dir" ] || return 0
   local now
   now=$(date +%s 2>/dev/null || echo 0)
-  local count=0
+  local sweep_requests=0
+  local max_sweep_requests=4
+
   for f in "$sa_dir"/*.active; do
     [ -f "$f" ] || continue
     [ -n "$VENDOR_ACTIVE" ] && [ "$f" = "$VENDOR_ACTIVE" ] && continue
+    if [ "$sweep_requests" -ge "$max_sweep_requests" ]; then
+      break
+    fi
+
     local f_pid f_sid f_pend is_dead mtime age
     f_pid=$(cat "$f" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | tr -cd '0-9')
     f_sid=$(cat "$f" 2>/dev/null | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
@@ -241,14 +290,19 @@ sweep_standalone_active() {
     fi
 
     if [ "$is_dead" -eq 1 ]; then
-      # Validate SIDs: filter to valid format ^[a-zA-Z0-9_-]{16,64}$
+      # Validate SIDs: filter to valid format ^[a-zA-Z0-9_-]{16,64}$ with noglob
+      set -f
       local valid_sids=""
       for s in $f_sid $f_pend; do
         [ -n "$s" ] || continue
         if printf '%s' "$s" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
-          valid_sids="${valid_sids:+${valid_sids} }${s}"
+          case " $valid_sids " in
+            *" $s "*) ;;
+            *) valid_sids="${valid_sids:+${valid_sids} }${s}" ;;
+          esac
         fi
       done
+      set +f
 
       # If dead record contains no valid SIDs at all (corrupted or unparseable), retire it immediately
       if [ -z "$valid_sids" ]; then
@@ -256,13 +310,13 @@ sweep_standalone_active() {
         continue
       fi
 
-      if [ "$count" -ge 2 ]; then
-        break
-      fi
-      count=$((count + 1))
-
       local all_ok=1
       for s in $valid_sids; do
+        if [ "$sweep_requests" -ge "$max_sweep_requests" ]; then
+          all_ok=0
+          break
+        fi
+        sweep_requests=$((sweep_requests + 1))
         if ! send_dismissal "$s"; then
           all_ok=0
         fi
@@ -506,31 +560,35 @@ fi
 if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVENT" != "SessionEnd" ]; then
   # Only record if SID matches standard vendor UUID regex (16-64 chars)
   if printf '%s' "$SID" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
+    set -f
     to_dismiss=""
     local_count=0
     for s in $PREV_VENDOR_SID $PENDING_DISMISSAL_SID; do
       [ -n "$s" ] || continue
       [ "$s" = "$SID" ] && continue
-      case " $to_dismiss " in
-        *" $s "*) ;;
-        *)
-          if [ "$local_count" -lt 8 ]; then
-            to_dismiss="${to_dismiss:+${to_dismiss} }${s}"
-            local_count=$((local_count + 1))
-          fi
-          ;;
-      esac
+      if printf '%s' "$s" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
+        case " $to_dismiss " in
+          *" $s "*) ;;
+          *)
+            if [ "$local_count" -lt 8 ]; then
+              to_dismiss="${to_dismiss:+${to_dismiss} }${s}"
+              local_count=$((local_count + 1))
+            fi
+            ;;
+        esac
+      fi
     done
+    set +f
 
     still_pending=""
     if [ "$EVENT" = "PreToolUse" ]; then
       # On PreToolUse, preserve pending dismissals without spending network time so tool admission is never delayed
       still_pending="$to_dismiss"
     else
-      # Attempt dismissal for up to 4 SIDs per event, preserving any remaining or failed ones
+      # Attempt dismissal for up to 8 SIDs per event, preserving any remaining or failed ones
       attempt_count=0
       for s in $to_dismiss; do
-        if [ "$attempt_count" -lt 4 ]; then
+        if [ "$attempt_count" -lt 8 ]; then
           attempt_count=$((attempt_count + 1))
           if ! send_dismissal "$s"; then
             still_pending="${still_pending:+${still_pending} }${s}"
@@ -584,40 +642,77 @@ fi
 # If delivery timed out or failed, keep .vendor_active intact so Herdr reconciler retries.
 # If a pending or previous session differs from SID, both must be dismissed before retiring.
 if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEnd" ]; }; then
+  set -f
   to_dismiss=""
   local_count=0
   for s in $PREV_VENDOR_SID $PENDING_DISMISSAL_SID; do
     [ -n "$s" ] || continue
     [ "$s" = "$SID" ] && continue
-    case " $to_dismiss " in
-      *" $s "*) ;;
-      *)
-        if [ "$local_count" -lt 8 ]; then
-          to_dismiss="${to_dismiss:+${to_dismiss} }${s}"
-          local_count=$((local_count + 1))
-        fi
-        ;;
-    esac
-  done
-  prior_ok=1
-  attempt_count=0
-  for s in $to_dismiss; do
-    if [ "$attempt_count" -lt 4 ]; then
-      attempt_count=$((attempt_count + 1))
-      if ! send_dismissal "$s"; then
-        prior_ok=0
-      fi
-    else
-      prior_ok=0
+    if printf '%s' "$s" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
+      case " $to_dismiss " in
+        *" $s "*) ;;
+        *)
+          if [ "$local_count" -lt 8 ]; then
+            to_dismiss="${to_dismiss:+${to_dismiss} }${s}"
+            local_count=$((local_count + 1))
+          fi
+          ;;
+      esac
     fi
   done
+  set +f
+
+  failed_priors=""
+  attempt_count=0
+  for s in $to_dismiss; do
+    if [ "$attempt_count" -lt 8 ]; then
+      attempt_count=$((attempt_count + 1))
+      if ! send_dismissal "$s"; then
+        failed_priors="${failed_priors:+${failed_priors} }${s}"
+      fi
+    else
+      failed_priors="${failed_priors:+${failed_priors} }${s}"
+    fi
+  done
+
   current_ok=0
   case "$http_code" in
     200|404|410) current_ok=1 ;;
   esac
-  if [ "$current_ok" -eq 1 ] && [ "$prior_ok" -eq 1 ]; then
+
+  if [ "$current_ok" -eq 1 ] && [ -z "$failed_priors" ]; then
     retire_vendor_file "$VENDOR_ACTIVE" "$SID"
     retire_vendor_file "$VENDOR_ACTIVE" "${PREV_VENDOR_SID:-$SID}"
+  else
+    # Some dismissals could not be confirmed: rewrite .vendor_active with remaining un-dismissed SIDs
+    va_dir=$(dirname "$VENDOR_ACTIVE")
+    mkdir -m 700 -p "$va_dir" 2>/dev/null || true
+    TMP_VA=$(mktemp "${va_dir}/.va.tmp.XXXXXX" 2>/dev/null || true)
+    if [ -n "$TMP_VA" ]; then
+      chmod 0600 "$TMP_VA" 2>/dev/null || true
+      all_failed=""
+      [ "$current_ok" -ne 1 ] && all_failed="$SID"
+      for s in $failed_priors; do
+        all_failed="${all_failed:+${all_failed} }${s}"
+      done
+      first_f=""
+      rest_f=""
+      for s in $all_failed; do
+        if [ -z "$first_f" ]; then
+          first_f="$s"
+        else
+          rest_f="${rest_f:+${rest_f} }${s}"
+        fi
+      done
+      if [ -n "$first_f" ]; then
+        if [ -z "$rest_f" ]; then
+          printf '{"vendor_session_id":"%s"}\n' "$first_f" > "$TMP_VA" 2>/dev/null || true
+        else
+          printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"}\n' "$first_f" "$rest_f" > "$TMP_VA" 2>/dev/null || true
+        fi
+        mv -f "$TMP_VA" "$VENDOR_ACTIVE" 2>/dev/null || rm -f "$TMP_VA" 2>/dev/null || true
+      fi
+    fi
   fi
 fi
 

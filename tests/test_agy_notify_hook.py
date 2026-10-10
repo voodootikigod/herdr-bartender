@@ -560,6 +560,37 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(out, '{"decision":"allow"}')
         self.assertLess(elapsed, 1.0, "PreToolUse in handoff branch must return immediately without dismissal delays")
 
+    def test_handoff_and_stop_with_more_than_4_pending_sids_dismisses_all(self):
+        """When .vendor_active has more than 4 pending SIDs, handoff and Stop dismiss all of them without stalling."""
+        pane_id = "ws1:pHandoffMany"
+        hex_pane = pane_id.encode("utf-8").hex()
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+        va_file.parent.mkdir(parents=True, exist_ok=True)
+
+        sids = [f"conv-many-pend-{i:04d}" for i in range(6)]
+        va_file.write_text(json.dumps({
+            "vendor_session_id": "conv-many-prev-0001",
+            "pending_dismissal_sid": " ".join(sids),
+        }))
+        self._fresh_marker(pane_id)
+        self.set_herdr_alive()
+
+        self.bridge.history.clear()
+        # PostInvocation in Herdr pane runs handoff dismissals
+        code, out, _ = self._run_hook(
+            "PostInvocation",
+            payload={"conversationId": "conv-current-post-001"},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(7)
+        # All 7 SIDs (1 prev + 6 pending) should be dismissed and file retired!
+        dismissed = {h.get("session_id") for h in self.bridge.history}
+        self.assertIn("conv-many-prev-0001", dismissed)
+        for s in sids:
+            self.assertIn(s, dismissed)
+        self.assertFalse(va_file.exists(), ".vendor_active must be retired after all SIDs are dismissed")
+
     def test_sweep_standalone_skips_live_records_and_cleans_dead_records(self):
         """Live standalone records do not consume the 2-file sweep budget, so dead records behind them are swept."""
         sa_dir = self.state_dir / "standalone"
