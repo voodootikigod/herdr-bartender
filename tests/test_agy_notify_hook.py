@@ -512,6 +512,8 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(self.bridge.history[-1].get("state"), "Ended")
         sid3 = self.bridge.history[-1].get("session_id", "")
         self.assertTrue(sid3.startswith("agy-fallback-"), f"expected agy-fallback- prefix, got {sid3}")
+        self.assertEqual(sid1, sid2, "fallback session ID must be stable across events")
+        self.assertEqual(sid2, sid3, "fallback session ID must be stable across events")
 
         # 4. Injected event -> whitelisted to empty, delivery is skipped safely
         code, out, _ = self._run_hook('Stop"; injection', payload={}, env_extra=env)

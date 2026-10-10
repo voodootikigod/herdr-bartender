@@ -352,8 +352,8 @@ if [ -z "${payload:-}" ]; then
     *) FB_STATE="Working" ;;
   esac
   # Compute unique per-process fallback session ID (>= 16 chars)
-  seed_str="${PWD:-}:${AGENT_PID:-$$}:${AGENT_TTY:-}:${TERM_SESSION_ID:-}"
-  h=$(printf '%s' "$seed_str" | shasum -a 256 2>/dev/null | cut -c1-24 || echo "$$")
+  seed_str="${PWD:-}:${AGENT_PID:-}:${AGENT_TTY:-}:${TERM_SESSION_ID:-}"
+  h=$(printf '%s' "$seed_str" | shasum -a 256 2>/dev/null | cut -c1-24 || echo "default-fallback")
   FALLBACK_SID="agy-fallback-${h}"
   SID="$FALLBACK_SID"
   payload="{\"state\":\"${FB_STATE}\",\"agent\":\"Antigravity\",\"event\":\"${EVENT}\",\"session_id\":\"${FALLBACK_SID}\"}"
