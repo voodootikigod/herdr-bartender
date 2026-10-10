@@ -368,36 +368,72 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertTrue(va_file.exists())
         self.assertIn(cid_a, va_file.read_text())
 
-        # Step 2: Bridge returns 500 for subsequent events
-        self.bridge.return_code = 500
+        # Step 2: Bridge returns 500 for the dismissal of A
+        self.bridge.enqueue(status=500)
 
-        # PreInvocation for conv B arrives. Dismissal of A fails (500), so va_file must NOT be overwritten!
+        # PreInvocation for conv B arrives. Dismissal of A fails (500), but B is still delivered,
+        # and A is preserved as pending_dismissal_sid in .vendor_active!
         code, out, _ = self._run_hook(
             "PreInvocation",
             payload={"conversationId": cid_b},
             env_extra={"HERDR_PANE_ID": pane_id},
         )
         self.assertEqual(code, 0)
-        # .vendor_active must still contain cid_a because dismissal was not confirmed
         self.assertTrue(va_file.exists())
-        self.assertIn(cid_a, va_file.read_text(), ".vendor_active must not be overwritten when dismissal fails")
-        # And delivery of B was skipped because dismissal of A failed
-        self.assertEqual(len(self.bridge.history), 1)
+        va_text = va_file.read_text()
+        self.assertIn(cid_b, va_text)
+        self.assertIn(cid_a, va_text)
+        self.assertIn("pending_dismissal_sid", va_text)
+        # B is delivered so the active session is never hidden!
+        self._wait_for_history(2)
+        self.assertEqual(len(self.bridge.history), 2)
+        self.assertEqual(self.bridge.history[-1].get("session_id"), cid_b)
 
-        # Step 3: Now bridge recovers (200), and Stop arrives for B
-        self.bridge.return_code = 200
+        # Step 3: Stop arrives for B
         code, out, _ = self._run_hook(
             "Stop",
             payload={"conversationId": cid_b},
             env_extra={"HERDR_PANE_ID": pane_id},
         )
         self.assertEqual(code, 0)
-        self._wait_for_history(3)
+        self._wait_for_history(4)
         # Both B and A are dismissed!
-        dismissed_sids = {h.get("session_id") for h in self.bridge.history[1:]}
+        dismissed_sids = {h.get("session_id") for h in self.bridge.history[2:]}
         self.assertIn(cid_b, dismissed_sids)
         self.assertIn(cid_a, dismissed_sids)
         self.assertFalse(va_file.exists(), ".vendor_active must be retired after confirmed Stop")
+
+    def test_crashed_standalone_session_cleaned_up_on_subsequent_run(self):
+        """When an earlier standalone agy process crashes/dies without Stop, the next hook run sweeps it."""
+        sa_dir = self.state_dir / "standalone"
+        sa_dir.mkdir(parents=True, exist_ok=True)
+        dead_pid = 99998
+        try:
+            os.kill(dead_pid, 0)
+            dead_pid = 99997
+        except OSError:
+            pass
+
+        dead_file = sa_dir / "dead12345678.active"
+        dead_sid = "conv-crashed-standalone-0001"
+        dead_file.write_text(json.dumps({"vendor_session_id": dead_sid, "pid": dead_pid}))
+
+        self.bridge.history.clear()
+        # Run hook for a different, new invocation
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "conv-alive-0001"},
+            env_extra={"AGENT_PID": "4242", "AGENT_TTY": "ttys002"},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(2)
+        # The dead session was swept and sent Ended, and the alive session was sent Working!
+        history_sids = [h.get("session_id") for h in self.bridge.history]
+        self.assertIn(dead_sid, history_sids)
+        ended_event = next(h for h in self.bridge.history if h.get("session_id") == dead_sid)
+        self.assertEqual(ended_event.get("state"), "Ended")
+        # Stale active file must be cleaned up
+        self.assertFalse(dead_file.exists(), "stale standalone file must be retired by sweep")
 
     def test_stop_without_conv_id_reuses_stored_vendor_sid(self):
         """When Stop arrives without conversationId, it reuses the session ID recorded in .vendor_active."""

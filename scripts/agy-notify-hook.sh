@@ -157,23 +157,55 @@ fi
 
 # Resolve controlling terminal for multi-session collision avoidance
 AGENT_TTY="${AGENT_TTY:-}"
-if [ -z "$AGENT_TTY" ]; then
+if [ -z "$AGENT_TTY" ] || [ "$AGENT_TTY" = "?" ] || [ "$AGENT_TTY" = "??" ]; then
   if [ -n "$AGENT_PID" ]; then
     AGENT_TTY=$(ps -o tty= -p "$AGENT_PID" 2>/dev/null | tr -d ' \t\n' || true)
   fi
   if [ -z "$AGENT_TTY" ] || [ "$AGENT_TTY" = "?" ] || [ "$AGENT_TTY" = "??" ]; then
     AGENT_TTY=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' \t\n' || true)
   fi
+  if [ "$AGENT_TTY" = "?" ] || [ "$AGENT_TTY" = "??" ]; then
+    AGENT_TTY=""
+  fi
 fi
 
 # In standalone mode (no HERDR_PANE_ID), track active session per process/TTY so Stop reuses the same SID
 if [ -z "$CANONICAL_PANE" ]; then
-  sa_ident="${AGENT_PID:-}:${AGENT_TTY:-}:${TERM_SESSION_ID:-}"
-  if [ "$sa_ident" != "::" ]; then
+  # Only track standalone active file when a reliable identifier (PID or real TTY) is known
+  if [ -n "$AGENT_PID" ] || [ -n "$AGENT_TTY" ]; then
+    sa_ident="${AGENT_PID:-}:${AGENT_TTY:-}:${TERM_SESSION_ID:-}"
     sa_hex=$(printf '%s' "$sa_ident" | LC_ALL=C od -An -v -tx1 | tr -d ' \t\n' | cut -c1-32)
     VENDOR_ACTIVE="${STATE_HOME}/standalone/${sa_hex}.active"
   fi
 fi
+
+# Sweep orphaned standalone .active files whose recording process has died
+sweep_standalone_active() {
+  local sa_dir="${STATE_HOME}/standalone"
+  [ -d "$sa_dir" ] || return 0
+  for f in "$sa_dir"/*.active; do
+    [ -f "$f" ] || continue
+    [ -n "$VENDOR_ACTIVE" ] && [ "$f" = "$VENDOR_ACTIVE" ] && continue
+    local f_pid f_sid
+    f_pid=$(cat "$f" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | tr -cd '0-9')
+    f_sid=$(cat "$f" 2>/dev/null | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+    if [ -n "$f_pid" ] && ! kill -0 "$f_pid" 2>/dev/null; then
+      if [ -n "$f_sid" ] && is_bartender_alive; then
+        curl -s \
+          --noproxy '*' \
+          --max-redirs 0 \
+          --proto =http \
+          --connect-timeout 0.15 \
+          --max-time 0.5 \
+          -X POST "http://${HOST}:${PORT}/event" \
+          -H 'Content-Type: application/json' \
+          --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${f_sid}\"}" >/dev/null 2>&1 || true
+      fi
+      retire_vendor_file "$f" "$f_sid"
+    fi
+  done
+}
+sweep_standalone_active
 
 # Resolve Python interpreter safely:
 # On macOS, /usr/bin/python3 is an xcrun stub that triggers GUI installation prompts
@@ -195,8 +227,10 @@ if [ -z "$PYTHON_BIN" ]; then
 fi
 
 PREV_VENDOR_SID=""
+PENDING_DISMISSAL_SID=""
 if [ -n "$VENDOR_ACTIVE" ] && [ -f "$VENDOR_ACTIVE" ]; then
   PREV_VENDOR_SID=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+  PENDING_DISMISSAL_SID=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"pending_dismissal_sid"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
 fi
 
 SID=""
@@ -398,14 +432,17 @@ if [ -z "${payload:-}" ]; then
   payload="{\"state\":\"${FB_STATE}\",\"agent\":\"Antigravity\",\"event\":\"${EVENT}\",\"session_id\":\"${FALLBACK_SID}\"}"
 fi
 
-# On non-Stop events, record or update .vendor_active during fail-open window
-can_deliver=1
+# On non-Stop events, record or update .vendor_active
 if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVENT" != "SessionEnd" ]; then
   # Only record if SID matches standard vendor UUID regex (16-64 chars)
   if printf '%s' "$SID" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
-    can_write_va=1
-    # If an existing record holds an older, different session ID, dismiss the older session first
-    if [ -n "$PREV_VENDOR_SID" ] && [ "$PREV_VENDOR_SID" != "$SID" ]; then
+    sid_to_dismiss="${PENDING_DISMISSAL_SID:-}"
+    if [ -z "$sid_to_dismiss" ] && [ -n "$PREV_VENDOR_SID" ] && [ "$PREV_VENDOR_SID" != "$SID" ]; then
+      sid_to_dismiss="$PREV_VENDOR_SID"
+    fi
+
+    dismiss_ok=1
+    if [ -n "$sid_to_dismiss" ] && [ "$sid_to_dismiss" != "$SID" ]; then
       if is_bartender_alive; then
         old_code=$(curl -s -o /dev/null -w "%{http_code}" \
           --noproxy '*' \
@@ -415,33 +452,43 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVE
           --max-time 0.5 \
           -X POST "http://${HOST}:${PORT}/event" \
           -H 'Content-Type: application/json' \
-          --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${PREV_VENDOR_SID}\"}" 2>/dev/null || echo "000")
-        if [ "$old_code" != "200" ] && [ "$old_code" != "404" ]; then
-          can_write_va=0
-          can_deliver=0
+          --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${sid_to_dismiss}\"}" 2>/dev/null || echo "000")
+        if [ "$old_code" != "200" ] && ! printf '%s' "$old_code" | grep -Eq '^4[0-9]{2}$'; then
+          dismiss_ok=0
         fi
       else
-        can_write_va=0
-        can_deliver=0
+        dismiss_ok=0
       fi
     fi
 
-    if [ "$can_write_va" -eq 1 ]; then
-      va_dir=$(dirname "$VENDOR_ACTIVE")
-      mkdir -m 700 -p "$va_dir" 2>/dev/null || true
-      TMP_VA=$(mktemp "${va_dir}/.va.tmp.XXXXXX" 2>/dev/null || true)
-      if [ -n "$TMP_VA" ]; then
-        chmod 0600 "$TMP_VA" 2>/dev/null || true
-        printf '{"vendor_session_id":"%s"}\n' "$SID" > "$TMP_VA" 2>/dev/null || true
-        mv -f "$TMP_VA" "$VENDOR_ACTIVE" 2>/dev/null || rm -f "$TMP_VA" 2>/dev/null || true
+    va_dir=$(dirname "$VENDOR_ACTIVE")
+    mkdir -m 700 -p "$va_dir" 2>/dev/null || true
+    TMP_VA=$(mktemp "${va_dir}/.va.tmp.XXXXXX" 2>/dev/null || true)
+    if [ -n "$TMP_VA" ]; then
+      chmod 0600 "$TMP_VA" 2>/dev/null || true
+      if [ "$dismiss_ok" -eq 1 ]; then
+        if [ -n "$AGENT_PID" ]; then
+          printf '{"vendor_session_id":"%s","pid":%s}\n' "$SID" "$AGENT_PID" > "$TMP_VA" 2>/dev/null || true
+        else
+          printf '{"vendor_session_id":"%s"}\n' "$SID" > "$TMP_VA" 2>/dev/null || true
+        fi
+      else
+        # Dismissal of previous session could not be completed; record both so subsequent events/Stop retry dismissing it,
+        # while still recording and advancing to current session.
+        if [ -n "$AGENT_PID" ]; then
+          printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s","pid":%s}\n' "$SID" "$sid_to_dismiss" "$AGENT_PID" > "$TMP_VA" 2>/dev/null || true
+        else
+          printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"}\n' "$SID" "$sid_to_dismiss" > "$TMP_VA" 2>/dev/null || true
+        fi
       fi
+      mv -f "$TMP_VA" "$VENDOR_ACTIVE" 2>/dev/null || rm -f "$TMP_VA" 2>/dev/null || true
     fi
   fi
 fi
 
 # Send event synchronously with tight timeout. Strictly loopback, no proxies, no redirects.
 http_code="000"
-if is_bartender_alive && [ "$can_deliver" -eq 1 ]; then
+if is_bartender_alive; then
   http_code=$(curl -s -o /dev/null -w "%{http_code}" \
     --noproxy '*' \
     --max-redirs 0 \
@@ -455,10 +502,14 @@ fi
 
 # On Stop/SessionEnd, retire .vendor_active ONLY if dismissal was confirmed by HTTP 200.
 # If delivery timed out or failed, keep .vendor_active intact so Herdr reconciler retries.
-# If PREV_VENDOR_SID differs from SID, both must be dismissed with HTTP 200 before retiring.
+# If a pending or previous session differs from SID, both must be dismissed before retiring.
 if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEnd" ]; }; then
+  sid_to_dismiss="${PENDING_DISMISSAL_SID:-}"
+  if [ -z "$sid_to_dismiss" ] && [ -n "$PREV_VENDOR_SID" ] && [ "$PREV_VENDOR_SID" != "$SID" ]; then
+    sid_to_dismiss="$PREV_VENDOR_SID"
+  fi
   old_code="200"
-  if [ -n "$PREV_VENDOR_SID" ] && [ "$PREV_VENDOR_SID" != "$SID" ]; then
+  if [ -n "$sid_to_dismiss" ] && [ "$sid_to_dismiss" != "$SID" ]; then
     if is_bartender_alive; then
       old_code=$(curl -s -o /dev/null -w "%{http_code}" \
         --noproxy '*' \
@@ -468,13 +519,17 @@ if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEn
         --max-time 0.5 \
         -X POST "http://${HOST}:${PORT}/event" \
         -H 'Content-Type: application/json' \
-        --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${PREV_VENDOR_SID}\"}" 2>/dev/null || echo "000")
+        --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${sid_to_dismiss}\"}" 2>/dev/null || echo "000")
+      if [ "$old_code" = "200" ] || printf '%s' "$old_code" | grep -Eq '^4[0-9]{2}$'; then
+        old_code="200"
+      fi
     else
       old_code="000"
     fi
   fi
   if [ "$http_code" = "200" ] && [ "$old_code" = "200" ]; then
-    retire_vendor_file "$VENDOR_ACTIVE" "$PREV_VENDOR_SID"
+    retire_vendor_file "$VENDOR_ACTIVE" "$sid_to_dismiss"
+    retire_vendor_file "$VENDOR_ACTIVE" "${PREV_VENDOR_SID:-$SID}"
     retire_vendor_file "$VENDOR_ACTIVE" "$SID"
   fi
 fi
