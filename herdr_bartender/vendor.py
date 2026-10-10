@@ -266,15 +266,21 @@ def cap_dismissals(queue: dict, keep: Optional[str] = None) -> dict:
 def stage_dismissal_hex(data: dict, uuid: str, pane_hex: str, now: float, pane_closed: bool = False) -> dict:
     """Queue ``uuid`` in ``dismissed_vendor_uuids`` before anything is sent (attempts 0), within the 64 cap.
 
-    If ``uuid`` was already queued, preserves the existing timestamp and attempt counter so retry budgets
-    remain strictly bounded (preventing unbounded retry loops), while upgrading ``pane_closed`` via logical OR.
+    If ``uuid`` was already queued and still within its retry window (< 10s and < 5 attempts), preserves
+    the existing timestamp and attempt counter so retries are bounded, while upgrading ``pane_closed``
+    via logical OR. If the existing entry was already expired or exhausted, resets to a fresh retry budget.
     """
     queue = dict(data.get("dismissed_vendor_uuids") or {})
     if uuid in queue:
         existing = queue[uuid]
-        if pane_closed and isinstance(existing, dict) and not existing.get("pane_closed"):
-            existing["pane_closed"] = True
-        return existing
+        if isinstance(existing, dict):
+            age = now - existing.get("timestamp", 0.0)
+            attempts = existing.get("attempts", 0)
+            if age < 10.0 and attempts < DISMISSAL_MAX_ATTEMPTS:
+                merged = {**existing, "pane_closed": bool(existing.get("pane_closed") or pane_closed)}
+                queue[uuid] = merged
+                data["dismissed_vendor_uuids"] = queue
+                return merged
     entry = {"timestamp": now, "pane_hex": pane_hex, "attempts": 0, "last_attempt": 0.0,
              "pane_closed": bool(pane_closed)}
     queue[uuid] = entry

@@ -1424,6 +1424,55 @@ fi
         proc = subprocess.run(["/bin/bash", "-c", bash_test], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, f"Bash test failed: {proc.stderr}")
 
+    def test_standalone_session_tracking_without_pid_and_tty(self):
+        """When AGENT_PID and AGENT_TTY are both empty, standalone mode tracks active session by PWD and TERM_SESSION_ID."""
+        self.bridge.history.clear()
+        env = {
+            "HERDR_PANE_ID": "",
+            "AGY_HOOK_AGENT_PID": "none",
+            "AGENT_PID": "",
+            "AGY_HOOK_NO_TTY": "1",
+            "AGENT_TTY": "none",
+            "TERM_SESSION_ID": "term-session-standalone-test",
+        }
+        cid = "conv-standalone-nopid-0001"
+        code1, out1, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": cid},
+            env_extra=env,
+        )
+        self.assertEqual(code1, 0)
+        self.assertEqual(out1, "{}")
+        self._wait_for_history(1)
+        self.assertEqual(len(self.bridge.history), 1)
+        self.assertEqual(self.bridge.history[-1]["session_id"], cid)
+        self.assertEqual(self.bridge.history[-1]["state"], "Working")
+
+        # Verify standalone active file was created
+        sa_dir = self.state_dir / "standalone"
+        active_files = list(sa_dir.glob("*.active"))
+        self.assertEqual(len(active_files), 1, "standalone active file must be created")
+        va_content = json.loads(active_files[0].read_text())
+        self.assertEqual(va_content.get("vendor_session_id"), cid)
+
+        # Call Stop without conversationId in payload
+        code2, out2, _ = self._run_hook(
+            "Stop",
+            payload={},
+            env_extra=env,
+        )
+        self.assertEqual(code2, 0)
+        self.assertEqual(out2, '{"decision":""}')
+        self._wait_for_history(2)
+        self.assertEqual(len(self.bridge.history), 2)
+        self.assertEqual(self.bridge.history[-1]["session_id"], cid, "Stop must reuse recorded session ID from .active file")
+        self.assertEqual(self.bridge.history[-1]["state"], "Ended")
+
+        # Active file must be retired after successful Stop
+        remaining_actives = list(sa_dir.glob("*.active"))
+        self.assertEqual(len(remaining_actives), 0, "standalone active file must be retired on confirmed Ended")
+
+
 
 
 

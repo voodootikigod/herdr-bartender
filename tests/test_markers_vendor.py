@@ -334,18 +334,56 @@ class MultiUuidReconcilerStagingTests(SandboxTestCase):
                 }
             }
         }
-        # Re-stage with pane_closed=True at now=20.0
-        entry = stage_dismissal_hex(data, "test-uuid-bound", "aa", now=20.0, pane_closed=True)
+        # Re-stage with pane_closed=True at now=15.0 (< 10s age)
+        entry = stage_dismissal_hex(data, "test-uuid-bound", "aa", now=15.0, pane_closed=True)
         self.assertEqual(entry["timestamp"], 10.0, "timestamp must NOT be reset to bound retries")
         self.assertEqual(entry["attempts"], 3, "attempts must NOT be reset to bound retries")
         self.assertEqual(entry["last_attempt"], 12.0)
         self.assertTrue(entry["pane_closed"], "pane_closed must be upgraded to True via OR")
 
-        # Re-stage again with pane_closed=False at now=25.0: pane_closed must remain True
-        entry2 = stage_dismissal_hex(data, "test-uuid-bound", "aa", now=25.0, pane_closed=False)
+        # Re-stage again with pane_closed=False at now=18.0: pane_closed must remain True
+        entry2 = stage_dismissal_hex(data, "test-uuid-bound", "aa", now=18.0, pane_closed=False)
         self.assertEqual(entry2["timestamp"], 10.0)
         self.assertEqual(entry2["attempts"], 3)
         self.assertTrue(entry2["pane_closed"])
+
+    def test_stage_dismissal_hex_expired_or_exhausted_resets_retry_budget(self):
+        """Re-staging an expired (>10s) or exhausted (>=5 attempts) UUID resets to a fresh retry budget."""
+        from herdr_bartender.vendor import stage_dismissal_hex
+        # Case 1: Expired (>10s old)
+        data = {
+            "dismissed_vendor_uuids": {
+                "test-uuid-expired": {
+                    "timestamp": 10.0,
+                    "pane_hex": "aa",
+                    "attempts": 2,
+                    "last_attempt": 12.0,
+                    "pane_closed": False,
+                }
+            }
+        }
+        entry = stage_dismissal_hex(data, "test-uuid-expired", "bb", now=25.0, pane_closed=True)
+        self.assertEqual(entry["timestamp"], 25.0, "expired entry must reset timestamp to now")
+        self.assertEqual(entry["attempts"], 0, "expired entry must reset attempts to 0")
+        self.assertEqual(entry["pane_hex"], "bb")
+        self.assertTrue(entry["pane_closed"])
+
+        # Case 2: Exhausted (attempts >= 5) even if within 10s
+        data2 = {
+            "dismissed_vendor_uuids": {
+                "test-uuid-exhausted": {
+                    "timestamp": 10.0,
+                    "pane_hex": "aa",
+                    "attempts": 5,
+                    "last_attempt": 14.0,
+                    "pane_closed": False,
+                }
+            }
+        }
+        entry2 = stage_dismissal_hex(data2, "test-uuid-exhausted", "cc", now=15.0, pane_closed=False)
+        self.assertEqual(entry2["timestamp"], 15.0, "exhausted entry must reset timestamp to now")
+        self.assertEqual(entry2["attempts"], 0, "exhausted entry must reset attempts to 0")
+        self.assertEqual(entry2["pane_hex"], "cc")
 
 
 if __name__ == "__main__":
