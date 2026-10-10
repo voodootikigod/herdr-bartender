@@ -336,7 +336,8 @@ def resolve_vendor_cleanups(data: dict, panes: Sequence[str], now: float,
         for uuid in uuids:
             stage_dismissal(data, uuid, pane, now, pane_closed=pane in closed)
             dismissals.append(uuid)
-        unlink.append(record)
+        if all(uuid in data.get("dismissed_vendor_uuids", {}) for uuid in uuids):
+            unlink.append(record)
     return VendorResolution(tuple(dict.fromkeys(dismissals)), tuple(unlink), tuple(resolved))
 
 

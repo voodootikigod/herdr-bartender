@@ -36,17 +36,17 @@ has_time_remaining() {
 TMP_VA=""
 PRETOOLUSE_EMITTED=0
 
-emit_pretooluse_allow() {
+emit_pretooluse_ask() {
   if [ "$PRETOOLUSE_EMITTED" -eq 0 ]; then
     PRETOOLUSE_EMITTED=1
-    printf '{"decision":"allow"}\n'
+    printf '{"decision":"ask"}\n'
   fi
 }
 
 cleanup_and_guarantee_pretooluse() {
   [ -n "${TMP_VA:-}" ] && rm -f "$TMP_VA" 2>/dev/null || true
   if [ "$EVENT" = "PreToolUse" ] && [ "$PRETOOLUSE_EMITTED" -eq 0 ]; then
-    emit_pretooluse_allow
+    emit_pretooluse_ask
   fi
 }
 trap cleanup_and_guarantee_pretooluse EXIT INT TERM
@@ -223,10 +223,14 @@ if is_herdr_owning_pane; then
           fi
         done
         if [ -n "$first_rem" ]; then
+          tty_json=""
+          [ -n "${AGENT_TTY:-}" ] && tty_json=",\"tty\":\"${AGENT_TTY}\""
+          pid_json=""
+          [ -n "${AGENT_PID:-}" ] && pid_json=",\"pid\":${AGENT_PID}"
           if [ -z "$rest_rem" ]; then
-            printf '{"vendor_session_id":"%s"}\n' "$first_rem" > "$TMP_VA" 2>/dev/null || true
+            printf '{"vendor_session_id":"%s"%s%s}\n' "$first_rem" "$pid_json" "$tty_json" > "$TMP_VA" 2>/dev/null || true
           else
-            printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"}\n' "$first_rem" "$rest_rem" > "$TMP_VA" 2>/dev/null || true
+            printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"%s%s}\n' "$first_rem" "$rest_rem" "$pid_json" "$tty_json" > "$TMP_VA" 2>/dev/null || true
           fi
           mv -f "$TMP_VA" "$VENDOR_ACTIVE" 2>/dev/null || rm -f "$TMP_VA" 2>/dev/null || true
         fi
@@ -235,7 +239,7 @@ if is_herdr_owning_pane; then
   fi
 
   case "$EVENT" in
-    PreToolUse) emit_pretooluse_allow ;;
+    PreToolUse) emit_pretooluse_ask ;;
     Stop|SessionEnd) printf '{"decision":""}\n' ;;
     *) printf '{}\n' ;;
   esac
@@ -571,7 +575,7 @@ except Exception:
 ' 2>/dev/null || true)
   if [ "$py_output" = "SKIP" ]; then
     case "$EVENT" in
-      PreToolUse) emit_pretooluse_allow ;;
+      PreToolUse) emit_pretooluse_ask ;;
       Stop|SessionEnd) printf '{"decision":""}\n' ;;
       *) printf '{}\n' ;;
     esac
@@ -587,7 +591,7 @@ fi
 if [ -z "${payload:-}" ]; then
   if [ -z "$EVENT" ]; then
     case "$EVENT" in
-      PreToolUse) emit_pretooluse_allow ;;
+      PreToolUse) emit_pretooluse_ask ;;
       Stop|SessionEnd) printf '{"decision":""}\n' ;;
       *) printf '{}\n' ;;
     esac
@@ -635,11 +639,11 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVE
         case " $to_dismiss " in
           *" $s "*) ;;
           *)
-            if [ "$local_count" -lt 32 ]; then
+            if [ "$local_count" -lt 8 ]; then
               to_dismiss="${to_dismiss:+${to_dismiss} }${s}"
               local_count=$((local_count + 1))
             else
-              printf '[herdr-bartender] Warning: pending dismissal cap (32) reached; dropping oldest SID %s\n' "$s" >&2
+              printf '[herdr-bartender] Warning: pending dismissal cap (8) reached; dropping oldest SID %s\n' "$s" >&2
             fi
             ;;
         esac
@@ -728,11 +732,11 @@ if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEn
       case " $to_dismiss " in
         *" $s "*) ;;
         *)
-          if [ "$local_count" -lt 32 ]; then
+          if [ "$local_count" -lt 8 ]; then
             to_dismiss="${to_dismiss:+${to_dismiss} }${s}"
             local_count=$((local_count + 1))
           else
-            printf '[herdr-bartender] Warning: pending dismissal cap (32) reached; dropping oldest SID %s\n' "$s" >&2
+            printf '[herdr-bartender] Warning: pending dismissal cap (8) reached; dropping oldest SID %s\n' "$s" >&2
           fi
           ;;
       esac
@@ -783,10 +787,14 @@ if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEn
         fi
       done
       if [ -n "$first_f" ]; then
+        tty_json=""
+        [ -n "${AGENT_TTY:-}" ] && tty_json=",\"tty\":\"${AGENT_TTY}\""
+        pid_json=""
+        [ -n "${AGENT_PID:-}" ] && pid_json=",\"pid\":${AGENT_PID}"
         if [ -z "$rest_f" ]; then
-          printf '{"vendor_session_id":"%s"}\n' "$first_f" > "$TMP_VA" 2>/dev/null || true
+          printf '{"vendor_session_id":"%s"%s%s}\n' "$first_f" "$pid_json" "$tty_json" > "$TMP_VA" 2>/dev/null || true
         else
-          printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"}\n' "$first_f" "$rest_f" > "$TMP_VA" 2>/dev/null || true
+          printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"%s%s}\n' "$first_f" "$rest_f" "$pid_json" "$tty_json" > "$TMP_VA" 2>/dev/null || true
         fi
         mv -f "$TMP_VA" "$VENDOR_ACTIVE" 2>/dev/null || rm -f "$TMP_VA" 2>/dev/null || true
       fi
@@ -796,7 +804,7 @@ fi
 
 # Emit expected JSON response to stdout for Antigravity lifecycle
 case "$EVENT" in
-  PreToolUse) emit_pretooluse_allow ;;
+  PreToolUse) emit_pretooluse_ask ;;
   Stop|SessionEnd) printf '{"decision":""}\n' ;;
   *) printf '{}\n' ;;
 esac

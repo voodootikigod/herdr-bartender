@@ -288,6 +288,27 @@ class MultiUuidReconcilerStagingTests(SandboxTestCase):
 
         self.assertFalse(va_file.exists())
 
+    def test_cap_pruning_prevents_file_retirement_when_uuids_dropped(self):
+        """When dismissal queue cap (64) prunes any UUID from a record, that file is NOT unlinked."""
+        pane = "w1:pOverflow"
+        hex_p = get_hex_pane_id(pane)
+        va_file = self.state_dir / "panes" / f"{hex_p}.vendor_active"
+        va_file.parent.mkdir(parents=True, exist_ok=True)
+        # Record with 70 UUIDs (exceeding the 64 queue cap)
+        uuids = [f"test-overflow-{i:04d}-xxxx" for i in range(70)]
+        va_file.write_text(json.dumps({
+            "vendor_session_id": uuids[0],
+            "pending_dismissal_sid": " ".join(uuids[1:]),
+        }))
+
+        with self.cache_mgr as data:
+            res = resolve_vendor_cleanups(data, [pane], now=300.0)
+            self.assertEqual(len(res.unlink), 0, "file must NOT be marked for unlinking when UUIDs are pruned")
+            res.commit()
+
+        # The file MUST still exist so a subsequent pass can retry
+        self.assertTrue(va_file.exists(), ".vendor_active must be preserved when UUIDs were pruned by queue cap")
+
 
 if __name__ == "__main__":
     unittest.main()

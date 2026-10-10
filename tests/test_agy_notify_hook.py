@@ -70,7 +70,7 @@ class AgyNotifyHookTests(SandboxTestCase):
 
         for event, expected_stdout in (
             ("PreInvocation", "{}"),
-            ("PreToolUse", '{"decision":"allow"}'),
+            ("PreToolUse", '{"decision":"ask"}'),
             ("PostInvocation", "{}"),
             ("Stop", '{"decision":""}'),
         ):
@@ -496,20 +496,20 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertFalse(va_file.exists(), ".vendor_active must be retired after confirmed Stop")
 
     def test_long_chain_of_failed_switches_capped_and_pretooluse_fast(self):
-        """A long chain of failed switches caps pending_dismissal_sid at 32 and PreToolUse does not spend dismissal time."""
+        """A long chain of failed switches caps pending_dismissal_sid at 8 and PreToolUse does not spend dismissal time."""
         pane_id = "ws1:pCapChain"
         hex_pane = pane_id.encode("utf-8").hex()
         va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
         va_file.parent.mkdir(parents=True, exist_ok=True)
-        # Pre-seed with 25 pending SIDs
-        sids = [f"conv-cap-chain-{i:04d}" for i in range(25)]
+        # Pre-seed with 6 pending SIDs
+        sids = [f"conv-cap-chain-{i:04d}" for i in range(6)]
         va_file.write_text(json.dumps({
             "vendor_session_id": "conv-cap-chain-prev",
             "pending_dismissal_sid": " ".join(sids),
         }))
 
         # Simulate conversation switches with bridge returning 500 for all requests (4 dismissals + 1 event)
-        for i in range(25, 35):
+        for i in range(6, 12):
             for _ in range(6):
                 self.bridge.enqueue(status=500)
             code, _, _ = self._run_hook(
@@ -524,10 +524,10 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertLess(len(va_bytes), 4096, "record must remain well under VENDOR_FILE_MAX_BYTES")
         va_data = json.loads(va_bytes.decode())
         pending = va_data.get("pending_dismissal_sid", "").split()
-        self.assertEqual(len(pending), 32, "pending dismissals must be exactly capped at 32")
-        self.assertIn("conv-cap-chain-0033", pending, "immediately preceding session must be preserved in pending dismissals")
+        self.assertEqual(len(pending), 8, "pending dismissals must be exactly capped at 8")
+        self.assertIn("conv-cap-chain-0010", pending, "immediately preceding session must be preserved in pending dismissals")
 
-        # Now test PreToolUse: it must return immediately with allow and NOT attempt dismissals
+        # Now test PreToolUse: it must return immediately with ask and NOT attempt dismissals
         t0 = time.monotonic()
         code, out, _ = self._run_hook(
             "PreToolUse",
@@ -539,7 +539,7 @@ class AgyNotifyHookTests(SandboxTestCase):
         )
         elapsed = time.monotonic() - t0
         self.assertEqual(code, 0)
-        self.assertEqual(out, '{"decision":"allow"}')
+        self.assertEqual(out, '{"decision":"ask"}')
         self.assertLess(elapsed, 1.5, "PreToolUse must not be blocked by dismissal network calls")
 
     def test_herdr_owning_pane_pretooluse_skips_dismissal_delays(self):
@@ -566,7 +566,7 @@ class AgyNotifyHookTests(SandboxTestCase):
         )
         elapsed = time.monotonic() - t0
         self.assertEqual(code, 0)
-        self.assertEqual(out, '{"decision":"allow"}')
+        self.assertEqual(out, '{"decision":"ask"}')
         self.assertLess(elapsed, 1.0, "PreToolUse in handoff branch must return immediately without dismissal delays")
         self.assertEqual(len(self.bridge.history), 0, "No dismissal requests should be made during PreToolUse")
 
@@ -813,7 +813,7 @@ class AgyNotifyHookTests(SandboxTestCase):
             },
         )
         self.assertEqual(code, 0)
-        self.assertEqual(out, '{"decision":"allow"}')
+        self.assertEqual(out, '{"decision":"ask"}')
         self._wait_for_history(1)
         self.assertEqual(self.bridge.history[-1].get("state"), "Working")
         self.assertEqual(self.bridge.history[-1].get("title"), "Tool: run_command")
@@ -898,7 +898,7 @@ class AgyNotifyHookTests(SandboxTestCase):
         }
         code, out, _ = self._run_hook(None, payload=payload)
         self.assertEqual(code, 0)
-        self.assertEqual(out, '{"decision":"allow"}')
+        self.assertEqual(out, '{"decision":"ask"}')
         self._wait_for_history(1)
         self.assertEqual(len(self.bridge.history), 1)
         self.assertEqual(self.bridge.history[-1].get("session_id"), "conv-large-payload-0001")
@@ -910,7 +910,7 @@ class AgyNotifyHookTests(SandboxTestCase):
         broken_payload = '{"broken_json": true, "partial": ' + ("x" * 1000)
         code, out, _ = self._run_hook("PreToolUse", payload=broken_payload)
         self.assertEqual(code, 0)
-        self.assertEqual(out, '{"decision":"allow"}')
+        self.assertEqual(out, '{"decision":"ask"}')
         time.sleep(0.1)
         # Must NOT deliver anything to bridge or mint a phantom session ID
         self.assertEqual(len(self.bridge.history), 0)
@@ -1118,12 +1118,12 @@ class AgyNotifyHookTests(SandboxTestCase):
             self.assertIn(s, pending)
 
     def test_pending_dismissal_cap_warning_logged_to_stderr(self):
-        """When pending dismissal list exceeds 32 SIDs, a warning is logged to stderr."""
+        """When pending dismissal list exceeds 8 SIDs, a warning is logged to stderr."""
         pane_id = "ws1:pCapWarn"
         hex_pane = pane_id.encode("utf-8").hex()
         vendor_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
         vendor_file.parent.mkdir(parents=True, exist_ok=True)
-        many_sids = [f"conv-cap-test-{i:04d}-xxxx" for i in range(35)]
+        many_sids = [f"conv-cap-test-{i:04d}-xxxx" for i in range(12)]
         vendor_file.write_text(json.dumps({
             "vendor_session_id": "conv-cap-main-0000",
             "pending_dismissal_sid": " ".join(many_sids),
@@ -1135,7 +1135,7 @@ class AgyNotifyHookTests(SandboxTestCase):
             env_extra={"HERDR_PANE_ID": pane_id},
         )
         self.assertEqual(code, 0)
-        self.assertIn("[herdr-bartender] Warning: pending dismissal cap (32) reached", err)
+        self.assertIn("[herdr-bartender] Warning: pending dismissal cap (8) reached", err)
 
         vendor_file.write_text(json.dumps({
             "vendor_session_id": "conv-cap-stop-0000",
@@ -1147,17 +1147,17 @@ class AgyNotifyHookTests(SandboxTestCase):
             env_extra={"HERDR_PANE_ID": pane_id},
         )
         self.assertEqual(code, 0)
-        self.assertIn("[herdr-bartender] Warning: pending dismissal cap (32) reached", err)
+        self.assertIn("[herdr-bartender] Warning: pending dismissal cap (8) reached", err)
 
     def test_pretooluse_guarantee_outputs_allow_even_when_home_unset(self):
-        """PreToolUse guarantees {"decision":"allow"} output even when HOME is unset under set -u."""
+        """PreToolUse guarantees {"decision":"ask"} output even when HOME is unset under set -u."""
         code, out, _ = self._run_hook(
             "PreToolUse",
             payload={"toolCall": {"name": "test_cmd"}},
             env_extra={"HOME": ""},
         )
         self.assertEqual(code, 0)
-        self.assertEqual(out, '{"decision":"allow"}')
+        self.assertEqual(out, '{"decision":"ask"}')
 
     def test_standalone_sweep_preserves_live_tty_session(self):
         """Standalone sweep does not purge a PID-less session if its TTY device still exists."""

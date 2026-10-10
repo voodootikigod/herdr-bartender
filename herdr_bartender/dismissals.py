@@ -214,7 +214,8 @@ def _stage_stale(data: dict, paths: Sequence[Path], now: float) -> Tuple[VendorF
             continue
         for uuid in uuids:
             stage_dismissal_hex(data, uuid, path.name[:-len(VENDOR_ACTIVE_SUFFIX)], now)
-        retire.append(record)
+        if all(uuid in data.get("dismissed_vendor_uuids", {}) for uuid in uuids):
+            retire.append(record)
     return tuple(retire)
 
 

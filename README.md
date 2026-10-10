@@ -155,18 +155,6 @@ To enable standalone `agy` reporting, copy `scripts/agy-notify-hook.sh` to `~/Li
         "timeout": 5
       }
     ],
-    "PreToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "if [ -x \"$HOME/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks/agy-notify-hook.sh\" ]; then AGY_HOOK_EVENT='PreToolUse' \"$HOME/Library/Application Support/Bartender/NotchBar/AgentStatus/hooks/agy-notify-hook.sh\"; else printf '{\"decision\":\"allow\"}\\n'; fi",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
     "PostInvocation": [
       {
         "type": "command",
@@ -187,7 +175,7 @@ To enable standalone `agy` reporting, copy `scripts/agy-notify-hook.sh` to `~/Li
 
 > [!NOTE]
 > **Antigravity Hook Protocol & Tool Admission**:
-> Antigravity's tool runner treats `PreToolUse` hooks as an admission filter. Unlike platforms where an empty `{}` is neutral, Antigravity requires a `PreToolUse` hook to return `{"decision":"allow"}` to permit tool execution; returning `{}` or an empty decision causes Antigravity's runner to abort the tool execution with `tool call denied by pre-tool hook:`. Returning `{"decision":"allow"}` allows the normal Antigravity execution to proceed without altering user confirmation or permission rules.
+> Status-bar reporting is driven by `PreInvocation` (`Working`), `PostInvocation` (`Idle`), and `Stop` (`Ended`), keeping tool execution completely unaffected. If you optionally choose to register `PreToolUse` to display active tool names on Top Shelf (`"Tool: <tool_name>"`), the hook responds with `{"decision":"ask"}`—the Antigravity protocol's standard neutral decision that strictly preserves user confirmation prompts and respects the "Always Allow" cache, ensuring the hook never grants blanket auto-approval.
 
 ## CLI reference
 
