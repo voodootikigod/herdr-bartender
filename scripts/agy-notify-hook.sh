@@ -13,7 +13,10 @@ fi
 # Whitelist EVENT strictly to supported lifecycle status events
 case "$EVENT" in
   PreInvocation|PostInvocation|Stop|SessionEnd) ;;
-  *) exit 0 ;;
+  *)
+    OUTPUT_EMITTED=1
+    exit 0
+    ;;
 esac
 
 # Strictly loopback only (Plan §8: literal loopback, no hostname resolution, no remote proxy)
@@ -25,24 +28,39 @@ fi
 
 # Global request counter to cap total network requests per invocation (well under 5s timeout)
 TOTAL_NETWORK_REQUESTS=0
-MAX_NETWORK_REQUESTS=6
+MAX_NETWORK_REQUESTS=8
 
 # Record invocation start for hard deadline checking (well under 5s hook timeout)
 START_TIME=$(date +%s 2>/dev/null || echo 0)
 has_time_remaining() {
-  [ "$TOTAL_NETWORK_REQUESTS" -ge "$MAX_NETWORK_REQUESTS" ] && return 1
+  local reserved="${1:-0}"
+  [ "$TOTAL_NETWORK_REQUESTS" -ge $(( MAX_NETWORK_REQUESTS - reserved )) ] && return 1
   [ "$START_TIME" -eq 0 ] && return 0
   local now
   now=$(date +%s 2>/dev/null || echo 0)
   [ $(( now - START_TIME )) -lt 3 ]
 }
 
-# Cleanup trap for temporary scratch files
-TMP_VA=""
-cleanup_temp_files() {
-  [ -n "${TMP_VA:-}" ] && rm -f "$TMP_VA" 2>/dev/null || true
+TERM_SESSION_ID="${TERM_SESSION_ID:-}"
+
+# Lifecycle output and scratch file cleanup trap
+OUTPUT_EMITTED=0
+emit_lifecycle_response() {
+  if [ "${OUTPUT_EMITTED:-0}" -eq 0 ]; then
+    OUTPUT_EMITTED=1
+    case "${EVENT:-}" in
+      Stop|SessionEnd) printf '{"decision":""}\n' ;;
+      PreInvocation|PostInvocation) printf '{}\n' ;;
+    esac
+  fi
 }
-trap cleanup_temp_files EXIT INT TERM
+
+TMP_VA=""
+cleanup() {
+  [ -n "${TMP_VA:-}" ] && rm -f "$TMP_VA" 2>/dev/null || true
+  emit_lifecycle_response
+}
+trap cleanup EXIT INT TERM
 
 # Check if Bartender 6 / Bartender is running (memoised per invocation)
 BARTENDER_ALIVE_STATUS=""
@@ -67,8 +85,9 @@ is_bartender_alive() {
 # Returns 1 on delivery failure or transient errors (e.g. 429, 500, network error).
 send_dismissal() {
   local target_sid="$1"
+  local reserved="${2:-0}"
   [ -n "$target_sid" ] || return 1
-  has_time_remaining || return 1
+  has_time_remaining "$reserved" || return 1
   is_bartender_alive || return 1
   TOTAL_NETWORK_REQUESTS=$((TOTAL_NETWORK_REQUESTS + 1))
   local code
@@ -511,10 +530,7 @@ if is_herdr_owning_pane; then
     fi
   fi
 
-  case "$EVENT" in
-    Stop|SessionEnd) printf '{"decision":""}\n' ;;
-    *) printf '{}\n' ;;
-  esac
+  emit_lifecycle_response
   exit 0
 fi
 
@@ -522,7 +538,7 @@ fi
 # Only track standalone active file when a reliable identifier (PID, real TTY, or TERM_SESSION_ID) is known,
 # preventing concurrent un-scoped sessions in the same directory from evicting each other.
 if [ -z "$CANONICAL_PANE" ]; then
-  if [ -n "$AGENT_PID" ] || [ -n "$AGENT_TTY" ] || [ -n "$TERM_SESSION_ID" ]; then
+  if [ -n "${AGENT_PID:-}" ] || [ -n "${AGENT_TTY:-}" ] || [ -n "${TERM_SESSION_ID:-}" ]; then
     sa_ident="${PWD:-}:${AGENT_PID:-}:${AGENT_TTY:-}:${TERM_SESSION_ID:-}"
     sa_hex=$(hash_identity_32 "$sa_ident")
     VENDOR_ACTIVE="${STATE_HOME}/standalone/${sa_hex}.active"
@@ -601,11 +617,11 @@ sweep_standalone_active() {
 
       local confirmed_sweep_sids=""
       for s in $valid_sids; do
-        if [ "$sweep_requests" -ge "$max_sweep_requests" ] || ! has_time_remaining; then
+        if [ "$sweep_requests" -ge "$max_sweep_requests" ] || ! has_time_remaining 2; then
           break
         fi
         sweep_requests=$((sweep_requests + 1))
-        if send_dismissal "$s"; then
+        if send_dismissal "$s" 2; then
           confirmed_sweep_sids="${confirmed_sweep_sids:+${confirmed_sweep_sids} }${s}"
         fi
       done
@@ -804,10 +820,7 @@ except Exception:
     sys.exit(0)
 ' 2>/dev/null || true)
   if [ "$py_output" = "SKIP" ]; then
-    case "$EVENT" in
-      Stop|SessionEnd) printf '{"decision":""}\n' ;;
-      *) printf '{}\n' ;;
-    esac
+    emit_lifecycle_response
     exit 0
   fi
   if [ -n "$py_output" ]; then
@@ -819,10 +832,7 @@ fi
 # Resilient fallback if Python is unavailable
 if [ -z "${payload:-}" ]; then
   if [ -z "$EVENT" ]; then
-    case "$EVENT" in
-      Stop|SessionEnd) printf '{"decision":""}\n' ;;
-      *) printf '{}\n' ;;
-    esac
+    emit_lifecycle_response
     exit 0
   fi
   case "$EVENT" in
@@ -891,12 +901,13 @@ if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVE
     set +f
 
     still_pending=""
-    # Attempt dismissal for up to 4 SIDs per event, preserving any remaining (un-attempted or failed) ones
+    # Attempt dismissal for up to 4 SIDs per event, preserving any remaining (un-attempted or failed) ones,
+    # reserving at least 1 request for the primary event.
     attempt_count=0
     for s in $to_dismiss; do
-      if [ "$attempt_count" -lt 4 ] && has_time_remaining; then
+      if [ "$attempt_count" -lt 4 ] && has_time_remaining 1; then
         attempt_count=$((attempt_count + 1))
-        if ! send_dismissal "$s"; then
+        if ! send_dismissal "$s" 1; then
           still_pending="${still_pending:+${still_pending} }${s}"
         fi
       else
@@ -1073,9 +1084,6 @@ if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEn
 fi
 
 # Emit expected JSON response to stdout for Antigravity lifecycle
-case "$EVENT" in
-  Stop|SessionEnd) printf '{"decision":""}\n' ;;
-  *) printf '{}\n' ;;
-esac
+emit_lifecycle_response
 
 exit 0

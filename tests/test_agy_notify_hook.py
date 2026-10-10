@@ -22,6 +22,7 @@ class AgyNotifyHookTests(SandboxTestCase):
         payload: dict | str | None = None,
         env_extra: dict[str, str] | None = None,
         cwd: str | Path | None = None,
+        unset_vars: list[str] | None = None,
     ) -> tuple[int, str, str]:
         env = {
             **os.environ,
@@ -35,6 +36,10 @@ class AgyNotifyHookTests(SandboxTestCase):
 
         if env_extra:
             env.update(env_extra)
+
+        if unset_vars:
+            for v in unset_vars:
+                env.pop(v, None)
 
         if isinstance(payload, dict):
             stdin_data = json.dumps(payload)
@@ -1633,6 +1638,107 @@ fi
         # Verify that session B was NEVER ended across any of these events
         ended_sids = [h.get("session_id") for h in self.bridge.history if h.get("state") == "Ended"]
         self.assertEqual(ended_sids, ["conv-same-pwd-session-aaa"], "Session B must never be dismissed by Session A")
+
+    def test_standalone_unbound_term_session_id_does_not_abort_under_set_u(self):
+        """When TERM_SESSION_ID is completely unset and no PID or TTY is resolved, the hook runs without unbound variable error and outputs valid JSON."""
+        self.bridge.history.clear()
+        target_dir = self.tmp / "unbound-term-session-dir"
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        env = {
+            "HERDR_PANE_ID": "",
+            "AGY_HOOK_AGENT_PID": "none",
+            "AGENT_PID": "",
+            "AGY_HOOK_NO_TTY": "1",
+            "AGENT_TTY": "none",
+            "PWD": str(target_dir),
+        }
+        code, out, err = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "conv-unbound-term-sess-001"},
+            env_extra=env,
+            cwd=target_dir,
+            unset_vars=["TERM_SESSION_ID"],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "{}")
+        self.assertNotIn("unbound variable", err)
+        self._wait_for_history(1)
+        self.assertEqual(len(self.bridge.history), 1)
+        self.assertEqual(self.bridge.history[-1]["session_id"], "conv-unbound-term-sess-001")
+        self.assertEqual(self.bridge.history[-1]["state"], "Working")
+
+        # Stop event must also emit valid decision JSON
+        code_stop, out_stop, err_stop = self._run_hook(
+            "Stop",
+            payload={"conversationId": "conv-unbound-term-sess-001"},
+            env_extra=env,
+            cwd=target_dir,
+            unset_vars=["TERM_SESSION_ID"],
+        )
+        self.assertEqual(code_stop, 0)
+        self.assertEqual(out_stop, '{"decision":""}')
+        self.assertNotIn("unbound variable", err_stop)
+        self._wait_for_history(2)
+        self.assertEqual(self.bridge.history[-1]["state"], "Ended")
+
+    def test_saturated_sweep_and_prior_sid_never_starves_primary_event(self):
+        """When sweep has 4 dead records and current session has a pending prior SID, the primary event is still delivered."""
+        sa_dir = self.state_dir / "standalone"
+        sa_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create 4 dead standalone records
+        dead_pid = 99991
+        try:
+            os.kill(dead_pid, 0)
+            self.skipTest(f"PID {dead_pid} unexpectedly alive")
+        except OSError:
+            pass
+
+        dead_sids = []
+        for i in range(4):
+            sid = f"conv-dead-sweep-{i:04d}"
+            dead_sids.append(sid)
+            dead_file = sa_dir / f"dead_{i}.active"
+            dead_file.write_text(json.dumps({
+                "vendor_session_id": sid,
+                "pid": dead_pid,
+            }))
+
+        # Create active file for current session with a pending prior SID
+        my_pid = 4242
+        my_tty = "ttys099"
+        ident = f"{str(self.tmp)}:{my_pid}:{my_tty}:term1"
+        import hashlib
+        hex_ident = hashlib.sha256(ident.encode("utf-8")).hexdigest()[:32]
+        curr_va = sa_dir / f"{hex_ident}.active"
+        prior_sid = "conv-prior-active-0001"
+        curr_va.write_text(json.dumps({
+            "vendor_session_id": prior_sid,
+            "pid": my_pid,
+            "tty": my_tty,
+        }))
+
+        self.bridge.history.clear()
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "conv-primary-live-0001"},
+            env_extra={
+                "HERDR_PANE_ID": "",
+                "AGENT_PID": str(my_pid),
+                "AGENT_TTY": my_tty,
+                "TERM_SESSION_ID": "term1",
+                "PWD": str(self.tmp),
+            },
+            cwd=self.tmp,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "{}")
+        # Crucially, the primary event conv-primary-live-0001 MUST be present with state Working!
+        delivered_sids = [h.get("session_id") for h in self.bridge.history]
+        self.assertIn("conv-primary-live-0001", delivered_sids, "Primary event MUST be delivered even under saturated sweep")
+        primary_ev = next(h for h in self.bridge.history if h.get("session_id") == "conv-primary-live-0001")
+        self.assertEqual(primary_ev.get("state"), "Working")
 
 
 
