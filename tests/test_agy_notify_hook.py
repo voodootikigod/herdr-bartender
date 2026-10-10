@@ -208,6 +208,35 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(self.bridge.history[-1].get("session_id"), cid)
         self.assertFalse(va_file.exists(), ".vendor_active must be unlinked upon handoff dismissal")
 
+    def test_handoff_with_pending_dismissal_sid_dismisses_both(self):
+        """When Herdr recovers, handoff sends Ended for both vendor_session_id and pending_dismissal_sid."""
+        pane_id = "ws1:pRecoverBoth"
+        hex_pane = pane_id.encode("utf-8").hex()
+        cid_a = "conv-recover-both-000A"
+        cid_b = "conv-recover-both-000B"
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+        va_file.parent.mkdir(parents=True, exist_ok=True)
+        va_file.write_text(json.dumps({"vendor_session_id": cid_b, "pending_dismissal_sid": cid_a}))
+
+        # Herdr is healthy with fresh marker
+        self._fresh_marker(pane_id)
+        self.bridge.history.clear()
+
+        code, out, _ = self._run_hook(
+            "PostInvocation",
+            payload={"conversationId": cid_b},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "{}")
+
+        self._wait_for_history(2)
+        self.assertEqual(len(self.bridge.history), 2)
+        dismissed_sids = {h.get("session_id") for h in self.bridge.history}
+        self.assertIn(cid_a, dismissed_sids)
+        self.assertIn(cid_b, dismissed_sids)
+        self.assertFalse(va_file.exists(), ".vendor_active must be unlinked after both dismissals confirmed")
+
     def test_fail_open_recover_failed_dismissal_preserves_vendor_active(self):
         """When dismissal delivery fails (e.g. Bartender dead), .vendor_active is NOT unlinked and remains for reconciler."""
         pane_id = "ws1:pFailDismiss"
@@ -434,6 +463,57 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(ended_event.get("state"), "Ended")
         # Stale active file must be cleaned up
         self.assertFalse(dead_file.exists(), "stale standalone file must be retired by sweep")
+
+    def test_sweep_standalone_failed_delivery_preserves_file(self):
+        """When sweep cannot deliver dismissal (e.g. Bartender dead), .active file is NOT deleted."""
+        sa_dir = self.state_dir / "standalone"
+        sa_dir.mkdir(parents=True, exist_ok=True)
+        dead_pid = 99996
+        try:
+            os.kill(dead_pid, 0)
+            dead_pid = 99995
+        except OSError:
+            pass
+
+        dead_file = sa_dir / "deadfailed01.active"
+        dead_sid = "conv-crashed-fail-0001"
+        dead_file.write_text(json.dumps({"vendor_session_id": dead_sid, "pid": dead_pid}))
+
+        # Bartender dead
+        self.clear_fake_processes()
+        self.set_herdr_alive()
+
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "conv-alive-0002"},
+            env_extra={"AGENT_PID": "4243", "AGENT_TTY": "ttys003"},
+        )
+        self.assertEqual(code, 0)
+        # Must NOT be deleted because delivery could not be confirmed
+        self.assertTrue(dead_file.exists(), "stale file must be preserved when delivery fails")
+
+    def test_sweep_standalone_pid_less_aged_record_swept(self):
+        """PID-less standalone record older than 12h is swept and retired."""
+        sa_dir = self.state_dir / "standalone"
+        sa_dir.mkdir(parents=True, exist_ok=True)
+        aged_file = sa_dir / "pidless_aged.active"
+        aged_sid = "conv-pidless-aged-0001"
+        aged_file.write_text(json.dumps({"vendor_session_id": aged_sid}))
+        # Set mtime to 13 hours ago (46800s)
+        old_time = time.time() - 46800
+        os.utime(aged_file, (old_time, old_time))
+
+        self.bridge.history.clear()
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": "conv-alive-0003"},
+            env_extra={"AGENT_PID": "4244", "AGENT_TTY": "ttys004"},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(2)
+        history_sids = [h.get("session_id") for h in self.bridge.history]
+        self.assertIn(aged_sid, history_sids)
+        self.assertFalse(aged_file.exists(), "aged PID-less standalone file must be retired")
 
     def test_stop_without_conv_id_reuses_stored_vendor_sid(self):
         """When Stop arrives without conversationId, it reuses the session ID recorded in .vendor_active."""

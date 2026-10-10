@@ -107,18 +107,41 @@ retire_vendor_file() {
 if is_herdr_owning_pane; then
   if [ -n "$VENDOR_ACTIVE" ] && [ -f "$VENDOR_ACTIVE" ]; then
     prev_sid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
-    if [ -n "$prev_sid" ] && is_bartender_alive; then
-      http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-        --noproxy '*' \
-        --max-redirs 0 \
-        --proto =http \
-        --connect-timeout 0.15 \
-        --max-time 0.5 \
-        -X POST "http://${HOST}:${PORT}/event" \
-        -H 'Content-Type: application/json' \
-        --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${prev_sid}\"}" 2>/dev/null || echo "000")
-      if [ "$http_code" = "200" ]; then
+    pend_sid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"pending_dismissal_sid"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+    if is_bartender_alive; then
+      prev_code="200"
+      if [ -n "$prev_sid" ]; then
+        prev_code=$(curl -s -o /dev/null -w "%{http_code}" \
+          --noproxy '*' \
+          --max-redirs 0 \
+          --proto =http \
+          --connect-timeout 0.15 \
+          --max-time 0.5 \
+          -X POST "http://${HOST}:${PORT}/event" \
+          -H 'Content-Type: application/json' \
+          --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${prev_sid}\"}" 2>/dev/null || echo "000")
+        if [ "$prev_code" = "200" ] || printf '%s' "$prev_code" | grep -Eq '^4[0-9]{2}$'; then
+          prev_code="200"
+        fi
+      fi
+      pend_code="200"
+      if [ -n "$pend_sid" ] && [ "$pend_sid" != "$prev_sid" ]; then
+        pend_code=$(curl -s -o /dev/null -w "%{http_code}" \
+          --noproxy '*' \
+          --max-redirs 0 \
+          --proto =http \
+          --connect-timeout 0.15 \
+          --max-time 0.5 \
+          -X POST "http://${HOST}:${PORT}/event" \
+          -H 'Content-Type: application/json' \
+          --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${pend_sid}\"}" 2>/dev/null || echo "000")
+        if [ "$pend_code" = "200" ] || printf '%s' "$pend_code" | grep -Eq '^4[0-9]{2}$'; then
+          pend_code="200"
+        fi
+      fi
+      if [ "$prev_code" = "200" ] && [ "$pend_code" = "200" ]; then
         retire_vendor_file "$VENDOR_ACTIVE" "$prev_sid"
+        [ -n "$pend_sid" ] && retire_vendor_file "$VENDOR_ACTIVE" "$pend_sid"
       fi
     fi
   fi
@@ -179,29 +202,74 @@ if [ -z "$CANONICAL_PANE" ]; then
   fi
 fi
 
-# Sweep orphaned standalone .active files whose recording process has died
+# Sweep orphaned standalone .active files whose recording process has died or aged out
 sweep_standalone_active() {
   local sa_dir="${STATE_HOME}/standalone"
   [ -d "$sa_dir" ] || return 0
+  local now
+  now=$(date +%s 2>/dev/null || echo 0)
   for f in "$sa_dir"/*.active; do
     [ -f "$f" ] || continue
     [ -n "$VENDOR_ACTIVE" ] && [ "$f" = "$VENDOR_ACTIVE" ] && continue
-    local f_pid f_sid
+    local f_pid f_sid f_pend is_dead mtime age
     f_pid=$(cat "$f" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | tr -cd '0-9')
     f_sid=$(cat "$f" 2>/dev/null | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
-    if [ -n "$f_pid" ] && ! kill -0 "$f_pid" 2>/dev/null; then
-      if [ -n "$f_sid" ] && is_bartender_alive; then
-        curl -s \
-          --noproxy '*' \
-          --max-redirs 0 \
-          --proto =http \
-          --connect-timeout 0.15 \
-          --max-time 0.5 \
-          -X POST "http://${HOST}:${PORT}/event" \
-          -H 'Content-Type: application/json' \
-          --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${f_sid}\"}" >/dev/null 2>&1 || true
+    f_pend=$(cat "$f" 2>/dev/null | LC_ALL=C grep -o '"pending_dismissal_sid"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+
+    is_dead=0
+    if [ -n "$f_pid" ]; then
+      if ! kill -0 "$f_pid" 2>/dev/null; then
+        is_dead=1
       fi
-      retire_vendor_file "$f" "$f_sid"
+    else
+      # PID-less record: check 12h (43200s) mtime horizon
+      mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
+      age=$(( now - mtime ))
+      if [ "$age" -ge 43200 ]; then
+        is_dead=1
+      fi
+    fi
+
+    if [ "$is_dead" -eq 1 ]; then
+      local sid_code="200" pend_code="200"
+      if is_bartender_alive; then
+        if [ -n "$f_sid" ]; then
+          sid_code=$(curl -s -o /dev/null -w "%{http_code}" \
+            --noproxy '*' \
+            --max-redirs 0 \
+            --proto =http \
+            --connect-timeout 0.15 \
+            --max-time 0.5 \
+            -X POST "http://${HOST}:${PORT}/event" \
+            -H 'Content-Type: application/json' \
+            --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${f_sid}\"}" 2>/dev/null || echo "000")
+          if [ "$sid_code" = "200" ] || printf '%s' "$sid_code" | grep -Eq '^4[0-9]{2}$'; then
+            sid_code="200"
+          fi
+        fi
+        if [ -n "$f_pend" ] && [ "$f_pend" != "$f_sid" ]; then
+          pend_code=$(curl -s -o /dev/null -w "%{http_code}" \
+            --noproxy '*' \
+            --max-redirs 0 \
+            --proto =http \
+            --connect-timeout 0.15 \
+            --max-time 0.5 \
+            -X POST "http://${HOST}:${PORT}/event" \
+            -H 'Content-Type: application/json' \
+            --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${f_pend}\"}" 2>/dev/null || echo "000")
+          if [ "$pend_code" = "200" ] || printf '%s' "$pend_code" | grep -Eq '^4[0-9]{2}$'; then
+            pend_code="200"
+          fi
+        fi
+      else
+        sid_code="000"
+      fi
+
+      # Retire record only on confirmed HTTP 200 or 4xx dismissal
+      if [ "$sid_code" = "200" ] && [ "$pend_code" = "200" ]; then
+        retire_vendor_file "$f" "$f_sid"
+        [ -n "$f_pend" ] && retire_vendor_file "$f" "$f_pend"
+      fi
     fi
   done
 }

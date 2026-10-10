@@ -109,24 +109,33 @@ def read_vendor_file(path: Path) -> Optional[VendorFile]:
     return VendorFile(path, content, (st.st_ino, st.st_mtime_ns))
 
 
-def parse_vendor_uuid(record: VendorFile) -> Optional[str]:
-    """The valid vendor UUID in ``record``, or None for a bare touch / unusable record."""
+def parse_vendor_uuids(record: VendorFile) -> Tuple[str, ...]:
+    """All valid vendor UUIDs in ``record`` (vendor_session_id and optional pending_dismissal_sid)."""
     try:
         text = (record.content or b"").decode("utf-8").strip()
     except UnicodeDecodeError as exc:
         log_debug(f"Undecodable {record.path.name} ({exc}); treating it as a bare touch")
-        return None
+        return ()
     if not text.startswith("{"):
-        return None
+        return ()
     try:
         parsed = jsonsafe.loads(text)
     except ValueError:
-        return None
-    uuid = parsed.get("vendor_session_id") if isinstance(parsed, dict) else None
-    if isinstance(uuid, str) and VENDOR_UUID_REGEX.match(uuid):
-        return uuid
-    log_debug(f"Ignoring malformed vendor_session_id in {record.path.name}; treating it as a bare touch")
-    return None
+        return ()
+    if not isinstance(parsed, dict):
+        return ()
+    found = []
+    for key in ("vendor_session_id", "pending_dismissal_sid"):
+        uuid = parsed.get(key)
+        if isinstance(uuid, str) and VENDOR_UUID_REGEX.match(uuid):
+            found.append(uuid)
+    return tuple(dict.fromkeys(found))
+
+
+def parse_vendor_uuid(record: VendorFile) -> Optional[str]:
+    """The primary valid vendor UUID in ``record``, or None for a bare touch / unusable record."""
+    uuids = parse_vendor_uuids(record)
+    return uuids[0] if uuids else None
 
 
 def _claimed_path(path: Path) -> Path:
@@ -305,8 +314,8 @@ def resolve_vendor_cleanups(data: dict, panes: Sequence[str], now: float,
         record = read_vendor_file(vendor_active_path(pane))
         if record is None:
             continue
-        uuid = parse_vendor_uuid(record)
-        if uuid:
+        uuids = parse_vendor_uuids(record)
+        for uuid in uuids:
             stage_dismissal(data, uuid, pane, now, pane_closed=pane in closed)
             dismissals.append(uuid)
         unlink.append(record)
