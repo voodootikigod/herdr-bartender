@@ -242,12 +242,21 @@ def cap_dismissals(queue: dict, keep: Optional[str] = None) -> dict:
 
 
 def stage_dismissal_hex(data: dict, uuid: str, pane_hex: str, now: float, pane_closed: bool = False) -> dict:
-    """Queue ``uuid`` in ``dismissed_vendor_uuids`` before anything is sent (attempts 0), within the 64 cap."""
+    """Queue ``uuid`` in ``dismissed_vendor_uuids`` before anything is sent (attempts 0), within the 64 cap.
+
+    If ``uuid`` was already queued, merges with the existing entry: refreshes the timestamp and attempt budget,
+    and upgrades ``pane_closed`` via logical OR so re-staging after a failed attempt or pane closure cannot starve.
+    """
     queue = dict(data.get("dismissed_vendor_uuids") or {})
-    if uuid in queue:
-        return queue[uuid]
-    entry = {"timestamp": now, "pane_hex": pane_hex, "attempts": 0, "last_attempt": 0.0,
-             "pane_closed": bool(pane_closed)}
+    existing = queue.get(uuid)
+    was_closed = bool(existing.get("pane_closed")) if isinstance(existing, dict) else False
+    entry = {
+        "timestamp": now,
+        "pane_hex": pane_hex,
+        "attempts": 0,
+        "last_attempt": 0.0,
+        "pane_closed": was_closed or bool(pane_closed),
+    }
     queue[uuid] = entry
     data["dismissed_vendor_uuids"] = cap_dismissals(queue, keep=uuid)
     return entry

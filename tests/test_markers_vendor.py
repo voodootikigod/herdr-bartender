@@ -309,6 +309,33 @@ class MultiUuidReconcilerStagingTests(SandboxTestCase):
         # The file MUST still exist so a subsequent pass can retry
         self.assertTrue(va_file.exists(), ".vendor_active must be preserved when UUIDs were pruned by queue cap")
 
+    def test_stage_dismissal_hex_merges_and_refreshes_existing_entry(self):
+        """Re-staging an existing UUID refreshes timestamp and attempts, and upgrades pane_closed via OR."""
+        from herdr_bartender.vendor import stage_dismissal_hex
+        data = {
+            "dismissed_vendor_uuids": {
+                "test-uuid-refresh": {
+                    "timestamp": 10.0,
+                    "pane_hex": "aa",
+                    "attempts": 3,
+                    "last_attempt": 12.0,
+                    "pane_closed": False,
+                }
+            }
+        }
+        # Re-stage with pane_closed=True at now=20.0
+        entry = stage_dismissal_hex(data, "test-uuid-refresh", "aa", now=20.0, pane_closed=True)
+        self.assertEqual(entry["timestamp"], 20.0)
+        self.assertEqual(entry["attempts"], 0)
+        self.assertEqual(entry["last_attempt"], 0.0)
+        self.assertTrue(entry["pane_closed"])
+
+        # Re-stage again with pane_closed=False at now=25.0: pane_closed must remain True
+        entry2 = stage_dismissal_hex(data, "test-uuid-refresh", "aa", now=25.0, pane_closed=False)
+        self.assertEqual(entry2["timestamp"], 25.0)
+        self.assertEqual(entry2["attempts"], 0)
+        self.assertTrue(entry2["pane_closed"])
+
 
 if __name__ == "__main__":
     unittest.main()

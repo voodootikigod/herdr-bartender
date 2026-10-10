@@ -173,8 +173,8 @@ To enable standalone `agy` reporting, copy `scripts/agy-notify-hook.sh` to `~/Li
 ```
 
 > [!NOTE]
-> **Antigravity Hook Protocol**:
-> Status-bar reporting is driven by `PreInvocation` (`Working`), `PostInvocation` (`Idle`), and `Stop` (`Ended`), keeping tool execution completely unaffected with zero overhead.
+> **Antigravity Hook Protocol & Tool Execution**:
+> Status-bar reporting is driven by `PreInvocation` (`Working`), `PostInvocation` (`Idle`), and `Stop` (`Ended`), keeping tool execution completely unaffected with zero overhead. If you optionally choose to register `PreToolUse` to display active tool names on Top Shelf (`"Tool: <tool_name>"`), the hook emits `{"decision":"allow"}` so that tool execution proceeds without blocking or prompting.
 
 ## CLI reference
 
