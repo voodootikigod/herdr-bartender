@@ -40,6 +40,7 @@ from .vendor import (
     VendorFile,
     cap_dismissals,
     parse_vendor_uuid,
+    parse_vendor_uuids,
     read_vendor_file,
     retire_vendor_file,
     stage_dismissal_hex,
@@ -206,10 +207,13 @@ def _stage_stale(data: dict, paths: Sequence[Path], now: float) -> Tuple[VendorF
     retire = []
     for path in paths:
         record = read_vendor_file(path)
-        uuid = parse_vendor_uuid(record) if record is not None else None
-        if uuid is None:   # gone, or a bare touch: never swept on mtime
+        if record is None:
             continue
-        stage_dismissal_hex(data, uuid, path.name[:-len(VENDOR_ACTIVE_SUFFIX)], now)
+        uuids = parse_vendor_uuids(record)
+        if not uuids:   # gone, or a bare touch: never swept on mtime
+            continue
+        for uuid in uuids:
+            stage_dismissal_hex(data, uuid, path.name[:-len(VENDOR_ACTIVE_SUFFIX)], now)
         retire.append(record)
     return tuple(retire)
 

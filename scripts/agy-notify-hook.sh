@@ -30,6 +30,29 @@ is_bartender_alive() {
     || pgrep -f '^[^[:space:]]*/Bartender( 6)?\.app/Contents/MacOS/' >/dev/null 2>&1
 }
 
+# Dismiss a session ID directly via Bartender HTTP endpoint.
+# Returns 0 on successful delivery (HTTP 200) or permanent resolution (HTTP 404, 410).
+# Returns 1 on delivery failure or transient errors (e.g. 429, 500, network error).
+send_dismissal() {
+  local target_sid="$1"
+  [ -n "$target_sid" ] || return 1
+  is_bartender_alive || return 1
+  local code
+  code=$(curl -s -o /dev/null -w "%{http_code}" \
+    --noproxy '*' \
+    --max-redirs 0 \
+    --proto =http \
+    --connect-timeout 0.15 \
+    --max-time 0.5 \
+    -X POST "http://${HOST}:${PORT}/event" \
+    -H 'Content-Type: application/json' \
+    --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${target_sid}\"}" 2>/dev/null || echo "000")
+  case "$code" in
+    200|404|410) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Resolve canonical pane ID and paths if HERDR_PANE_ID is set
 CANONICAL_PANE=""
 HEX_PANE=""
@@ -85,11 +108,11 @@ is_herdr_owning_pane() {
 # restores the newer record so it is never lost.
 retire_vendor_file() {
   local target="$1"
-  local expected_sid="$2"
+  local expected_sid="${2:-}"
   [ -f "$target" ] || return 0
   local claim="${target}.claim-$$-$(date +%s%N 2>/dev/null || date +%s 2>/dev/null || echo $$)"
   if mv -f "$target" "$claim" 2>/dev/null; then
-    if grep -q "\"vendor_session_id\"[[:space:]]*:[[:space:]]*\"${expected_sid}\"" "$claim" 2>/dev/null; then
+    if [ -z "$expected_sid" ] || grep -q "\"vendor_session_id\"[[:space:]]*:[[:space:]]*\"${expected_sid}\"" "$claim" 2>/dev/null; then
       rm -f "$claim" 2>/dev/null || true
     else
       # Newer record written concurrently: restore it so newer session is never lost
@@ -100,7 +123,7 @@ retire_vendor_file() {
 
 # If Herdr actively owns this pane:
 # - If an earlier fail-open wrote .vendor_active, attempt dismissal of the direct entry.
-#   Only retire .vendor_active if dismissal was confirmed by HTTP 200. If delivery fails
+#   Only retire .vendor_active if dismissal was confirmed by HTTP 200, 404, or 410. If delivery fails
 #   or Bartender is unavailable, keep .vendor_active intact so Herdr's reconciler stages
 #   and retries dismissal under cache lock.
 # - Otherwise suppress standalone reporting to prevent duplicate entries.
@@ -108,41 +131,15 @@ if is_herdr_owning_pane; then
   if [ -n "$VENDOR_ACTIVE" ] && [ -f "$VENDOR_ACTIVE" ]; then
     prev_sid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
     pend_sid=$(cat "$VENDOR_ACTIVE" 2>/dev/null | LC_ALL=C grep -o '"pending_dismissal_sid"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
-    if is_bartender_alive; then
-      prev_code="200"
-      if [ -n "$prev_sid" ]; then
-        prev_code=$(curl -s -o /dev/null -w "%{http_code}" \
-          --noproxy '*' \
-          --max-redirs 0 \
-          --proto =http \
-          --connect-timeout 0.15 \
-          --max-time 0.5 \
-          -X POST "http://${HOST}:${PORT}/event" \
-          -H 'Content-Type: application/json' \
-          --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${prev_sid}\"}" 2>/dev/null || echo "000")
-        if [ "$prev_code" = "200" ] || printf '%s' "$prev_code" | grep -Eq '^4[0-9]{2}$'; then
-          prev_code="200"
-        fi
+    local_ok=1
+    for s in $prev_sid $pend_sid; do
+      [ -n "$s" ] || continue
+      if ! send_dismissal "$s"; then
+        local_ok=0
       fi
-      pend_code="200"
-      if [ -n "$pend_sid" ] && [ "$pend_sid" != "$prev_sid" ]; then
-        pend_code=$(curl -s -o /dev/null -w "%{http_code}" \
-          --noproxy '*' \
-          --max-redirs 0 \
-          --proto =http \
-          --connect-timeout 0.15 \
-          --max-time 0.5 \
-          -X POST "http://${HOST}:${PORT}/event" \
-          -H 'Content-Type: application/json' \
-          --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${pend_sid}\"}" 2>/dev/null || echo "000")
-        if [ "$pend_code" = "200" ] || printf '%s' "$pend_code" | grep -Eq '^4[0-9]{2}$'; then
-          pend_code="200"
-        fi
-      fi
-      if [ "$prev_code" = "200" ] && [ "$pend_code" = "200" ]; then
-        retire_vendor_file "$VENDOR_ACTIVE" "$prev_sid"
-        [ -n "$pend_sid" ] && retire_vendor_file "$VENDOR_ACTIVE" "$pend_sid"
-      fi
+    done
+    if [ "$local_ok" -eq 1 ]; then
+      retire_vendor_file "$VENDOR_ACTIVE" "$prev_sid"
     fi
   fi
 
@@ -204,13 +201,19 @@ fi
 
 # Sweep orphaned standalone .active files whose recording process has died or aged out
 sweep_standalone_active() {
+  [ "$EVENT" = "PreToolUse" ] && return 0
   local sa_dir="${STATE_HOME}/standalone"
   [ -d "$sa_dir" ] || return 0
   local now
   now=$(date +%s 2>/dev/null || echo 0)
+  local count=0
   for f in "$sa_dir"/*.active; do
     [ -f "$f" ] || continue
     [ -n "$VENDOR_ACTIVE" ] && [ "$f" = "$VENDOR_ACTIVE" ] && continue
+    if [ "$count" -ge 2 ]; then
+      break
+    fi
+    count=$((count + 1))
     local f_pid f_sid f_pend is_dead mtime age
     f_pid=$(cat "$f" 2>/dev/null | LC_ALL=C grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]*' 2>/dev/null | head -n1 | tr -cd '0-9')
     f_sid=$(cat "$f" 2>/dev/null | LC_ALL=C grep -o '"vendor_session_id"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
@@ -231,44 +234,17 @@ sweep_standalone_active() {
     fi
 
     if [ "$is_dead" -eq 1 ]; then
-      local sid_code="200" pend_code="200"
-      if is_bartender_alive; then
-        if [ -n "$f_sid" ]; then
-          sid_code=$(curl -s -o /dev/null -w "%{http_code}" \
-            --noproxy '*' \
-            --max-redirs 0 \
-            --proto =http \
-            --connect-timeout 0.15 \
-            --max-time 0.5 \
-            -X POST "http://${HOST}:${PORT}/event" \
-            -H 'Content-Type: application/json' \
-            --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${f_sid}\"}" 2>/dev/null || echo "000")
-          if [ "$sid_code" = "200" ] || printf '%s' "$sid_code" | grep -Eq '^4[0-9]{2}$'; then
-            sid_code="200"
-          fi
+      local all_ok=1
+      for s in $f_sid $f_pend; do
+        [ -n "$s" ] || continue
+        if ! send_dismissal "$s"; then
+          all_ok=0
         fi
-        if [ -n "$f_pend" ] && [ "$f_pend" != "$f_sid" ]; then
-          pend_code=$(curl -s -o /dev/null -w "%{http_code}" \
-            --noproxy '*' \
-            --max-redirs 0 \
-            --proto =http \
-            --connect-timeout 0.15 \
-            --max-time 0.5 \
-            -X POST "http://${HOST}:${PORT}/event" \
-            -H 'Content-Type: application/json' \
-            --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${f_pend}\"}" 2>/dev/null || echo "000")
-          if [ "$pend_code" = "200" ] || printf '%s' "$pend_code" | grep -Eq '^4[0-9]{2}$'; then
-            pend_code="200"
-          fi
-        fi
-      else
-        sid_code="000"
-      fi
+      done
 
-      # Retire record only on confirmed HTTP 200 or 4xx dismissal
-      if [ "$sid_code" = "200" ] && [ "$pend_code" = "200" ]; then
+      # Retire record only on confirmed HTTP 200, 404, or 410 dismissal of all sessions
+      if [ "$all_ok" -eq 1 ]; then
         retire_vendor_file "$f" "$f_sid"
-        [ -n "$f_pend" ] && retire_vendor_file "$f" "$f_pend"
       fi
     fi
   done
@@ -504,49 +480,41 @@ fi
 if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVENT" != "SessionEnd" ]; then
   # Only record if SID matches standard vendor UUID regex (16-64 chars)
   if printf '%s' "$SID" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
-    sid_to_dismiss="${PENDING_DISMISSAL_SID:-}"
-    if [ -z "$sid_to_dismiss" ] && [ -n "$PREV_VENDOR_SID" ] && [ "$PREV_VENDOR_SID" != "$SID" ]; then
-      sid_to_dismiss="$PREV_VENDOR_SID"
-    fi
+    to_dismiss=""
+    for s in $PENDING_DISMISSAL_SID $PREV_VENDOR_SID; do
+      [ -n "$s" ] || continue
+      [ "$s" = "$SID" ] && continue
+      case " $to_dismiss " in
+        *" $s "*) ;;
+        *) to_dismiss="${to_dismiss:+${to_dismiss} }${s}" ;;
+      esac
+    done
 
-    dismiss_ok=1
-    if [ -n "$sid_to_dismiss" ] && [ "$sid_to_dismiss" != "$SID" ]; then
-      if is_bartender_alive; then
-        old_code=$(curl -s -o /dev/null -w "%{http_code}" \
-          --noproxy '*' \
-          --max-redirs 0 \
-          --proto =http \
-          --connect-timeout 0.15 \
-          --max-time 0.5 \
-          -X POST "http://${HOST}:${PORT}/event" \
-          -H 'Content-Type: application/json' \
-          --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${sid_to_dismiss}\"}" 2>/dev/null || echo "000")
-        if [ "$old_code" != "200" ] && ! printf '%s' "$old_code" | grep -Eq '^4[0-9]{2}$'; then
-          dismiss_ok=0
-        fi
-      else
-        dismiss_ok=0
+    still_pending=""
+    for s in $to_dismiss; do
+      if ! send_dismissal "$s"; then
+        still_pending="${still_pending:+${still_pending} }${s}"
       fi
-    fi
+    done
 
     va_dir=$(dirname "$VENDOR_ACTIVE")
     mkdir -m 700 -p "$va_dir" 2>/dev/null || true
     TMP_VA=$(mktemp "${va_dir}/.va.tmp.XXXXXX" 2>/dev/null || true)
     if [ -n "$TMP_VA" ]; then
       chmod 0600 "$TMP_VA" 2>/dev/null || true
-      if [ "$dismiss_ok" -eq 1 ]; then
+      if [ -z "$still_pending" ]; then
         if [ -n "$AGENT_PID" ]; then
           printf '{"vendor_session_id":"%s","pid":%s}\n' "$SID" "$AGENT_PID" > "$TMP_VA" 2>/dev/null || true
         else
           printf '{"vendor_session_id":"%s"}\n' "$SID" > "$TMP_VA" 2>/dev/null || true
         fi
       else
-        # Dismissal of previous session could not be completed; record both so subsequent events/Stop retry dismissing it,
+        # Dismissal of previous session(s) could not be completed; record both so subsequent events/Stop retry dismissing them,
         # while still recording and advancing to current session.
         if [ -n "$AGENT_PID" ]; then
-          printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s","pid":%s}\n' "$SID" "$sid_to_dismiss" "$AGENT_PID" > "$TMP_VA" 2>/dev/null || true
+          printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s","pid":%s}\n' "$SID" "$still_pending" "$AGENT_PID" > "$TMP_VA" 2>/dev/null || true
         else
-          printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"}\n' "$SID" "$sid_to_dismiss" > "$TMP_VA" 2>/dev/null || true
+          printf '{"vendor_session_id":"%s","pending_dismissal_sid":"%s"}\n' "$SID" "$still_pending" > "$TMP_VA" 2>/dev/null || true
         fi
       fi
       mv -f "$TMP_VA" "$VENDOR_ACTIVE" 2>/dev/null || rm -f "$TMP_VA" 2>/dev/null || true
@@ -568,37 +536,32 @@ if is_bartender_alive; then
     --data-raw "$payload" 2>/dev/null || echo "000")
 fi
 
-# On Stop/SessionEnd, retire .vendor_active ONLY if dismissal was confirmed by HTTP 200.
+# On Stop/SessionEnd, retire .vendor_active ONLY if dismissal was confirmed by HTTP 200, 404, or 410.
 # If delivery timed out or failed, keep .vendor_active intact so Herdr reconciler retries.
 # If a pending or previous session differs from SID, both must be dismissed before retiring.
 if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEnd" ]; }; then
-  sid_to_dismiss="${PENDING_DISMISSAL_SID:-}"
-  if [ -z "$sid_to_dismiss" ] && [ -n "$PREV_VENDOR_SID" ] && [ "$PREV_VENDOR_SID" != "$SID" ]; then
-    sid_to_dismiss="$PREV_VENDOR_SID"
-  fi
-  old_code="200"
-  if [ -n "$sid_to_dismiss" ] && [ "$sid_to_dismiss" != "$SID" ]; then
-    if is_bartender_alive; then
-      old_code=$(curl -s -o /dev/null -w "%{http_code}" \
-        --noproxy '*' \
-        --max-redirs 0 \
-        --proto =http \
-        --connect-timeout 0.15 \
-        --max-time 0.5 \
-        -X POST "http://${HOST}:${PORT}/event" \
-        -H 'Content-Type: application/json' \
-        --data-raw "{\"state\":\"Ended\",\"agent\":\"Antigravity\",\"session_id\":\"${sid_to_dismiss}\"}" 2>/dev/null || echo "000")
-      if [ "$old_code" = "200" ] || printf '%s' "$old_code" | grep -Eq '^4[0-9]{2}$'; then
-        old_code="200"
-      fi
-    else
-      old_code="000"
+  to_dismiss=""
+  for s in $PENDING_DISMISSAL_SID $PREV_VENDOR_SID; do
+    [ -n "$s" ] || continue
+    [ "$s" = "$SID" ] && continue
+    case " $to_dismiss " in
+      *" $s "*) ;;
+      *) to_dismiss="${to_dismiss:+${to_dismiss} }${s}" ;;
+    esac
+  done
+  prior_ok=1
+  for s in $to_dismiss; do
+    if ! send_dismissal "$s"; then
+      prior_ok=0
     fi
-  fi
-  if [ "$http_code" = "200" ] && [ "$old_code" = "200" ]; then
-    retire_vendor_file "$VENDOR_ACTIVE" "$sid_to_dismiss"
-    retire_vendor_file "$VENDOR_ACTIVE" "${PREV_VENDOR_SID:-$SID}"
+  done
+  current_ok=0
+  case "$http_code" in
+    200|404|410) current_ok=1 ;;
+  esac
+  if [ "$current_ok" -eq 1 ] && [ "$prior_ok" -eq 1 ]; then
     retire_vendor_file "$VENDOR_ACTIVE" "$SID"
+    retire_vendor_file "$VENDOR_ACTIVE" "${PREV_VENDOR_SID:-$SID}"
   fi
 fi
 

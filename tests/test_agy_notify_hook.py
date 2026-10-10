@@ -432,6 +432,69 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertIn(cid_a, dismissed_sids)
         self.assertFalse(va_file.exists(), ".vendor_active must be retired after confirmed Stop")
 
+    def test_conversation_chain_failures_accumulate_pending_dismissals_until_stop(self):
+        """Chain of conversation switches with failed dismissals (A -> B -> C) preserves all prior SIDs until Stop."""
+        pane_id = "ws1:pChainFail"
+        hex_pane = pane_id.encode("utf-8").hex()
+        cid_a = "conv-chain-fail-000A"
+        cid_b = "conv-chain-fail-000B"
+        cid_c = "conv-chain-fail-000C"
+        va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
+
+        # Step 1: PreInvocation for conv A -> Working
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": cid_a},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(1)
+        self.assertTrue(va_file.exists())
+        self.assertIn(cid_a, va_file.read_text())
+
+        # Step 2: Switch to B, dismissal of A fails (500)
+        self.bridge.enqueue(status=500)
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": cid_b},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(2)
+        va_text = va_file.read_text()
+        self.assertIn(cid_b, va_text)
+        self.assertIn(cid_a, va_text)
+
+        # Step 3: Switch to C, dismissal of A and B both fail (500)
+        self.bridge.enqueue(status=500)
+        self.bridge.enqueue(status=500)
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": cid_c},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(3)
+        va_text = va_file.read_text()
+        self.assertIn(cid_c, va_text)
+        self.assertIn(cid_a, va_text)
+        self.assertIn(cid_b, va_text)
+
+        # Step 4: Stop arrives for C. Bridge is healthy (returns 200).
+        code, out, _ = self._run_hook(
+            "Stop",
+            payload={"conversationId": cid_c},
+            env_extra={"HERDR_PANE_ID": pane_id},
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(6)
+        # All three sessions (C, A, B) must have been dismissed!
+        dismissed_sids = {h.get("session_id") for h in self.bridge.history[3:]}
+        self.assertIn(cid_a, dismissed_sids)
+        self.assertIn(cid_b, dismissed_sids)
+        self.assertIn(cid_c, dismissed_sids)
+        self.assertFalse(va_file.exists(), ".vendor_active must be retired after confirmed Stop")
+
     def test_crashed_standalone_session_cleaned_up_on_subsequent_run(self):
         """When an earlier standalone agy process crashes/dies without Stop, the next hook run sweeps it."""
         sa_dir = self.state_dir / "standalone"

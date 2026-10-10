@@ -125,10 +125,28 @@ def parse_vendor_uuids(record: VendorFile) -> Tuple[str, ...]:
     if not isinstance(parsed, dict):
         return ()
     found = []
-    for key in ("vendor_session_id", "pending_dismissal_sid"):
-        uuid = parsed.get(key)
-        if isinstance(uuid, str) and VENDOR_UUID_REGEX.match(uuid):
-            found.append(uuid)
+    # Primary vendor_session_id: must strictly match VENDOR_UUID_REGEX without whitespace/newlines
+    vsid = parsed.get("vendor_session_id")
+    if isinstance(vsid, str) and VENDOR_UUID_REGEX.match(vsid):
+        found.append(vsid)
+    elif isinstance(vsid, list):
+        for part in vsid:
+            if isinstance(part, str) and VENDOR_UUID_REGEX.match(part):
+                found.append(part)
+
+    # Optional pending_dismissal_sid: single UUID, list, or space/comma-separated UUIDs
+    pnd = parsed.get("pending_dismissal_sid")
+    if isinstance(pnd, str):
+        if VENDOR_UUID_REGEX.match(pnd):
+            found.append(pnd)
+        else:
+            for part in pnd.replace(",", " ").split(" "):
+                if part and VENDOR_UUID_REGEX.match(part):
+                    found.append(part)
+    elif isinstance(pnd, list):
+        for part in pnd:
+            if isinstance(part, str) and VENDOR_UUID_REGEX.match(part):
+                found.append(part)
     return tuple(dict.fromkeys(found))
 
 
