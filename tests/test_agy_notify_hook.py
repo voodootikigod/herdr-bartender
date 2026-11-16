@@ -533,7 +533,7 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(len(pending), 8, "pending dismissals must be exactly capped at 8")
         self.assertIn("conv-cap-chain-0010", pending, "immediately preceding session must be preserved in pending dismissals")
 
-        # Unsupported events (like PreToolUse) must exit 0 immediately with empty output and NOT attempt dismissals
+        # Non-status events (like PreToolUse) must exit 0 immediately with allow decision and NOT attempt dismissals
         t0 = time.monotonic()
         code, out, _ = self._run_hook(
             "PreToolUse",
@@ -545,11 +545,11 @@ class AgyNotifyHookTests(SandboxTestCase):
         )
         elapsed = time.monotonic() - t0
         self.assertEqual(code, 0)
-        self.assertEqual(out, "")
-        self.assertLess(elapsed, 0.5, "Unsupported events must not be blocked by dismissal network calls")
+        self.assertEqual(out, '{"decision":"allow"}')
+        self.assertLess(elapsed, 0.5, "PreToolUse must not be blocked by dismissal network calls")
 
     def test_herdr_owning_pane_unsupported_event_skips_dismissal_delays(self):
-        """When Herdr owns the pane, unsupported events like PreToolUse exit immediately without dismissal delays."""
+        """When Herdr owns the pane, non-status events like PreToolUse exit immediately without dismissal delays."""
         pane_id = "ws1:pHandoffPreTool"
         hex_pane = pane_id.encode("utf-8").hex()
         va_file = self.state_dir / "panes" / f"{hex_pane}.vendor_active"
@@ -572,9 +572,9 @@ class AgyNotifyHookTests(SandboxTestCase):
         )
         elapsed = time.monotonic() - t0
         self.assertEqual(code, 0)
-        self.assertEqual(out, "")
-        self.assertLess(elapsed, 0.5, "Unsupported event in handoff branch must return immediately without dismissal delays")
-        self.assertEqual(len(self.bridge.history), 0, "No dismissal requests should be made during unsupported events")
+        self.assertEqual(out, '{"decision":"allow"}')
+        self.assertLess(elapsed, 0.5, "PreToolUse in handoff branch must return immediately without dismissal delays")
+        self.assertEqual(len(self.bridge.history), 0, "No dismissal requests should be made during PreToolUse")
 
     def test_handoff_and_stop_with_more_than_4_pending_sids_dismisses_all(self):
         """When .vendor_active has more than 4 pending SIDs, handoff and Stop dismiss all of them across events."""
@@ -860,7 +860,7 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(self.bridge.history[-1].get("state"), "Working")
         self.assertEqual(self.bridge.history[-1].get("title"), "Thinking...")
 
-        # 2. Stop in JSON
+        # 2. Stop in JSON (standalone -> Done)
         code, out, _ = self._run_hook(
             None,
             payload={
@@ -871,6 +871,19 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out, '{"decision":""}')
         self._wait_for_history(2)
+        self.assertEqual(self.bridge.history[-1].get("state"), "Done")
+
+        # 3. SessionEnd in JSON (-> Ended)
+        code, out, _ = self._run_hook(
+            None,
+            payload={
+                "hook_event_name": "SessionEnd",
+                "conversationId": "conv-json-event-001",
+            },
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":""}')
+        self._wait_for_history(3)
         self.assertEqual(self.bridge.history[-1].get("state"), "Ended")
 
     def test_string_sanitization_and_length_caps(self):
@@ -979,7 +992,7 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertTrue(sid2.startswith("agy-session-"))
 
     def test_python_unavailable_fallback_and_event_whitelist(self):
-        """When Python is unavailable, bash fallback correctly maps Stop to Ended, PostInvocation to Idle, and whitelists EVENT."""
+        """When Python is unavailable, bash fallback maps standalone Stop to Done, SessionEnd/Herdr Stop to Ended, PostInvocation to Working, and whitelists EVENT."""
         no_py_dir = self.tmp / "no-py-bin"
         no_py_dir.mkdir(parents=True, exist_ok=True)
         fake_py = no_py_dir / "python3"
@@ -1001,33 +1014,50 @@ class AgyNotifyHookTests(SandboxTestCase):
         sid1 = self.bridge.history[-1].get("session_id", "")
         self.assertTrue(sid1.startswith("agy-fallback-"), f"expected agy-fallback- prefix, got {sid1}")
 
-        # 2. PostInvocation -> Idle
+        # 2. PostInvocation -> Working
         code, out, _ = self._run_hook("PostInvocation", payload={}, env_extra=env)
         self.assertEqual(code, 0)
         self._wait_for_history(2)
-        self.assertEqual(self.bridge.history[-1].get("state"), "Idle")
+        self.assertEqual(self.bridge.history[-1].get("state"), "Working")
         sid2 = self.bridge.history[-1].get("session_id", "")
         self.assertTrue(sid2.startswith("agy-fallback-"), f"expected agy-fallback- prefix, got {sid2}")
 
-        # 3. Stop -> Ended
+        # 3. Standalone Stop -> Done
         code, out, _ = self._run_hook("Stop", payload={}, env_extra=env)
         self.assertEqual(code, 0)
         self.assertEqual(out, '{"decision":""}')
         self._wait_for_history(3)
-        self.assertEqual(self.bridge.history[-1].get("state"), "Ended")
+        self.assertEqual(self.bridge.history[-1].get("state"), "Done")
         sid3 = self.bridge.history[-1].get("session_id", "")
         self.assertTrue(sid3.startswith("agy-fallback-"), f"expected agy-fallback- prefix, got {sid3}")
         self.assertEqual(sid1, sid2, "fallback session ID must be stable across events")
         self.assertEqual(sid2, sid3, "fallback session ID must be stable across events")
 
-        # 4. Injected event -> whitelisted to empty, delivery is skipped safely
+        # 4. SessionEnd -> Ended
+        code, out, _ = self._run_hook("SessionEnd", payload={}, env_extra=env)
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":""}')
+        self._wait_for_history(4)
+        self.assertEqual(self.bridge.history[-1].get("state"), "Ended")
+        sid4 = self.bridge.history[-1].get("session_id", "")
+        self.assertEqual(sid3, sid4, "fallback session ID must be stable across events")
+
+        # 5. Herdr fail-open Stop -> Ended
+        code, out, _ = self._run_hook("Stop", payload={}, env_extra={**env, "HERDR_PANE_ID": "ws1:pPyFb"})
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":""}')
+        self._wait_for_history(5)
+        self.assertEqual(self.bridge.history[-1].get("state"), "Ended")
+
+        # 6. Injected event -> whitelisted to empty, delivery is skipped safely
         code, out, _ = self._run_hook('Stop"; injection', payload={}, env_extra=env)
         self.assertEqual(code, 0)
+        self.assertEqual(out, "")
         time.sleep(0.1)
-        self.assertEqual(len(self.bridge.history), 3)
+        self.assertEqual(len(self.bridge.history), 5)
 
     def test_standalone_stop_without_workspace_matches_preinvocation_sid(self):
-        """In standalone mode (no HERDR_PANE_ID), Stop without workspacePaths reuses PreInvocation's SID."""
+        """In standalone mode (no HERDR_PANE_ID), Stop without workspacePaths reuses PreInvocation's SID and keeps .active until SessionEnd."""
         self.bridge.history.clear()
         env = {"AGENT_PID": "4141", "AGENT_TTY": "ttys999", "TERM_SESSION_ID": "term-sa-1"}
 
@@ -1042,7 +1072,7 @@ class AgyNotifyHookTests(SandboxTestCase):
         sid1 = self.bridge.history[-1].get("session_id")
         self.assertTrue(sid1.startswith("agy-session-"))
 
-        # Stop arrives with empty payload (no workspacePaths)
+        # Stop arrives with empty payload (no workspacePaths) -> Done, retains .active
         code2, _, _ = self._run_hook(
             "Stop",
             payload={},
@@ -1053,7 +1083,22 @@ class AgyNotifyHookTests(SandboxTestCase):
         sid2 = self.bridge.history[-1].get("session_id")
 
         self.assertEqual(sid1, sid2, "Stop in standalone mode must match PreInvocation session ID")
+        self.assertEqual(self.bridge.history[-1].get("state"), "Done")
+
+        sa_dir = self.state_dir / "standalone"
+        self.assertEqual(len(list(sa_dir.glob("*.active"))), 1, "standalone .active must be retained on Stop")
+
+        # SessionEnd arrives with empty payload -> Ended, retires .active
+        code3, _, _ = self._run_hook(
+            "SessionEnd",
+            payload={},
+            env_extra=env,
+        )
+        self.assertEqual(code3, 0)
+        self._wait_for_history(3)
+        self.assertEqual(self.bridge.history[-1].get("session_id"), sid1)
         self.assertEqual(self.bridge.history[-1].get("state"), "Ended")
+        self.assertEqual(len(list(sa_dir.glob("*.active"))), 0, "standalone .active must be retired on SessionEnd")
 
     def test_bash_fallback_hash_length_and_validity_without_shasum(self):
         """When shasum/sha256sum/cksum are unavailable, bash fallback still produces a valid 16-64 char SID."""
@@ -1202,8 +1247,16 @@ class AgyNotifyHookTests(SandboxTestCase):
         self.assertEqual(out, "{}")
 
     def test_unsupported_events_exit_zero_immediately(self):
-        """Unsupported events (e.g. PreToolUse, PostToolUse) exit 0 immediately with empty output."""
-        for event in ("PreToolUse", "PostToolUse", "Notification", "Unknown"):
+        """Non-status and unknown events exit 0 immediately with defensive stdout contracts and zero bridge calls."""
+        self.bridge.history.clear()
+        expected_contracts = (
+            ("PreToolUse", '{"decision":"allow"}'),
+            ("PostToolUse", "{}"),
+            ("SessionStart", "{}"),
+            ("Notification", ""),
+            ("Unknown", ""),
+        )
+        for event, expected_out in expected_contracts:
             with self.subTest(event=event):
                 code, out, _ = self._run_hook(
                     event,
@@ -1211,7 +1264,8 @@ class AgyNotifyHookTests(SandboxTestCase):
                     env_extra={"HOME": ""},
                 )
                 self.assertEqual(code, 0)
-                self.assertEqual(out, "")
+                self.assertEqual(out, expected_out)
+        self.assertEqual(len(self.bridge.history), 0)
 
     def test_standalone_sweep_preserves_live_tty_session(self):
         """Standalone sweep does not purge a PID-less session if its TTY device still exists."""
@@ -1462,7 +1516,7 @@ fi
         va_content = json.loads(active_files[0].read_text())
         self.assertEqual(va_content.get("vendor_session_id"), cid)
 
-        # Call Stop without conversationId in payload
+        # Call Stop without conversationId in payload -> Done, keeps .active intact
         code2, out2, _ = self._run_hook(
             "Stop",
             payload={},
@@ -1473,11 +1527,27 @@ fi
         self._wait_for_history(2)
         self.assertEqual(len(self.bridge.history), 2)
         self.assertEqual(self.bridge.history[-1]["session_id"], cid, "Stop must reuse recorded session ID from .active file")
+        self.assertEqual(self.bridge.history[-1]["state"], "Done")
+
+        # Active file must remain intact after standalone Stop
+        stop_actives = list(sa_dir.glob("*.active"))
+        self.assertEqual(len(stop_actives), 1, "standalone active file must remain intact on standalone Stop")
+
+        # Call SessionEnd without conversationId in payload -> Ended, retires .active
+        code3, out3, _ = self._run_hook(
+            "SessionEnd",
+            payload={},
+            env_extra=env,
+        )
+        self.assertEqual(code3, 0)
+        self.assertEqual(out3, '{"decision":""}')
+        self._wait_for_history(3)
+        self.assertEqual(len(self.bridge.history), 3)
+        self.assertEqual(self.bridge.history[-1]["session_id"], cid, "SessionEnd must reuse recorded session ID from .active file")
         self.assertEqual(self.bridge.history[-1]["state"], "Ended")
 
-        # Active file must be retired after successful Stop
         remaining_actives = list(sa_dir.glob("*.active"))
-        self.assertEqual(len(remaining_actives), 0, "standalone active file must be retired on confirmed Ended")
+        self.assertEqual(len(remaining_actives), 0, "standalone active file must be retired on confirmed SessionEnd")
 
     def test_standalone_prefix_sharing_pwds_produce_distinct_keys_and_no_mutual_dismissal(self):
         """Two standalone sessions in directories sharing a long prefix produce distinct .active files and do not evict each other."""
@@ -1540,7 +1610,7 @@ fi
         sids = {json.loads(f.read_text()).get("vendor_session_id") for f in active_files}
         self.assertEqual(sids, {"conv-shared-prefix-alpha", "conv-shared-prefix-beta"})
 
-        # Session A sends PostInvocation: must NOT dismiss session B
+        # Session A sends PostInvocation: must NOT dismiss session B, keeps Working state
         code_a2, _, _ = self._run_hook(
             "PostInvocation",
             payload={"conversationId": "conv-shared-prefix-alpha"},
@@ -1551,7 +1621,7 @@ fi
         self._wait_for_history(3)
         self.assertEqual(len(self.bridge.history), 3)
         self.assertEqual(self.bridge.history[-1]["session_id"], "conv-shared-prefix-alpha")
-        self.assertEqual(self.bridge.history[-1]["state"], "Idle")
+        self.assertEqual(self.bridge.history[-1]["state"], "Working")
 
     def test_standalone_same_pwd_no_pid_tty_never_dismiss_each_other(self):
         """Two standalone sessions in the exact same directory without PID/TTY/TERM_SESSION_ID never dismiss each other."""
@@ -1607,7 +1677,7 @@ fi
         self._wait_for_history(3)
         self.assertEqual(len(self.bridge.history), 3)
         self.assertEqual(self.bridge.history[-1]["session_id"], "conv-same-pwd-session-aaa")
-        self.assertEqual(self.bridge.history[-1]["state"], "Idle")
+        self.assertEqual(self.bridge.history[-1]["state"], "Working")
 
         # 4. Session B sends PostInvocation: must NOT dismiss session A
         code_b2, _, _ = self._run_hook(
@@ -1620,9 +1690,9 @@ fi
         self._wait_for_history(4)
         self.assertEqual(len(self.bridge.history), 4)
         self.assertEqual(self.bridge.history[-1]["session_id"], "conv-same-pwd-session-bbb")
-        self.assertEqual(self.bridge.history[-1]["state"], "Idle")
+        self.assertEqual(self.bridge.history[-1]["state"], "Working")
 
-        # 5. Session A stops: must NOT dismiss session B
+        # 5. Session A stops (turn ends -> Done): must NOT dismiss session B
         code_a3, _, _ = self._run_hook(
             "Stop",
             payload={"conversationId": "conv-same-pwd-session-aaa"},
@@ -1632,6 +1702,19 @@ fi
         self.assertEqual(code_a3, 0)
         self._wait_for_history(5)
         self.assertEqual(len(self.bridge.history), 5)
+        self.assertEqual(self.bridge.history[-1]["session_id"], "conv-same-pwd-session-aaa")
+        self.assertEqual(self.bridge.history[-1]["state"], "Done")
+
+        # 6. Session A ends session (-> Ended): must NOT dismiss session B
+        code_a4, _, _ = self._run_hook(
+            "SessionEnd",
+            payload={"conversationId": "conv-same-pwd-session-aaa"},
+            env_extra=env,
+            cwd=shared_dir,
+        )
+        self.assertEqual(code_a4, 0)
+        self._wait_for_history(6)
+        self.assertEqual(len(self.bridge.history), 6)
         self.assertEqual(self.bridge.history[-1]["session_id"], "conv-same-pwd-session-aaa")
         self.assertEqual(self.bridge.history[-1]["state"], "Ended")
 
@@ -1668,7 +1751,7 @@ fi
         self.assertEqual(self.bridge.history[-1]["session_id"], "conv-unbound-term-sess-001")
         self.assertEqual(self.bridge.history[-1]["state"], "Working")
 
-        # Stop event must also emit valid decision JSON
+        # Stop event must also emit valid decision JSON and map to Done in standalone mode
         code_stop, out_stop, err_stop = self._run_hook(
             "Stop",
             payload={"conversationId": "conv-unbound-term-sess-001"},
@@ -1680,6 +1763,20 @@ fi
         self.assertEqual(out_stop, '{"decision":""}')
         self.assertNotIn("unbound variable", err_stop)
         self._wait_for_history(2)
+        self.assertEqual(self.bridge.history[-1]["state"], "Done")
+
+        # SessionEnd event emits valid decision JSON and maps to Ended
+        code_end, out_end, err_end = self._run_hook(
+            "SessionEnd",
+            payload={"conversationId": "conv-unbound-term-sess-001"},
+            env_extra=env,
+            cwd=target_dir,
+            unset_vars=["TERM_SESSION_ID"],
+        )
+        self.assertEqual(code_end, 0)
+        self.assertEqual(out_end, '{"decision":""}')
+        self.assertNotIn("unbound variable", err_end)
+        self._wait_for_history(3)
         self.assertEqual(self.bridge.history[-1]["state"], "Ended")
 
     def test_saturated_sweep_and_prior_sid_never_starves_primary_event(self):
@@ -1740,9 +1837,254 @@ fi
         primary_ev = next(h for h in self.bridge.history if h.get("session_id") == "conv-primary-live-0001")
         self.assertEqual(primary_ev.get("state"), "Working")
 
+    def test_defensive_stdout_contracts_fast_zero_network(self):
+        """PreToolUse emits allow JSON (<0.5s, 0 requests); PostToolUse/SessionStart emit {} (0 requests); unknown emits empty."""
+        self.bridge.history.clear()
+        cases = (
+            ("PreToolUse", '{"decision":"allow"}'),
+            ("PostToolUse", "{}"),
+            ("SessionStart", "{}"),
+            ("UnknownCustomEvent", ""),
+            ('Stop"; injection', ""),
+        )
+        for ev_name, expected_stdout in cases:
+            with self.subTest(via="env", event=ev_name):
+                t0 = time.monotonic()
+                code, out, _ = self._run_hook(
+                    ev_name,
+                    payload={"conversationId": "conv-defensive-contract-01", "toolCall": {"name": "bash"}},
+                )
+                elapsed = time.monotonic() - t0
+                self.assertEqual(code, 0)
+                self.assertEqual(out, expected_stdout)
+                self.assertLess(elapsed, 0.5)
 
+            if '"' not in ev_name:
+                with self.subTest(via="json_camel", event=ev_name):
+                    t0 = time.monotonic()
+                    code, out, _ = self._run_hook(
+                        None,
+                        payload={
+                            "hookEventName": ev_name,
+                            "conversationId": "conv-defensive-contract-01",
+                        },
+                    )
+                    elapsed = time.monotonic() - t0
+                    self.assertEqual(code, 0)
+                    self.assertEqual(out, expected_stdout)
+                    self.assertLess(elapsed, 0.5)
 
+        self.assertEqual(len(self.bridge.history), 0, "Zero bridge requests allowed for non-status or unknown events")
 
+    def test_camelcase_hook_event_name_resolution(self):
+        """When AGY_HOOK_EVENT is unset, camelCase hookEventName resolves PreInvocation, Stop, and SessionEnd."""
+        self.bridge.history.clear()
+        cid = "conv-camelcase-event-0001"
+        env = {"HERDR_PANE_ID": "", "AGENT_PID": "5150", "AGENT_TTY": "ttys050", "TERM_SESSION_ID": "term-camel-1"}
 
+        # 1. PreInvocation via camelCase hookEventName (also takes precedence over snake_case)
+        code, out, _ = self._run_hook(
+            None,
+            payload={
+                "hookEventName": "PreInvocation",
+                "hook_event_name": "SessionEnd",
+                "conversationId": cid,
+                "lastUserInput": "Fix hook event parsing",
+            },
+            env_extra=env,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "{}")
+        self._wait_for_history(1)
+        self.assertEqual(self.bridge.history[-1].get("event"), "PreInvocation")
+        self.assertEqual(self.bridge.history[-1].get("state"), "Working")
+        self.assertEqual(self.bridge.history[-1].get("title"), "Fix hook event parsing")
 
+        # 2. Stop via camelCase hookEventName
+        code, out, _ = self._run_hook(
+            None,
+            payload={"hookEventName": "Stop", "conversationId": cid},
+            env_extra=env,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":""}')
+        self._wait_for_history(2)
+        self.assertEqual(self.bridge.history[-1].get("event"), "Stop")
+        self.assertEqual(self.bridge.history[-1].get("state"), "Done")
+
+        # 3. SessionEnd via camelCase hookEventName
+        code, out, _ = self._run_hook(
+            None,
+            payload={"hookEventName": "SessionEnd", "conversationId": cid},
+            env_extra=env,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":""}')
+        self._wait_for_history(3)
+        self.assertEqual(self.bridge.history[-1].get("event"), "SessionEnd")
+        self.assertEqual(self.bridge.history[-1].get("state"), "Ended")
+
+    def test_preinvocation_sanitizes_and_truncates_last_user_input(self):
+        """PreInvocation extracts sanitized lastUserInput truncated to 120 chars, falling back to Thinking... when absent/empty."""
+        self.bridge.history.clear()
+        dirty_prompt = (
+            "  \x1b]0;malicious-title\x07\x1b[31m\u202ePromptPrefix\u202c\x1b[0m\n"
+            + ("A" * 150)
+        )
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={
+                "conversationId": "conv-prompt-sanitize-0001",
+                "lastUserInput": dirty_prompt,
+            },
+            env_extra={"HERDR_PANE_ID": ""},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "{}")
+        self._wait_for_history(1)
+        ev = self.bridge.history[-1]
+        self.assertEqual(ev.get("state"), "Working")
+        title = ev.get("title", "")
+        self.assertEqual(len(title), 120)
+        self.assertTrue(title.startswith("PromptPrefixAAAA"))
+        self.assertNotIn("\x1b", title)
+        self.assertNotIn("\u202e", title)
+
+        # Absent, empty, control-only, or non-string lastUserInput falls back to "Thinking..."
+        for idx, empty_val in enumerate((None, "", "   ", "\x1b[32m\u200b\x1b[0m", 42)):
+            with self.subTest(idx=idx):
+                self.bridge.history.clear()
+                pl: dict = {"conversationId": f"conv-prompt-empty-{idx:04d}"}
+                if empty_val is not None:
+                    pl["lastUserInput"] = empty_val
+                code, out, _ = self._run_hook("PreInvocation", payload=pl, env_extra={"HERDR_PANE_ID": ""})
+                self.assertEqual(code, 0)
+                self.assertEqual(out, "{}")
+                self._wait_for_history(1)
+                self.assertEqual(self.bridge.history[-1].get("state"), "Working")
+                self.assertEqual(self.bridge.history[-1].get("title"), "Thinking...")
+
+    def test_postinvocation_keeps_working_state(self):
+        """PostInvocation stays Working to prevent mid-turn Working -> Idle -> Working flicker."""
+        self.bridge.history.clear()
+        code, out, _ = self._run_hook(
+            "PostInvocation",
+            payload={
+                "conversationId": "conv-postinv-working-0001",
+                "lastUserInput": "\x1b[1mRefactor hook tests\x1b[0m",
+            },
+            env_extra={"HERDR_PANE_ID": ""},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "{}")
+        self._wait_for_history(1)
+        self.assertEqual(self.bridge.history[-1].get("state"), "Working")
+        self.assertEqual(self.bridge.history[-1].get("title"), "Refactor hook tests")
+
+        # Without lastUserInput, title is empty string while state stays Working
+        code2, out2, _ = self._run_hook(
+            "PostInvocation",
+            payload={"conversationId": "conv-postinv-working-0001"},
+            env_extra={"HERDR_PANE_ID": ""},
+        )
+        self.assertEqual(code2, 0)
+        self.assertEqual(out2, "{}")
+        self._wait_for_history(2)
+        self.assertEqual(self.bridge.history[-1].get("state"), "Working")
+        self.assertEqual(self.bridge.history[-1].get("title"), "")
+
+    def test_standalone_stop_turn_lifecycle_and_session_end_retirement(self):
+        """Standalone Stop maps Done/Working/Waiting while retaining .active; SessionEnd maps Ended and retires .active."""
+        self.bridge.history.clear()
+        sa_dir = self.state_dir / "standalone"
+        cid = "conv-standalone-lifecycle-01"
+        env = {
+            "HERDR_PANE_ID": "",
+            "AGENT_PID": "6262",
+            "AGENT_TTY": "ttys062",
+            "TERM_SESSION_ID": "term-sa-lifecycle-01",
+        }
+
+        # 1. PreInvocation -> Working, creates .active
+        code, out, _ = self._run_hook(
+            "PreInvocation",
+            payload={"conversationId": cid, "lastUserInput": "Run deployment pipeline"},
+            env_extra=env,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "{}")
+        self._wait_for_history(1)
+        self.assertEqual(self.bridge.history[-1]["state"], "Working")
+        self.assertEqual(self.bridge.history[-1]["title"], "Run deployment pipeline")
+        self.assertEqual(len(list(sa_dir.glob("*.active"))), 1)
+
+        # 2. Stop with fullyIdle=False -> Working (fallback title when lastUserInput omitted)
+        code, out, _ = self._run_hook(
+            "Stop",
+            payload={"conversationId": cid, "fullyIdle": False},
+            env_extra=env,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":""}')
+        self._wait_for_history(2)
+        self.assertEqual(self.bridge.history[-1]["state"], "Working")
+        self.assertEqual(self.bridge.history[-1]["title"], "Background task running...")
+        self.assertEqual(len(list(sa_dir.glob("*.active"))), 1)
+
+        # 3. Stop with terminationReason="ERROR" and sanitized error string -> Waiting
+        code, out, _ = self._run_hook(
+            "Stop",
+            payload={
+                "conversationId": cid,
+                "terminationReason": "ERROR",
+                "error": "\x1b[31mModel quota exceeded\x1b[0m",
+                "lastUserInput": "Run deployment pipeline",
+            },
+            env_extra=env,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":""}')
+        self._wait_for_history(3)
+        self.assertEqual(self.bridge.history[-1]["state"], "Waiting")
+        self.assertEqual(self.bridge.history[-1]["title"], "Model quota exceeded")
+        self.assertEqual(len(list(sa_dir.glob("*.active"))), 1)
+
+        # 4. Stop with terminationReason="ERROR" and no error/prompt -> Waiting with "Error" fallback title
+        code, out, _ = self._run_hook(
+            "Stop",
+            payload={"conversationId": cid, "terminationReason": "ERROR"},
+            env_extra=env,
+        )
+        self.assertEqual(code, 0)
+        self._wait_for_history(4)
+        self.assertEqual(self.bridge.history[-1]["state"], "Waiting")
+        self.assertEqual(self.bridge.history[-1]["title"], "Error")
+        self.assertEqual(len(list(sa_dir.glob("*.active"))), 1)
+
+        # 5. Normal standalone Stop (fullyIdle=True) -> Done, still keeps .active intact
+        code, out, _ = self._run_hook(
+            "Stop",
+            payload={"conversationId": cid, "fullyIdle": True, "lastUserInput": "Run deployment pipeline"},
+            env_extra=env,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":""}')
+        self._wait_for_history(5)
+        self.assertEqual(self.bridge.history[-1]["state"], "Done")
+        self.assertEqual(self.bridge.history[-1]["title"], "Run deployment pipeline")
+        self.assertEqual(len(list(sa_dir.glob("*.active"))), 1, ".active must remain intact after standalone Done")
+
+        # 6. SessionEnd (without conversationId) -> reuses cid from .active, delivers Ended, retires .active
+        code, out, _ = self._run_hook(
+            "SessionEnd",
+            payload={},
+            env_extra=env,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(out, '{"decision":""}')
+        self._wait_for_history(6)
+        self.assertEqual(self.bridge.history[-1]["session_id"], cid)
+        self.assertEqual(self.bridge.history[-1]["state"], "Ended")
+        self.assertEqual(self.bridge.history[-1]["title"], "")
+        self.assertEqual(len(list(sa_dir.glob("*.active"))), 0, ".active must be retired on SessionEnd")
 
