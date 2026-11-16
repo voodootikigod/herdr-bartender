@@ -46,7 +46,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Tuple
 from . import clock, runtime
 from .bridge import DEFAULT_EVENT_TIMEOUT, deliver_event
 from .cache import BoundedSessionCache, CacheError
-from .config import SESSION_ID_REGEX
+from .config import SESSION_ID_REGEX, get_sanitized_hostname
 from .delivery_state import (
     STATUS_SUCCESS,
     Outcome,
@@ -57,8 +57,10 @@ from .delivery_state import (
     force_resync_superseding_senders,
 )
 from .handoff import ensure_reconciler_running, touch_reconciler_pending
+from .intake import resolve_host
 from .log import log_debug, log_warning
 from .markers import remove_pane_marker
+from .multihost import is_local_host, session_id_host
 from .orphans import (
     OrphanFileError,
     acquire_orphan_lock,
@@ -214,10 +216,26 @@ def record_pane(sid: str, record: object) -> Optional[str]:
     return ":".join(parts[2:]) if len(parts) >= 3 else None
 
 
-def find_active(sessions: Mapping, sid: str, pane: Optional[str]) -> Optional[dict]:
+def _pane_host_compatible(record: Mapping, sid_host: Optional[str], local_host: str) -> bool:
+    rec_host = record.get("host")
+    explicit_host = rec_host if isinstance(rec_host, str) and rec_host else None
+    if is_local_host(sid_host, local_host):
+        return is_local_host(explicit_host, local_host)
+    return explicit_host is None or explicit_host == sid_host
+
+
+def find_active(sessions: Mapping, sid: str, pane: Optional[str],
+                local_host: Optional[str] = None) -> Optional[dict]:
     active = sessions.get(sid)
     if active is None and pane:
-        active = next((r for r in sessions.values() if isinstance(r, dict) and r.get("pane_id") == pane), None)
+        resolved_local = local_host or get_sanitized_hostname()
+        sid_host = session_id_host(sid)
+        active = next(
+            (r for r in sessions.values()
+             if isinstance(r, dict) and r.get("pane_id") == pane
+             and _pane_host_compatible(r, sid_host, resolved_local)),
+            None,
+        )
     return active if isinstance(active, dict) else None
 
 
@@ -226,9 +244,14 @@ def suppresses_replay(active: Optional[Mapping]) -> bool:
     return active is not None and not active.get("salvaged", False) and active.get("desired_state") != "Ended"
 
 
-def _live_on_pane(sessions: Mapping, pane: Optional[str]) -> bool:
-    return bool(pane) and any(isinstance(r, dict) and r.get("pane_id") == pane and r.get("desired_state") != "Ended"
-                              and not r.get("salvaged") for r in sessions.values())
+def _live_on_pane(sessions: Mapping, pane: Optional[str], local_host: Optional[str] = None) -> bool:
+    resolved_local = local_host or get_sanitized_hostname()
+    return bool(pane) and any(
+        isinstance(r, dict) and r.get("pane_id") == pane
+        and is_local_host(r.get("host"), resolved_local)
+        and r.get("desired_state") != "Ended" and not r.get("salvaged")
+        for r in sessions.values()
+    )
 
 
 def _confirm_cached_ended(data: dict, sid: str) -> Optional[StagedEffects]:
@@ -239,12 +262,20 @@ def _confirm_cached_ended(data: dict, sid: str) -> Optional[StagedEffects]:
     return apply_delivery_result(data, Transmission.snapshot(sid, cached, None), Outcome(STATUS_SUCCESS))
 
 
-def settle_confirmed(cache_mgr: BoundedSessionCache, sid: str, pane: Optional[str]) -> bool:
+def _is_local_orphan(sid: str, record: object, local_host: str) -> bool:
+    rec_host = record.get("host") if isinstance(record, Mapping) else None
+    host = rec_host if isinstance(rec_host, str) and rec_host else session_id_host(sid)
+    return is_local_host(host, local_host)
+
+
+def settle_confirmed(cache_mgr: BoundedSessionCache, sid: str, pane: Optional[str],
+                     record: object = None) -> bool:
     """After a confirmed orphan Ended: re-sync a live re-admission, confirm a cached Ended; True when the
     reconciler must run (a re-sync)."""
     with cache_mgr as data:
+        local_host = resolve_host(data.get("host"))
         sessions = data.get("sessions", {})
-        active = find_active(sessions, sid, pane)
+        active = find_active(sessions, sid, pane, local_host=local_host)
         resync = suppresses_replay(active)
         if resync:
             log_debug(f"Live session for {sid} admitted while its orphan Ended was in flight; forcing re-sync")
@@ -254,7 +285,8 @@ def settle_confirmed(cache_mgr: BoundedSessionCache, sid: str, pane: Optional[st
             cache_mgr.save(data)
         if confirmed is not None:
             commit_delivery_down(confirmed)   # a reconnection clears DELIVERY_DOWN only once its re-sync is saved
-        if pane and not _live_on_pane(data.get("sessions", {}), pane):
+        if pane and "@" not in pane and _is_local_orphan(sid, record, local_host) \
+                and not _live_on_pane(data.get("sessions", {}), pane, local_host=local_host):
             remove_pane_marker(pane)
     # touch_pending: e.g. the confirmation was the reconnection after DELIVERY_DOWN
     return resync or (confirmed is not None and confirmed.touch_pending)
@@ -268,9 +300,9 @@ def _send_ended(sid: str, record: object, bridge_url: Optional[str]) -> bool:
     return deliver_event(payload, timeout=REPLAY_SOCKET_SECONDS, bridge_url=bridge_url).success
 
 
-def _cache_sessions(cache_mgr: BoundedSessionCache) -> dict:
+def _cache_state(cache_mgr: BoundedSessionCache) -> Tuple[dict, str]:
     with cache_mgr as data:
-        return dict(data.get("sessions", {}))
+        return dict(data.get("sessions", {})), resolve_host(data.get("host"))
 
 
 @dataclass
@@ -287,14 +319,14 @@ class _Run:
     resync_owed: List[str] = field(default_factory=list)
 
 
-def _settle_unsent(run: _Run, sid: object, record: object, sessions: dict, emit) -> bool:
+def _settle_unsent(run: _Run, sid: object, record: object, sessions: dict, local_host: str, emit) -> bool:
     """Invalid id or skip guard: settled without a POST (True), else False."""
     if not isinstance(sid, str) or not SESSION_ID_REGEX.match(sid):
         emit(f"    [-] Skipping orphan with invalid session_id: {str(sid)[:64]!r}")
         run.invalid.append(sid)
         run.settled[sid] = record
         return True
-    active = find_active(sessions, sid, record_pane(sid, record))
+    active = find_active(sessions, sid, record_pane(sid, record), local_host=local_host)
     if suppresses_replay(active):
         emit(f"    [*] Skipping orphan {sid}: pane currently has active non-Ended session {active.get('desired_state')}")
         run.skipped.append(sid)
@@ -310,7 +342,7 @@ def _settle_landed(run: _Run, sid: str, record: object, cache_mgr: BoundedSessio
     live session admitted while the Ended was in flight (its cache record still reads delivered).
     """
     try:
-        if settle_confirmed(cache_mgr, sid, record_pane(sid, record)):
+        if settle_confirmed(cache_mgr, sid, record_pane(sid, record), record=record):
             run.resynced.append(sid)
     except CacheError as exc:
         log_warning(f"Post-send re-sync check for {sid} not saved ({exc}); kept in the orphan file for the next replay")
@@ -322,14 +354,14 @@ def _settle_landed(run: _Run, sid: str, record: object, cache_mgr: BoundedSessio
     run.settled[sid] = record
 
 
-def _replay_one(run: _Run, sid: str, record: object, sessions: dict, cache_mgr: BoundedSessionCache,
-                bridge_url: Optional[str], emit) -> None:
+def _replay_one(run: _Run, sid: str, record: object, sessions: dict, local_host: str,
+                cache_mgr: BoundedSessionCache, bridge_url: Optional[str], emit) -> None:
     if isinstance(record, dict) and record.get(RESYNC_OWED_FIELD) is True and isinstance(sid, str) \
             and SESSION_ID_REGEX.match(sid):
         emit(f"    [*] Re-running the re-sync check for {sid} (its Ended already landed)")
         _settle_landed(run, sid, record, cache_mgr, emit)
         return
-    if _settle_unsent(run, sid, record, sessions, emit):
+    if _settle_unsent(run, sid, record, sessions, local_host, emit):
         return
     if not _send_ended(sid, record, bridge_url):
         emit(f"    [-] Failed to deliver Ended for {sid}")
@@ -343,10 +375,10 @@ def _replay_one(run: _Run, sid: str, record: object, sessions: dict, cache_mgr: 
 
 def replay_records(records: Mapping[str, object], bridge_url: Optional[str], emit, between: Between = None) -> _Run:
     cache_mgr = BoundedSessionCache(get_state_dir())   # DISABLED is not consulted: replay works after rollback
-    sessions = _cache_sessions(cache_mgr)
+    sessions, local_host = _cache_state(cache_mgr)
     run = _Run()
     for sid, record in records.items():
-        _replay_one(run, sid, record, sessions, cache_mgr, bridge_url, emit)
+        _replay_one(run, sid, record, sessions, local_host, cache_mgr, bridge_url, emit)
         if between is not None:
             between()
     if run.resynced:

@@ -36,6 +36,7 @@ from .intake import (
     session_matches_workspace,
 )
 from .log import log_debug, log_warning
+from .multihost import host_matches_session, pane_scope_key, resolve_event_host
 from .sanitize import format_agent_name
 
 TOMBSTONE_WINDOW_NS = 60_000_000_000
@@ -207,8 +208,8 @@ def _clamped_event_ns(arr_ns: int, cached: Mapping) -> int:
     return max(arr_ns, int(cached.get("last_event_ns", 0) or 0) + 1)
 
 
-def _next_generation(data: dict, pane: str, cached: Mapping) -> int:
-    return max(int(data.get("next_generation", 1) or 1), int(data.get("pane_generations", {}).get(pane, 0) or 0),
+def _next_generation(data: dict, scope_key: str, cached: Mapping) -> int:
+    return max(int(data.get("next_generation", 1) or 1), int(data.get("pane_generations", {}).get(scope_key, 0) or 0),
                int(cached.get("generation", 0) or 0)) + 1
 
 
@@ -216,20 +217,21 @@ def _commit_status(data: dict, sid: str, identity: Identity, event_data: Mapping
                    plan: dict) -> dict:
     """Apply a decided status event to ``data`` (the only mutating step)."""
     pane = identity.canonical_pane
+    scope_key = plan["scope_key"]
     for evicted in plan["evictions"]:
         log_debug(f"Pruning {evicted} to admit {sid} at the {SESSION_CAP}-session cap")
         data["sessions"].pop(evicted, None)
     if plan["pop_tombstone"]:
-        data.get("tombstones", {}).pop(pane, None)
+        data.get("tombstones", {}).pop(scope_key, None)
     if plan["pop_agent_exit"]:
-        data.get("agent_exits", {}).pop(pane, None)
+        data.get("agent_exits", {}).pop(scope_key, None)
     record = data["sessions"].setdefault(sid, {})
     event_ns = _clamped_event_ns(plan["arr_ns"], record)
     signal = plan["signal"]
     if plan["new_generation"] is not None:
         gen = plan["new_generation"]
         data["next_generation"] = gen
-        data.setdefault("pane_generations", {})[pane] = gen
+        data.setdefault("pane_generations", {})[scope_key] = gen
         record.update({"generation": gen, "admitted_at_ns": plan["arr_ns"],
                        ADMISSION_SIGNAL: {**signal, "prior_src": _num(record.get("last_source_timestamp")) or 0.0}})
         for stale in PREVIOUS_TURN_FIELDS + (POSITIVE_SIGNAL,):  # a new turn starts without the previous turn's
@@ -252,7 +254,7 @@ def _commit_status(data: dict, sid: str, identity: Identity, event_data: Mapping
     if mapped == "Ended":
         exit_src = float(_num(event_data.get("timestamp")) or 0.0)
         record.update({"close_kind": "agent_exit", "exit_at_ns": arr_ns, "exit_source_ts": exit_src})
-        data.setdefault("agent_exits", {})[pane] = {"exit_at_ns": arr_ns, "exit_source_ts": exit_src}
+        data.setdefault("agent_exits", {})[scope_key] = {"exit_at_ns": arr_ns, "exit_source_ts": exit_src}
     if plan["source_ts"] is not None:  # never moves backward (an accepted event may be <= 0.1s older)
         previous = _num(record.get("last_source_timestamp"))
         record["last_source_timestamp"] = plan["source_ts"] if previous is None else max(previous, plan["source_ts"])
@@ -271,7 +273,9 @@ def stage_status(data: dict, identity: Identity, event_data: Mapping, context: M
     staged record, or None with the drop reason (``data`` is then unchanged).
     """
     pane = identity.canonical_pane
-    host = resolve_host(data.get("host"))
+    local_host = resolve_host(data.get("host"))
+    host, is_remote = resolve_event_host(event_data, data.get("host"))
+    scope_key = pane_scope_key(pane, host, local_host)
     sid = build_session_id(host, pane)
     if not sid:
         return _drop("", f"Rejecting out-of-bounds session_id for host {loggable(host)} pane {pane}")
@@ -279,7 +283,7 @@ def stage_status(data: dict, identity: Identity, event_data: Mapping, context: M
     now_wall = clock.time() if now_wall is None else now_wall
     cached = data["sessions"].get(sid, {})
     src_ts = _num(event_data.get("timestamp"))
-    gate = _gate_reason(data, sid, pane, event_data, arr_ns, src_ts, cached, herdr_alive, require_newer,
+    gate = _gate_reason(data, sid, pane, scope_key, event_data, arr_ns, src_ts, cached, herdr_alive, require_newer,
                         can_export_orphans, now_wall)
     if gate.reason:
         if gate.warn:
@@ -294,18 +298,21 @@ def stage_status(data: dict, identity: Identity, event_data: Mapping, context: M
         return _drop(sid, reason)
     # Plan §4.3 L441: a new admission or a desired Ended -> live transition (never a delivered Ended alone).
     new_turn = cached.get("desired_state") == "Ended" or "generation" not in cached
-    new_gen = _next_generation(data, pane, cached) if new_turn else None
+    new_gen = _next_generation(data, scope_key, cached) if new_turn else None
     effective_gen = new_gen if new_gen is not None else cached.get("generation", 1)
     if spool_generation is not None and effective_gen > spool_generation:
         return _drop(sid, f"Ignoring spooled event with older generation {spool_generation} < {effective_gen}")
     exports = tuple((evicted, mirror_copy(data["sessions"][evicted], orphaned_ended=True))
                     for evicted in gate.evictions if _undelivered_ended(data["sessions"][evicted]))
     plan = {
-        "pop_tombstone": pane in data.get("tombstones", {}), "pop_agent_exit": gate.pop_agent_exit,
+        "scope_key": scope_key,
+        "pop_tombstone": scope_key in data.get("tombstones", {}), "pop_agent_exit": gate.pop_agent_exit,
         "evictions": gate.evictions, "new_generation": new_gen,
         "mapped_state": admission.mapped_state, "raw_agent": admission.raw_agent,
-        "agent_name": format_agent_name(admission.raw_agent),
-        "fields": resolve_fields(event_data, context, identity, cached), "host": host, "arr_ns": arr_ns,
+        "agent_name": format_agent_name(admission.raw_agent, remote_host=host if is_remote else None,
+                                        display_agent=event_data.get("display_agent")),
+        "fields": resolve_fields(event_data, context, identity, {} if new_turn else cached),
+        "host": host, "arr_ns": arr_ns,
         "arr_time": arr_time, "now_wall": now_wall, "source_ts": src_ts,
         "signal": {"arr_ns": arr_ns, "status": event_data.get("agent_status"), "agent": _positive_agent(event_data),
                    "src_ts": src_ts},
@@ -318,8 +325,8 @@ def _has_event_agent(event_data: Mapping) -> bool:
     return raw is not None and bool(str(raw).strip())
 
 
-def _gate_reason(data: dict, sid: str, pane: str, event_data: Mapping, arr_ns: int, src_ts: Optional[float],
-                 cached: Mapping, herdr_alive: Callable[[], bool], require_newer: bool,
+def _gate_reason(data: dict, sid: str, pane: str, scope_key: str, event_data: Mapping, arr_ns: int,
+                 src_ts: Optional[float], cached: Mapping, herdr_alive: Callable[[], bool], require_newer: bool,
                  can_export_orphans: bool, now_wall: float) -> _Gate:
     """Pre-admission gates in Plan §4.3 order; decides only (evictions are applied by ``_commit_status``)."""
     agent_status = event_data.get("agent_status")
@@ -328,12 +335,12 @@ def _gate_reason(data: dict, sid: str, pane: str, event_data: Mapping, arr_ns: i
         return _Gate(f"Warning: unrecognized agent_status {loggable(agent_status)} for pane {pane}")
     if require_newer and _superseded_replay(_ordering_view(cached), src_ts, arr_ns):
         return _Gate(f"Dropping superseded spooled status for {sid}")
-    tomb = data.get("tombstones", {}).get(pane)
+    tomb = data.get("tombstones", {}).get(scope_key)
     if tomb:
         reason = _tombstone_verdict(tomb, agent_status, src_ts, _positive_agent(event_data), arr_ns, herdr_alive, pane)
         if reason:
             return _Gate(reason)
-    exit_reason, pop_exit = _agent_exit_verdict(data.get("agent_exits", {}).get(pane), agent_status, src_ts,
+    exit_reason, pop_exit = _agent_exit_verdict(data.get("agent_exits", {}).get(scope_key), agent_status, src_ts,
                                                 arr_ns, pane, _has_event_agent(event_data))
     if exit_reason:
         return _Gate(exit_reason)
@@ -437,11 +444,14 @@ def stage_pane_close_result(data: dict, canonical_pane: str, event_data: Mapping
     The tombstone is recorded only when a matching session accepted the close, or no
     session is cached for the pane; a close predating a real admission of the session
     changes nothing (gap tombstone-on-stale-close, R48). ``recorded`` tells the caller to
-    remove the pane marker under the same lock (Plan §1 L59).
+    remove the local pane marker under the same lock (Plan §1 L59; never set for remote closes).
     """
     sessions = data["sessions"]
-    host = resolve_host(data.get("host"))
-    matching = [(sid, rec) for sid, rec in sessions.items() if session_matches_pane(sid, rec, canonical_pane, host)]
+    local_host = resolve_host(data.get("host"))
+    host, is_remote = resolve_event_host(event_data, data.get("host"))
+    scope_key = pane_scope_key(canonical_pane, host, local_host)
+    matching = [(sid, rec) for sid, rec in sessions.items()
+                if host_matches_session(rec, host, local_host) and session_matches_pane(sid, rec, canonical_pane, host)]
     last_src = max([_num(rec.get("last_source_timestamp")) or 0.0 for _, rec in matching] + [0.0])
     event_ts = _num(event_data.get("timestamp")) or 0.0
     targets = []
@@ -449,14 +459,15 @@ def stage_pane_close_result(data: dict, canonical_pane: str, event_data: Mapping
         if _eligible(rec, arr_ns, spool_generation, event_ts, herdr_alive):
             target = _close_session(rec, sid, PANE_CLOSED, event_data, arr_ns)
             targets.append(CloseTarget(sid, canonical_pane, rec, target.payload, target.seq))
-    recorded = bool(targets) or not matching
-    if recorded:
-        record_tombstone(data, canonical_pane, arr_ns, max(event_ts, last_src, float(arr_ns) / 1e9),
+    applied = bool(targets) or not matching
+    if applied:
+        record_tombstone(data, scope_key, arr_ns, max(event_ts, last_src, float(arr_ns) / 1e9),
                          max(last_src, event_ts))
-        # Plan §1 L57 / §3.2: a pane close dismisses any vendor entry recorded for the pane, whatever
-        # happens to the session's own Ended (persisted; the event path resolves it in the same lock hold).
-        stage_vendor_cleanup(data, canonical_pane, True, clock.time())
-    return PaneCloseStage(tuple(targets), recorded)
+        if not is_remote:
+            # Plan §1 L57 / §3.2: a local pane close dismisses any vendor entry recorded for the pane, whatever
+            # happens to the session's own Ended (persisted; the event path resolves it in the same lock hold).
+            stage_vendor_cleanup(data, canonical_pane, True, clock.time())
+    return PaneCloseStage(tuple(targets), applied and not is_remote)
 
 
 def stage_pane_close(data: dict, canonical_pane: str, event_data: Mapping, arr_ns: int,
@@ -487,14 +498,18 @@ def stage_container_close(data: dict, event_name: str, event_data: Mapping, arr_
     if matches is None:
         log_debug(f"Ignoring {event_name} without a valid container id")
         return ()
+    local_host = resolve_host(data.get("host"))
+    host, _ = resolve_event_host(event_data, data.get("host"))
     event_ts = _num(event_data.get("timestamp")) or 0.0
     targets = []
     for sid, rec in list(data["sessions"].items()):
-        if not matches(rec) or not _eligible(rec, arr_ns, spool_generation, event_ts, herdr_alive):
+        if not host_matches_session(rec, host, local_host) or not matches(rec) \
+                or not _eligible(rec, arr_ns, spool_generation, event_ts, herdr_alive):
             continue
         target = _close_session(rec, sid, event_name, event_data, arr_ns)
         if target.pane_id:
-            record_tombstone(data, target.pane_id, arr_ns, rec["closed_source_ts"],
+            scope_key = pane_scope_key(target.pane_id, host, local_host)
+            record_tombstone(data, scope_key, arr_ns, rec["closed_source_ts"],
                              max(_num(rec.get("last_source_timestamp")) or 0.0, _num(event_data.get("timestamp")) or 0.0))
         targets.append(target)
     return tuple(targets)

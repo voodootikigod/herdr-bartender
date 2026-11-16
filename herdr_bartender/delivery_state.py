@@ -27,6 +27,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 from . import clock
 from .cache import ORPHAN_MIRROR_OWED, mirror_copy
+from .intake import resolve_host
 from .log import log_debug, log_warning
 from .markers import (
     clear_delivery_down,
@@ -37,6 +38,7 @@ from .markers import (
     touch_pane_failed,
     touch_pane_marker,
 )
+from .multihost import is_local_host, pane_scope_key, session_id_host
 from .orphans import flush_pending_orphan_ops, journal_orphan_exports, run_orphan_io
 
 STATUS_SUCCESS = "success"
@@ -170,6 +172,19 @@ def foreign_lease_open(record: Mapping, now_wall: float) -> bool:
 
 
 # -- persisted side effects ----------------------------------------------------------
+def _tx_scope(data: dict, session: Optional[Mapping], tx: Transmission) -> Tuple[bool, str]:
+    """Return ``(local_pane, scope_key)`` for ``tx`` against ``data``'s pinned host."""
+    local_host = resolve_host(data.get("host"))
+    raw_pane = tx.pane_id if isinstance(tx.pane_id, str) else ""
+    rec_host = session.get("host") if isinstance(session, Mapping) else None
+    effective_host = (rec_host if isinstance(rec_host, str) and rec_host else session_id_host(tx.session_id))
+    is_local = is_local_host(effective_host, local_host)
+    host = effective_host or local_host
+    local_pane = bool(raw_pane) and "@" not in raw_pane and is_local
+    scope_key = raw_pane if "@" in raw_pane else pane_scope_key(raw_pane, host, local_host)
+    return local_pane, scope_key
+
+
 def _same_session(entry: object, session_id: str) -> bool:
     return isinstance(entry, dict) and entry.get("session_id") == session_id
 
@@ -180,7 +195,8 @@ def stage_compensation(data: dict, tx: Transmission, now: float) -> dict:
     A replaced entry whose Ended may already have reached Bartender passes its ``posted``
     mark on, so a later re-admission is still re-synced (``sender.compensation``).
     """
-    generation = tx.generation if tx.generation is not None else data.get("pane_generations", {}).get(tx.pane_id)
+    _, scope_key = _tx_scope(data, data.get("sessions", {}).get(tx.session_id), tx)
+    generation = tx.generation if tx.generation is not None else data.get("pane_generations", {}).get(scope_key)
     entry = {
         "session_id": tx.session_id,
         "pane_id": tx.pane_id,
@@ -325,18 +341,21 @@ def _is_stale(session: dict, tx: Transmission, outcome: Outcome) -> bool:
     return not outcome.success or session.get("delivered_state") == tx.state
 
 
-def _evict(data: dict, session: dict, tx: Transmission, now_ns: int) -> None:
-    """Confirmed Ended: evict, drop the marker, re-record the close origin persisted in Step A."""
+def _evict(data: dict, session: dict, tx: Transmission, now_ns: int, *,
+           local_pane: bool = True, scope_key: Optional[str] = None) -> None:
+    """Confirmed Ended: evict, drop the local marker, re-record the close origin persisted in Step A."""
     data["sessions"].pop(tx.session_id, None)
-    remove_pane_marker(tx.pane_id)
+    if local_pane:
+        remove_pane_marker(tx.pane_id)
     origin_ns = tx.arrival_ns or now_ns
-    if not tx.pane_id:
+    key = scope_key if scope_key is not None else (tx.pane_id or "")
+    if not key:
         return
     if session.get("close_kind") == "container":  # re-affirmed from the origins persisted in Step A
-        record_tombstone(data, tx.pane_id, int(session.get("closed_at_ns") or origin_ns),
+        record_tombstone(data, key, int(session.get("closed_at_ns") or origin_ns),
                          _num(session.get("closed_source_ts")), _num(session.get("last_source_timestamp")))
     elif session.get("close_kind") == "agent_exit":
-        data.setdefault("agent_exits", {})[tx.pane_id] = {
+        data.setdefault("agent_exits", {})[key] = {
             "exit_at_ns": session.get("exit_at_ns") or origin_ns,
             "exit_source_ts": float(session.get("exit_source_ts") or 0.0),
         }
@@ -399,7 +418,7 @@ def _pane_closed(session: dict, tx: Transmission) -> bool:
 
 
 def _apply_success(data: dict, session: dict, tx: Transmission, now: float, now_ns: int,
-                   down: Optional[bool]) -> StagedEffects:
+                   down: Optional[bool], *, local_pane: bool = True, scope_key: Optional[str] = None) -> StagedEffects:
     if int(session.get("resync_generation", 0) or 0) > tx.resync_generation:
         log_debug(f"Resync generation advanced during transmission of {tx.session_id}; forcing re-sync")
         _force_resync(session)
@@ -408,14 +427,16 @@ def _apply_success(data: dict, session: dict, tx: Transmission, now: float, now_
                     "delivery_attempts": 0, "delivery_error": None, "next_retry_at": None})
     data["consecutive_failures"] = 0
     data["last_successful_delivery"] = now
-    touch_pane_marker(tx.pane_id)
+    if local_pane:
+        touch_pane_marker(tx.pane_id)
     resynced = _reconnection_resync(data, tx, down)
-    clear_pane_failed(tx.pane_id)
+    if local_pane:
+        clear_pane_failed(tx.pane_id)
     rearm_exhausted(data)
     evict = tx.state == "Ended" and int(session.get("seq", 0) or 0) == tx.seq
-    cleanups = (stage_vendor_cleanup(data, tx.pane_id, _pane_closed(session, tx), now),) if tx.pane_id else ()
+    cleanups = (stage_vendor_cleanup(data, tx.pane_id, _pane_closed(session, tx), now),) if local_pane else ()
     if evict:
-        _evict(data, session, tx, now_ns)
+        _evict(data, session, tx, now_ns, local_pane=local_pane, scope_key=scope_key)
         effects = StagedEffects(EVICTED, orphans_to_remove=((tx.session_id, tx.seq),), vendor_cleanups=cleanups, evicted=True,
                                 delivery_down=False)
     else:
@@ -435,18 +456,20 @@ def _orphan_if_ended(session: dict, tx: Transmission, desired: bool, now: float)
 
 
 def _apply_non_retryable(data: dict, session: dict, tx: Transmission, outcome: Outcome,
-                         now: float, now_ns: int) -> StagedEffects:
+                         now: float, now_ns: int, *, local_pane: bool = True) -> StagedEffects:
     session.update({"delivery_status": "non_retryable_failed", "rejected_seq": tx.seq,
                     "delivery_error": outcome.error or DEFAULT_NON_RETRYABLE_ERROR, "next_retry_at": None})
-    touch_pane_failed(tx.pane_id)
+    if local_pane:
+        touch_pane_failed(tx.pane_id)
     return StagedEffects(REJECTED, orphans_to_export=_orphan_if_ended(session, tx, desired=False, now=now))
 
 
 def _apply_retryable(data: dict, session: dict, tx: Transmission, outcome: Outcome,
-                     now: float, now_ns: int) -> StagedEffects:
+                     now: float, now_ns: int, *, local_pane: bool = True) -> StagedEffects:
     session["delivery_attempts"] = int(session.get("delivery_attempts", 0) or 0) + 1
     session["delivery_error"] = outcome.error or DEFAULT_RETRYABLE_ERROR
-    touch_pane_failed(tx.pane_id)
+    if local_pane:
+        touch_pane_failed(tx.pane_id)
     data["consecutive_failures"] = int(data.get("consecutive_failures", 0) or 0) + 1
     down = True if data["consecutive_failures"] >= DELIVERY_DOWN_THRESHOLD else None
     if session["delivery_attempts"] < MAX_DELIVERY_ATTEMPTS:
@@ -465,11 +488,11 @@ _FAILURE_BRANCHES: Dict[str, Callable[..., StagedEffects]] = {
 
 
 def _apply_outcome(data: dict, session: dict, tx: Transmission, outcome: Outcome, now: float, now_ns: int,
-                   down: Optional[bool]) -> StagedEffects:
+                   down: Optional[bool], *, local_pane: bool = True, scope_key: Optional[str] = None) -> StagedEffects:
     """The §3.3 response matrix branch for ``outcome``."""
     if outcome.success:
-        return _apply_success(data, session, tx, now, now_ns, down)
-    return _FAILURE_BRANCHES[outcome.status](data, session, tx, outcome, now, now_ns)
+        return _apply_success(data, session, tx, now, now_ns, down, local_pane=local_pane, scope_key=scope_key)
+    return _FAILURE_BRANCHES[outcome.status](data, session, tx, outcome, now, now_ns, local_pane=local_pane)
 
 
 def _finalize(session: dict, tx: Transmission, effects: StagedEffects, retain_lease: bool,
@@ -517,7 +540,8 @@ def apply_delivery_result(data: dict, tx: Transmission, outcome: Outcome, *, ret
     session = data.setdefault("sessions", {}).get(tx.session_id)
     if session is None:
         return _missing_session(data, tx, outcome, now)
-    if tx.state != "Ended" and tx.pane_id and tx.pane_id in data.get("tombstones", {}):
+    local_pane, scope_key = _tx_scope(data, session, tx)
+    if tx.state != "Ended" and scope_key and scope_key in data.get("tombstones", {}):
         return _tombstoned(data, session, tx, outcome, now)
     if _late_send_after_takeover(session, tx, outcome):
         return _superseded(session, tx)
@@ -525,7 +549,8 @@ def apply_delivery_result(data: dict, tx: Transmission, outcome: Outcome, *, ret
         return StagedEffects(STALE)
     if tx.lease_token is not None and session.get("lease_token") != tx.lease_token:
         return _superseded(session, tx)
-    effects = _apply_outcome(data, session, tx, outcome, now, now_ns, delivery_down)
+    effects = _apply_outcome(data, session, tx, outcome, now, now_ns, delivery_down,
+                             local_pane=local_pane, scope_key=scope_key)
     if effects.evicted:
         return effects
     return _finalize(session, tx, effects, retain_lease, outcome, now)

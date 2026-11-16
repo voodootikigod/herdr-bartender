@@ -5,8 +5,13 @@ import time
 import unittest
 
 from herdr_bartender.cache import BoundedSessionCache
-from herdr_bartender.housekeeping import STALE_TMP_SECONDS, sweep_stale_temp_files
+from herdr_bartender.housekeeping import (
+    STALE_BARE_VENDOR_SECONDS,
+    STALE_TMP_SECONDS,
+    sweep_stale_temp_files,
+)
 from herdr_bartender.paths import get_orphan_path
+from herdr_bartender.salvage import CORRUPT_PREFIX, QUARANTINE_RETENTION_SECONDS
 from tests.support import SandboxTestCase
 
 
@@ -54,6 +59,51 @@ class StaleTempSweepTests(SandboxTestCase):
         BoundedSessionCache(self.state_dir)
         for path in stale:
             self.assertFalse(path.exists(), path)
+
+    def test_sweep_prunes_expired_corrupt_quarantine_files(self):
+        now = time.time()
+        expired_ts = int(now - QUARANTINE_RETENTION_SECONDS - 120)
+        fresh_ts = int(now - QUARANTINE_RETENTION_SECONDS + 3600)
+        expired = self.state_dir / f"{CORRUPT_PREFIX}{expired_ts}"
+        fresh = self.state_dir / f"{CORRUPT_PREFIX}{fresh_ts}"
+        expired.write_text("{corrupt")
+        fresh.write_text("{corrupt-recent")
+
+        removed = sweep_stale_temp_files(self.state_dir, now=now)
+        self.assertIn(expired, removed)
+        self.assertFalse(expired.exists())
+        self.assertTrue(fresh.exists())
+
+    def test_sweep_removes_only_stale_empty_regular_vendor_active_files(self):
+        self.assertEqual(STALE_BARE_VENDOR_SECONDS, 7 * 86400)
+        now = time.time()
+        panes = self.state_dir / "panes"
+        panes.mkdir(parents=True, exist_ok=True)
+
+        def touch_aged(path, content: bytes, age: float):
+            path.write_bytes(content)
+            stamp = now - age
+            os.utime(path, (stamp, stamp))
+            return path
+
+        stale_bare = touch_aged(panes / "aa01.vendor_active", b"", STALE_BARE_VENDOR_SECONDS + 10)
+        fresh_bare = touch_aged(panes / "aa02.vendor_active", b"", STALE_BARE_VENDOR_SECONDS - 60)
+        stale_json = touch_aged(
+            panes / "aa03.vendor_active",
+            b'{"vendor_session_id": "vendor-uuid-0000000001"}',
+            STALE_BARE_VENDOR_SECONDS + 86400,
+        )
+        target = touch_aged(self.state_dir / "symlink-target", b"", STALE_BARE_VENDOR_SECONDS + 86400)
+        symlink_vendor = panes / "aa04.vendor_active"
+        symlink_vendor.symlink_to(target)
+
+        removed = sweep_stale_temp_files(self.state_dir, now=now)
+        self.assertEqual(removed, [stale_bare])
+        self.assertFalse(stale_bare.exists())
+        self.assertTrue(fresh_bare.exists())
+        self.assertTrue(stale_json.exists(), "non-empty .vendor_active must never be unlinked by housekeeping")
+        self.assertTrue(symlink_vendor.is_symlink(), "symlink .vendor_active must never be unlinked by housekeeping")
+        self.assertTrue(target.exists())
 
 
 if __name__ == "__main__":

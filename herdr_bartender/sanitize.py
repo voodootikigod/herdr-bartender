@@ -88,13 +88,25 @@ def get_hex_pane_id(raw_id: Optional[str]) -> str:
     return str(raw_id).encode("utf-8").hex()
 
 
-def format_agent_name(raw_agent: object) -> str:
-    """Display name: AGENT_NAME_OVERRIDES / capitalized, suffixed ' (Herdr)', total <= 64 chars."""
+def format_agent_name(raw_agent: object, *, remote_host: Optional[str] = None,
+                      display_agent: Optional[object] = None) -> str:
+    """Display name: AGENT_NAME_OVERRIDES / display_agent / capitalized, suffixed ' (Herdr[ · host])', <= 64 chars."""
     clean = sanitize_agent(raw_agent).lower()
-    if not clean:
+    display = sanitize_agent(display_agent)
+    has_remote = bool(remote_host and _as_text(remote_host).strip())
+    clean_host = sanitize_hostname(remote_host) if has_remote else ""
+    if clean in AGENT_NAME_OVERRIDES:
+        pretty = AGENT_NAME_OVERRIDES[clean]
+    elif display:
+        pretty = display
+    elif clean:
+        pretty = clean.capitalize()
+    elif has_remote:
+        return f"Herdr ({clean_host})"[:AGENT_MAX]
+    else:
         return DEFAULT_AGENT_NAME
-    pretty = AGENT_NAME_OVERRIDES.get(clean, clean.capitalize())
-    return f"{pretty[:AGENT_MAX - len(AGENT_SUFFIX)]}{AGENT_SUFFIX}"
+    suffix = f" (Herdr \u00b7 {clean_host})" if has_remote else AGENT_SUFFIX
+    return f"{pretty[:max(0, AGENT_MAX - len(suffix))]}{suffix}"
 
 
 def normalize_pane_id(raw_pane_id: object, workspace_id: Optional[str],

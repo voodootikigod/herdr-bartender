@@ -268,6 +268,14 @@ def _is_gui_bundle(pid: int) -> bool:
     return ".app/" in comm or comm.startswith("/Applications/")
 
 
+def _is_herdr_server(pid: int) -> bool:
+    parts = (_ps_field(pid, "args") or "").split()
+    if len(parts) < 2:
+        return False
+    subcmd = next((tok for tok in parts[1:] if not tok.startswith("-")), None)
+    return subcmd == "server"
+
+
 def _probe_herdr() -> ProcessProbe:
     # R44: -a includes our own ancestors. macOS pgrep otherwise skips them, and Herdr is the
     # ancestor of every plugin process it spawns (on Linux procps -a only lists the command line).
@@ -279,7 +287,8 @@ def _probe_herdr() -> ProcessProbe:
     if not candidates:
         return ProcessProbe(None, by_bundle is not None)
     gui = [p for p in candidates if _is_gui_bundle(p)]
-    return ProcessProbe(_earliest(gui or candidates), True)
+    servers = [p for p in candidates if _is_herdr_server(p)] if not gui and len(candidates) > 1 else []
+    return ProcessProbe(_earliest(gui or servers or candidates), True)
 
 
 def probe_herdr() -> ProcessProbe:
