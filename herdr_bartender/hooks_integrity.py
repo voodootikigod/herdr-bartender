@@ -23,6 +23,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
+from .agy_hook import (
+    AGY_HOOK_NAME,
+    audit_agy_hooks_config,
+    default_agy_hooks_config_path,
+    verify_agy_hook_intact,
+)
 from .boundedio import HOOK_SCRIPT_MAX_BYTES, read_regular_file, read_regular_prefix
 from . import hooks_fs
 from .hooks_install import (

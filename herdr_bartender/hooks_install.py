@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
+from .agy_hook import AGY_HOOK_NAME, install_agy_hook, uninstall_agy_hook
 from .boundedio import HOOK_SCRIPT_MAX_BYTES, read_regular_file
 from . import hooks_fs
 from .hooks_text import GuardTextError, find_guard, insert_guard, is_legacy_layout, replace_guard, strip_guard
@@ -127,7 +128,8 @@ def install_hooks(state_dir: Optional[Path] = None, hooks_dir: Optional[Path] = 
     hooks_dir = hooks_dir or get_vendor_hooks_dir()
     hooks_fs.unlink_flags(state_dir, (NO_HOOKS,))
     hook_files = present_hooks(hooks_dir) if hooks_dir.is_dir() else []
-    if not hook_files:
+    agy_present = hooks_dir.is_dir() and os.path.lexists(hooks_dir / AGY_HOOK_NAME)
+    if not hook_files and not agy_present:
         where = hooks_dir if hooks_dir.is_dir() else f"{hooks_dir} (directory not found)"
         _say(f"[-] No target hook scripts found in {where}")
         hooks_fs.unlink_flags(state_dir, REVIEW_FLAGS)
@@ -139,7 +141,8 @@ def install_hooks(state_dir: Optional[Path] = None, hooks_dir: Optional[Path] = 
         return False
     outcomes = tuple(_install_one(hook, template) for hook in hook_files)
     recorded = _record_approvals(state_dir / SHA_FILE_NAME, outcomes)
-    all_ok = recorded and all(o.ok for o in outcomes)
+    agy_ok = install_agy_hook(hooks_dir) if hooks_dir.is_dir() else True
+    all_ok = recorded and all(o.ok for o in outcomes) and agy_ok
     if all_ok:
         hooks_fs.unlink_flags(state_dir, REVIEW_FLAGS)
     else:
@@ -184,11 +187,12 @@ def uninstall_hooks(state_dir: Optional[Path] = None, hooks_dir: Optional[Path] 
     hooks_dir = hooks_dir or get_vendor_hooks_dir()
     intent_ok = _record_no_hooks(state_dir)
     hook_files = present_hooks(hooks_dir) if hooks_dir.is_dir() else []
-    if not hook_files:
-        _say(f"[=] No vendor hook scripts found in {hooks_dir}; nothing to uninstall")
-        return intent_ok
+    agy_present = hooks_dir.is_dir() and os.path.lexists(hooks_dir / AGY_HOOK_NAME)
     results: Tuple[bool, ...] = tuple(_uninstall_one(hook) for hook in hook_files)
-    return intent_ok and all(results)
+    agy_ok = uninstall_agy_hook(hooks_dir) if hooks_dir.is_dir() else True
+    if not hook_files and not agy_present:
+        _say(f"[=] No vendor hook scripts found in {hooks_dir}; nothing to uninstall")
+    return intent_ok and all(results) and agy_ok
 
 
 def _record_no_hooks(state_dir: Path) -> bool:

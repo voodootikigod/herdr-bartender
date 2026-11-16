@@ -47,6 +47,15 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+from .agy_hook import (  # noqa: E402
+    AGY_HOOK_NAME,
+    agy_source_path,
+    audit_agy_hooks_config,
+    default_agy_hooks_config_path,
+    install_agy_hook,
+    uninstall_agy_hook,
+    verify_agy_hook_intact,
+)
 from .hooks_install import (  # noqa: E402  (re-exported public API)
     HOOK_NAMES,
     HOOK_NEEDS_REVIEW,
@@ -74,6 +83,7 @@ from .hooks_integrity import (  # noqa: E402
 )
 
 __all__ = [
+    "AGY_HOOK_NAME",
     "HOOK_NAMES",
     "HOOK_NEEDS_REVIEW",
     "HOOK_REVIEW_ALERTED",
@@ -89,12 +99,18 @@ __all__ = [
     "HookCheck",
     "IntegrityResult",
     "RepairResult",
+    "agy_source_path",
+    "audit_agy_hooks_config",
     "check_hook_integrity",
+    "default_agy_hooks_config_path",
     "flag_hook_review",
     "get_hook_guard_template",
     "get_vendor_hooks_dir",
+    "install_agy_hook",
     "install_hooks",
     "repair_hooks_if_allowlisted",
+    "uninstall_agy_hook",
     "uninstall_hooks",
+    "verify_agy_hook_intact",
     "verify_vendor_hooks_intact",
 ]
