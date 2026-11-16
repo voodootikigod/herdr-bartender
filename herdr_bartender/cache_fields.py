@@ -134,6 +134,21 @@ def _sane_root(data: dict) -> List[str]:
     return dropped
 
 
+def _sane_unreachable(raw: object) -> Tuple[Dict[str, object], List[str]]:
+    if not isinstance(raw, dict):
+        return {}, ["root remote_unreachable_since"]
+    kept: Dict[str, object] = {}
+    dropped: List[str] = []
+    for key, value in raw.items():
+        checked = _as_number(value) if isinstance(key, str) and key else _DROP
+        if checked is _DROP:
+            label = repr(key) if not isinstance(key, str) or not key else key
+            dropped.append(f"remote_unreachable_since {label}")
+        else:
+            kept[key] = checked
+    return kept, dropped
+
+
 def sane_cache_fields(data: dict, warn: Optional[Callable[[str], None]] = None) -> dict:
     """Fix the known fields of a normalized cache ``data`` in place (and return it)."""
     warn = warn or log_warning
@@ -150,6 +165,9 @@ def sane_cache_fields(data: dict, warn: Optional[Callable[[str], None]] = None) 
         before = data.get(name, {})
         data[name] = _sane_entries(before, times)
         notes.extend(f"{name} {key}" for key in before if key not in data[name])
+    if "remote_unreachable_since" in data:
+        data["remote_unreachable_since"], bad_hosts = _sane_unreachable(data["remote_unreachable_since"])
+        notes.extend(bad_hosts)
     if notes:
         warn(f"Cache fields of the wrong type dropped (defaults apply): {', '.join(notes[:20])}"
              + (f" and {len(notes) - 20} more" if len(notes) > 20 else ""))

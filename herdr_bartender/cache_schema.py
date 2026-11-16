@@ -14,7 +14,9 @@ SCHEMA_VERSION = 4
 SALVAGE_EPOCH_FLOOR = 1_700_000_000   # Plan §6.3 step 4: epoch-dominating salvage generation floor
 DISMISSED_VENDOR_CAP = 64             # Plan §1 L56
 
-DICT_FIELDS = ("sessions", "pane_generations", "tombstones", "agent_exits", "dismissed_vendor_uuids")
+DICT_FIELDS = (
+    "sessions", "pane_generations", "tombstones", "agent_exits", "dismissed_vendor_uuids", "remote_unreachable_since",
+)
 LIST_FIELDS = ("pending_compensations", "pending_vendor_cleanups")
 SCALAR_DEFAULTS = {
     "cache_seq": 0,

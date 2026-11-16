@@ -107,6 +107,36 @@ class HerdrPidSelectionTests(SandboxTestCase):
         self.assertEqual(process._pgrep(["-a", "-xi", "herdr"]), [pid])
         self.assertEqual(get_herdr_pid(), pid)
 
+    def test_herdr_server_preferred_over_earlier_cli_client(self):
+        """When no GUI `.app` bundle is running, `herdr server` beats an earlier non-server CLI invocation."""
+        self.add_fake_process("herdr", pid=200, lstart="Sat Oct  4 08:00:00 2026",
+                              comm="herdr", cmdline="herdr attach session-1")
+        self.add_fake_process("herdr", pid=300, lstart="Sat Oct  4 09:00:00 2026",
+                              comm="herdr", cmdline="/usr/local/bin/herdr --verbose server --port 9000")
+        self.assertEqual(get_herdr_pid(), 300)
+        self.assertTrue(process._is_herdr_server(300))
+        self.assertFalse(process._is_herdr_server(200))
+
+    def test_earliest_herdr_server_wins_among_multiple_servers_and_non_server_subcmd_ignored(self):
+        """Non-server subcommands mentioning 'server' later do not qualify; earliest `herdr server` wins."""
+        self.add_fake_process("herdr", pid=150, lstart="Sat Oct  4 07:00:00 2026",
+                              comm="herdr", cmdline="herdr status server")
+        self.add_fake_process("herdr", pid=400, lstart="Sat Oct  4 10:00:00 2026",
+                              comm="herdr", cmdline="herdr server")
+        self.add_fake_process("herdr", pid=250, lstart="Sat Oct  4 08:30:00 2026",
+                              comm="herdr", cmdline="herdr -d server")
+        self.assertFalse(process._is_herdr_server(150))
+        self.assertEqual(get_herdr_pid(), 250)
+
+    def test_gui_bundle_still_preferred_over_earlier_herdr_server(self):
+        """GUI `.app` bundle keeps top priority even when a `herdr server` daemon started earlier."""
+        self.add_fake_process("herdr", pid=200, lstart="Sat Oct  4 07:00:00 2026",
+                              comm="herdr", cmdline="herdr server")
+        self.add_fake_process("herdr", pid=350, lstart="Sat Oct  4 09:00:00 2026",
+                              comm="/Applications/Herdr.app/Contents/MacOS/herdr",
+                              cmdline="/Applications/Herdr.app/Contents/MacOS/herdr")
+        self.assertEqual(get_herdr_pid(), 350)
+
 
 class BartenderPidSelectionTests(SandboxTestCase):
     """Plan §1 L134 / §3.1 Restart Detection: Bartender PID is the earliest-started process."""

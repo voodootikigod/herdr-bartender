@@ -7,11 +7,21 @@ import unittest
 import copy
 
 from herdr_bartender import cache
-from herdr_bartender.cache_schema import new_cache
-from herdr_bartender.handlers import handle_agent_status_changed, handle_pane_closed, handle_tab_closed
+from herdr_bartender.cache_fields import sane_cache_fields
+from herdr_bartender.cache_schema import new_cache, normalize_cache
+from herdr_bartender.delivery_state import Outcome, Transmission, apply_delivery_result
+from herdr_bartender.handlers import (
+    handle_agent_status_changed,
+    handle_pane_closed,
+    handle_tab_closed,
+    handle_workspace_closed,
+)
 from herdr_bartender.intake import resolve_identity
+from herdr_bartender.markers import touch_pane_marker
+from herdr_bartender.multihost import host_matches_session, is_local_host, pane_scope_key, resolve_event_host
 from herdr_bartender.process import get_process_start_time
-from herdr_bartender.staging import SESSION_CAP, stage_status
+from herdr_bartender.sanitize import AGENT_MAX, format_agent_name, get_hex_pane_id
+from herdr_bartender.staging import SESSION_CAP, stage_pane_close_result, stage_status
 from tests.support import SandboxTestCase
 
 
@@ -180,6 +190,267 @@ class CapacityStagingTests(SandboxTestCase):
         before = copy.deepcopy(data)
         self.assertFalse(self._stage(data, agent_status="unknown").staged)
         self.assertEqual(data, before)
+
+
+class AgentNameAndSchemaMultiHostTests(SandboxTestCase):
+    start_bridge = False   # normalize_cache logs dropped fields to plugin.log; keep it sandboxed
+    def test_format_agent_name_local_remote_and_display_agent(self):
+        self.assertEqual(format_agent_name("claude"), "Claude (Herdr)")
+        self.assertEqual(format_agent_name(""), "Herdr")
+        self.assertEqual(format_agent_name(None), "Herdr")
+        self.assertEqual(format_agent_name("custom"), "Custom (Herdr)")
+        self.assertEqual(format_agent_name("claude", display_agent="Ignored Override"), "Claude (Herdr)")
+        self.assertEqual(format_agent_name("custom_bot", display_agent="Custom Bot"), "Custom Bot (Herdr)")
+        self.assertEqual(format_agent_name("", display_agent="Custom Bot"), "Custom Bot (Herdr)")
+        self.assertEqual(format_agent_name("agy", remote_host="dev-one"), "Antigravity (Herdr \u00b7 dev-one)")
+        self.assertEqual(format_agent_name("custom_bot", remote_host="DEV-ONE.corp.local",
+                                           display_agent="Custom Bot"),
+                         "Custom Bot (Herdr \u00b7 dev-one)")
+        self.assertEqual(format_agent_name("", remote_host="dev-one"), "Herdr (dev-one)")
+        self.assertEqual(format_agent_name("", remote_host="   "), "Herdr")
+        long_formatted = format_agent_name("x" * 100, remote_host="h" * 50, display_agent="D" * 100)
+        self.assertEqual(len(long_formatted), AGENT_MAX)
+        self.assertTrue(long_formatted.endswith(f" (Herdr \u00b7 {'h' * 32})"))
+
+    def test_multihost_pure_helpers(self):
+        self.assertEqual(resolve_event_host({}, "macbook"), ("macbook", False))
+        self.assertEqual(resolve_event_host({"host": "   "}, "macbook"), ("macbook", False))
+        self.assertEqual(resolve_event_host({"host": "MACBOOK.local"}, "macbook"), ("macbook", False))
+        self.assertEqual(resolve_event_host({"host": "Dev-One.example.com"}, "macbook"), ("dev-one", True))
+        self.assertEqual(pane_scope_key("w1:p1", "", "macbook"), "w1:p1")
+        self.assertEqual(pane_scope_key("w1:p1", "macbook", "macbook"), "w1:p1")
+        self.assertEqual(pane_scope_key("w1:p1", "dev-one", "macbook"), "dev-one@w1:p1")
+        self.assertTrue(is_local_host(None, "macbook"))
+        self.assertTrue(is_local_host("", "macbook"))
+        self.assertTrue(is_local_host("macbook", "macbook"))
+        self.assertFalse(is_local_host("dev-one", "macbook"))
+        self.assertTrue(host_matches_session({}, "macbook", "macbook"))
+        self.assertFalse(host_matches_session({}, "dev-one", "macbook"))
+        self.assertTrue(host_matches_session({"host": "dev-one"}, "dev-one", "macbook"))
+        self.assertFalse(host_matches_session({"host": "dev-one"}, "macbook", "macbook"))
+
+    def test_remote_unreachable_since_schema_and_field_sanity(self):
+        fresh = new_cache("macbook")
+        self.assertEqual(fresh["remote_unreachable_since"], {})
+        notes_seen = []
+        raw = {
+            "sessions": {},
+            "remote_unreachable_since": {
+                "dev-one": 100.5,
+                "dev-two": "200.25",
+                "": 50.0,
+                "bad-bool": True,
+                "bad-nan": "NaN",
+                "bad-inf": float("inf"),
+                "bad-str": "never",
+                "bad-none": None,
+            },
+        }
+        normalized = normalize_cache(raw, lambda: "macbook")
+        self.assertEqual(normalized["remote_unreachable_since"], {"dev-one": 100.5, "dev-two": 200.25})
+        sane_cache_fields({"sessions": {}, "remote_unreachable_since": {"": 1.0, "bad": "nope", "ok": 3}},
+                          warn=notes_seen.append)
+        self.assertEqual(len(notes_seen), 1)
+        self.assertIn("remote_unreachable_since ''", notes_seen[0])
+        self.assertIn("remote_unreachable_since bad", notes_seen[0])
+
+
+class MultiHostAndNewTurnStagingTests(SandboxTestCase):
+    def _data(self):
+        with self.cache_mgr as data:
+            return data
+
+    def test_same_pane_id_isolated_across_local_and_remote_hosts(self):
+        t0 = time.time_ns()
+        pane = "w1:pShared"
+        local_sid = self.sid(pane)
+        remote_sid = f"herdr:dev-one:{pane}"
+        marker = self.state_dir / "panes" / get_hex_pane_id(pane)
+
+        handle_agent_status_changed(
+            {"agent_status": "working", "pane_id": pane, "workspace_id": "w1", "agent": "claude",
+             "tab_id": "w1:t1", "title": "Local work"},
+            {}, bridge_url=self.mock_url, arrival_ns=t0,
+        )
+        handle_agent_status_changed(
+            {"agent_status": "working", "pane_id": pane, "workspace_id": "w1", "agent": "agy",
+             "display_agent": "Custom Agy", "host": "dev-one", "tab_id": "w1:t1", "title": "Remote work"},
+            {}, bridge_url=self.mock_url, arrival_ns=t0 + 10,
+        )
+
+        data = self._data()
+        self.assertIn(local_sid, data["sessions"])
+        self.assertIn(remote_sid, data["sessions"])
+        self.assertEqual(data["sessions"][local_sid]["host"], self.host)
+        self.assertEqual(data["sessions"][local_sid]["agent"], "Claude (Herdr)")
+        self.assertEqual(data["sessions"][remote_sid]["pane_id"], pane)
+        self.assertEqual(data["sessions"][remote_sid]["host"], "dev-one")
+        self.assertEqual(data["sessions"][remote_sid]["agent"], "Antigravity (Herdr \u00b7 dev-one)")
+        self.assertIn(pane, data["pane_generations"])
+        self.assertIn(f"dev-one@{pane}", data["pane_generations"])
+        self.assertTrue(marker.exists(), "local session created local pane marker")
+
+        # Remote pane.closed only closes remote session, tombstones dev-one@w1:pShared, keeps local marker & vendor free.
+        handle_pane_closed({"pane_id": pane, "workspace_id": "w1", "host": "dev-one"}, {},
+                           bridge_url=self.mock_url, arrival_ns=t0 + 100)
+        data = self._data()
+        self.assertIn(local_sid, data["sessions"])
+        self.assertNotIn(remote_sid, data["sessions"])
+        self.assertIn(f"dev-one@{pane}", data["tombstones"])
+        self.assertNotIn(pane, data["tombstones"])
+        self.assertTrue(marker.exists(), "remote pane close must NOT remove local pane marker")
+
+        # Local non-working status still succeeds (not blocked by remote tombstone).
+        handle_agent_status_changed(
+            {"agent_status": "blocked", "pane_id": pane, "workspace_id": "w1", "agent": "claude"},
+            {}, bridge_url=self.mock_url, arrival_ns=t0 + 200,
+        )
+        self.assertEqual(self._data()["sessions"][local_sid]["desired_state"], "Waiting")
+
+    def test_remote_container_close_and_agent_exit_do_not_affect_local_sessions(self):
+        t0 = time.time_ns()
+        pane = "w1:pTabIso"
+        local_sid = self.sid(pane)
+        remote_sid = f"herdr:dev-one:{pane}"
+
+        for extra in ({}, {"host": "dev-one"}):
+            handle_agent_status_changed(
+                {"agent_status": "working", "pane_id": pane, "workspace_id": "w1", "agent": "codex",
+                 "tab_id": "w1:tShared", **extra},
+                {}, bridge_url=self.mock_url, arrival_ns=t0,
+            )
+
+        # Remote agent exit records dev-one@pane in agent_exits, leaving local session live.
+        handle_agent_status_changed(
+            {"agent_status": "idle", "pane_id": pane, "workspace_id": "w1", "agent": "",
+             "host": "dev-one", "timestamp": 500.0},
+            {}, bridge_url=self.mock_url, arrival_ns=t0 + 50,
+        )
+        data = self._data()
+        self.assertIn(local_sid, data["sessions"])
+        self.assertNotIn(remote_sid, data["sessions"])
+        self.assertIn(f"dev-one@{pane}", data["agent_exits"])
+        self.assertNotIn(pane, data["agent_exits"])
+
+        # Re-admit remote session, then close remote tab & workspace; local session stays Working.
+        handle_agent_status_changed(
+            {"agent_status": "working", "pane_id": pane, "workspace_id": "w1", "agent": "codex",
+             "tab_id": "w1:tShared", "host": "dev-one"},
+            {}, bridge_url=self.mock_url, arrival_ns=t0 + 100,
+        )
+        handle_tab_closed({"tab_id": "w1:tShared", "workspace_id": "w1", "host": "dev-one"}, {},
+                          bridge_url=self.mock_url, arrival_ns=t0 + 200)
+        data = self._data()
+        self.assertEqual(data["sessions"][local_sid]["desired_state"], "Working")
+        self.assertNotIn(remote_sid, data["sessions"])
+        self.assertIn(f"dev-one@{pane}", data["tombstones"])
+        self.assertNotIn(pane, data["tombstones"])
+
+        # Re-admit remote in another pane, then close local workspace -> remote survives.
+        remote_pane2 = "w1:pRem2"
+        remote_sid2 = f"herdr:dev-one:{remote_pane2}"
+        handle_agent_status_changed(
+            {"agent_status": "working", "pane_id": remote_pane2, "workspace_id": "w1", "agent": "codex",
+             "host": "dev-one"},
+            {}, bridge_url=self.mock_url, arrival_ns=t0 + 300,
+        )
+        handle_workspace_closed({"workspace_id": "w1"}, {}, bridge_url=self.mock_url, arrival_ns=t0 + 400)
+        data = self._data()
+        self.assertNotIn(local_sid, data["sessions"])
+        self.assertIn(remote_sid2, data["sessions"])
+        self.assertEqual(data["sessions"][remote_sid2]["desired_state"], "Working")
+
+    def test_remote_step_c_never_touches_local_markers_or_vendor_cleanups(self):
+        pane = "w1:pRemoteStepC"
+        remote_sid = f"herdr:dev-one:{pane}"
+        hex_id = get_hex_pane_id(pane)
+        panes_dir = self.state_dir / "panes"
+        data = new_cache(self.host)
+        data["tombstones"][pane] = {"closed_at_ns": 999999, "closed_source_ts": 99.0, "last_source_timestamp": 99.0}
+        data["sessions"][remote_sid] = {
+            "pane_id": pane, "host": "dev-one", "agent": "Claude (Herdr \u00b7 dev-one)",
+            "desired_state": "Working", "seq": 1, "delivered_seq": 0, "generation": 2, "admitted_at_ns": 100,
+            "lease_token": "tok-r", "sending_pid": 1, "lease_deadline": time.time() + 1.5,
+            "delivery_status": "in_flight", "delivery_attempts": 0, "resync_generation": 0,
+        }
+        tx = Transmission(remote_sid, pane, "Working", 1, "Claude (Herdr \u00b7 dev-one)", "tok-r", 0, 2, 100, 200)
+
+        # Local tombstone on bare `pane` does NOT tombstone the remote delivery; success writes no local marker/cleanup.
+        eff = apply_delivery_result(data, tx, Outcome("success"))
+        self.assertEqual(eff.verdict, "delivered")
+        self.assertEqual(eff.vendor_cleanups, ())
+        self.assertEqual(data["pending_vendor_cleanups"], [])
+        self.assertFalse((panes_dir / hex_id).exists())
+
+        # Retryable and non_retryable failures on remote session do NOT create local .failed or remove local marker.
+        touch_pane_marker(pane)
+        self.assertTrue((panes_dir / hex_id).exists())
+        data["sessions"][remote_sid].update({"seq": 2, "lease_token": "tok-r2"})
+        tx2 = Transmission(remote_sid, pane, "Waiting", 2, "Claude (Herdr \u00b7 dev-one)", "tok-r2", 0, 2, 100, 300)
+        apply_delivery_result(data, tx2, Outcome("retryable", "network_timeout"))
+        self.assertTrue((panes_dir / hex_id).exists())
+        self.assertFalse((panes_dir / f"{hex_id}.failed").exists())
+
+        data["sessions"][remote_sid].update({"lease_token": "tok-r3"})
+        tx3 = Transmission(remote_sid, pane, "Waiting", 2, "Claude (Herdr \u00b7 dev-one)", "tok-r3", 0, 2, 100, 300)
+        apply_delivery_result(data, tx3, Outcome("non_retryable", "4xx_client_error"))
+        self.assertTrue((panes_dir / hex_id).exists())
+        self.assertFalse((panes_dir / f"{hex_id}.failed").exists())
+
+        # Remote Ended eviction keeps local marker and records tombstone under dev-one@pane.
+        data["sessions"][remote_sid].update({
+            "desired_state": "Ended", "seq": 3, "lease_token": "tok-r4",
+            "close_kind": "container", "closed_at_ns": 555, "closed_source_ts": 12.0,
+        })
+        tx4 = Transmission(remote_sid, pane, "Ended", 3, "Claude (Herdr \u00b7 dev-one)", "tok-r4", 0, 2, 100, 400)
+        ev = apply_delivery_result(data, tx4, Outcome("success"))
+        self.assertTrue(ev.evicted)
+        self.assertTrue((panes_dir / hex_id).exists(), "local marker preserved across remote eviction")
+        self.assertIn(f"dev-one@{pane}", data["tombstones"])
+        self.assertEqual(data["pending_vendor_cleanups"], [])
+
+        # stage_pane_close_result for remote pane returns recorded=False and adds no vendor cleanup.
+        closed = stage_pane_close_result(data, pane, {"pane_id": pane, "host": "dev-two"}, 777)
+        self.assertFalse(closed.recorded)
+        self.assertIn(f"dev-two@{pane}", data["tombstones"])
+        self.assertEqual(data["pending_vendor_cleanups"], [])
+
+    def test_pane_generations_save_prune_handles_remote_scoped_keys(self):
+        with self.cache_mgr as data:
+            data["pane_generations"] = {f"dev-one@w9:p{i}": i + 1 for i in range(520)}
+            data["tombstones"]["dev-one@w9:p0"] = {"closed_at_ns": time.time_ns(), "closed_source_ts": 1.0}
+            self.cache_mgr.save(data, orphan_panes=frozenset())
+            self.assertEqual(len(data["pane_generations"]), 512)
+            self.assertIn("dev-one@w9:p0", data["pane_generations"], "tombstone-protected remote scope key is retained")
+
+    def test_new_turn_does_not_inherit_stale_fields_from_ended_turn(self):
+        pane = "w1:pNewTurn"
+        sid = self.sid(pane)
+        t0 = time.time_ns()
+        handle_agent_status_changed(
+            {"agent_status": "working", "pane_id": pane, "workspace_id": "w1", "agent": "claude",
+             "cwd": "/stale/cwd", "title": "Stale Turn Title", "tab_id": "w1:tStale"},
+            {}, bridge_url=self.mock_url, arrival_ns=t0,
+        )
+        # Keep the Ended turn in cache by failing its bridge delivery.
+        self.bridge.return_code = 500
+        handle_agent_status_changed(
+            {"agent_status": "idle", "pane_id": pane, "workspace_id": "w1", "agent": ""},
+            {}, bridge_url=self.mock_url, arrival_ns=t0 + 100,
+        )
+        self.assertEqual(self._data()["sessions"][sid]["desired_state"], "Ended")
+
+        # Start a new turn with no cwd/title/tab_id on the event: must NOT inherit stale Ended fields!
+        self.bridge.return_code = 200
+        handle_agent_status_changed(
+            {"agent_status": "working", "pane_id": pane, "workspace_id": "w1", "agent": "codex"},
+            {}, bridge_url=self.mock_url, arrival_ns=t0 + 200,
+        )
+        rec = self._data()["sessions"][sid]
+        self.assertEqual(rec["desired_state"], "Working")
+        self.assertEqual(rec["cwd"], "")
+        self.assertEqual(rec["title"], f"Pane {pane}")
+        self.assertIsNone(rec["tab_id"])
 
 
 if __name__ == "__main__":
