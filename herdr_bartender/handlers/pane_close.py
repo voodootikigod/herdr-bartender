@@ -1,4 +1,4 @@
-"""pane.closed handler (Plan §2.1, §4.1 tombstones, §4.3; Step A staging in ``staging.stage_pane_close``).
+"""pane.closed and pane.exited handlers (Plan §2.1, §4.1 tombstones, §4.3; Step A staging in ``staging.stage_pane_close``).
 
 Step A ends every matching session (close origin persisted on the session, R7),
 tombstones the pane only when the close is not stale against a real admission (R8, R48),
@@ -20,19 +20,26 @@ from ..sender import Stage, Staged, Target
 from ..staging import stage_pane_close_result
 from .flow import run_event
 
+PANE_EXITED = "pane.exited"
 
-def _pane_stage(pane: str, event_data: dict, arr_ns: int, spool_generation: Optional[int]) -> Stage:
+
+def _pane_stage(pane: str, event_data: dict, arr_ns: int, spool_generation: Optional[int],
+                event_name: str = PANE_CLOSED) -> Stage:
     def stage(data: dict) -> Staged:
         staged = stage_pane_close_result(data, pane, event_data, arr_ns, spool_generation,
                                          herdr_alive=memoised_herdr_alive)
+        if event_name != PANE_CLOSED:
+            for t in staged.targets:
+                t.payload["event"] = event_name
+                t.record["desired_payload"] = {**t.record["desired_payload"], "event": event_name}
         if staged.recorded:
             remove_pane_marker(pane)
         return Staged(tuple(Target(t.session_id, t.pane_id, t.record) for t in staged.targets), mutated=True)
     return stage
 
 
-def handle_pane_closed(event_data: dict, context: dict, bridge_url: Optional[str] = None,
-                       arrival_ns: Optional[int] = None, spool_generation: Optional[int] = None) -> None:
+def _handle_pane_close_event(event_name: str, event_data: dict, context: dict, bridge_url: Optional[str],
+                             arrival_ns: Optional[int], spool_generation: Optional[int]) -> None:
     arr_ns = arrival_ns or clock.time_ns()
     event_data = event_data if isinstance(event_data, dict) else {}
 
@@ -44,6 +51,16 @@ def handle_pane_closed(event_data: dict, context: dict, bridge_url: Optional[str
             log_debug(note)
         if identity is None:
             return None
-        return _pane_stage(identity.canonical_pane, event_data, arr_ns, spool_generation)
+        return _pane_stage(identity.canonical_pane, event_data, arr_ns, spool_generation, event_name)
 
-    run_event(PANE_CLOSED, event_data, context if isinstance(context, dict) else {}, arr_ns, prepare, bridge_url)
+    run_event(event_name, event_data, context if isinstance(context, dict) else {}, arr_ns, prepare, bridge_url)
+
+
+def handle_pane_closed(event_data: dict, context: dict, bridge_url: Optional[str] = None,
+                       arrival_ns: Optional[int] = None, spool_generation: Optional[int] = None) -> None:
+    _handle_pane_close_event(PANE_CLOSED, event_data, context, bridge_url, arrival_ns, spool_generation)
+
+
+def handle_pane_exited(event_data: dict, context: dict, bridge_url: Optional[str] = None,
+                       arrival_ns: Optional[int] = None, spool_generation: Optional[int] = None) -> None:
+    _handle_pane_close_event(PANE_EXITED, event_data, context, bridge_url, arrival_ns, spool_generation)

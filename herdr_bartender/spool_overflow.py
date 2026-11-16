@@ -16,7 +16,7 @@ from typing import FrozenSet, Iterable, Mapping, Optional
 
 from . import jsonsafe
 from .boundedio import CACHE_MAX_BYTES, read_regular_file
-from .envelopes import read_json
+from .envelopes import PANE_EXITED, read_json
 from .intake import PANE_CLOSED, TAB_CLOSED, WORKSPACE_CLOSED
 
 CACHE_FILE_NAME = "active-sessions.json"
@@ -49,6 +49,16 @@ def _cached_sessions(state_dir: Path) -> Optional[Iterable[Mapping]]:
     return [s for s in sessions.values() if isinstance(s, dict)] if isinstance(sessions, dict) else None
 
 
+def _add_envelope_targets(data: Mapping, panes: set, tabs: set, workspaces: set) -> None:
+    pane = _canonical_pane(data)
+    if pane:
+        panes.add(pane)
+        workspaces.add(pane.split(":", 1)[0])
+    for key, bucket in (("tab_id", tabs), ("workspace_id", workspaces)):
+        if isinstance(data.get(key), str):
+            bucket.add(data[key])
+
+
 def live_targets(state_dir: Path, status_envelopes: Iterable[Path]) -> Optional[Targets]:
     """Everything a close could still end; None when the cache cannot be read (then nothing is evictable)."""
     sessions = _cached_sessions(state_dir)
@@ -71,13 +81,10 @@ def live_targets(state_dir: Path, status_envelopes: Iterable[Path]) -> Optional[
             continue
         data = env.get("event_data") if isinstance(env, dict) else None
         if isinstance(data, dict):
-            pane = _canonical_pane(data)
-            if pane:
-                panes.add(pane)
-                workspaces.add(pane.split(":", 1)[0])
-            for key, bucket in (("tab_id", tabs), ("workspace_id", workspaces)):
-                if isinstance(data.get(key), str):
-                    bucket.add(data[key])
+            _add_envelope_targets(data, panes, tabs, workspaces)
+            nested_pane = data.get("pane")
+            if isinstance(nested_pane, dict):
+                _add_envelope_targets(nested_pane, panes, tabs, workspaces)
     return Targets(frozenset(panes), frozenset(tabs), frozenset(workspaces))
 
 
@@ -89,7 +96,10 @@ def close_is_relevant(event_name: str, event_data: Mapping, targets: Optional[Ta
         return event_data.get("tab_id") in targets.tabs
     if event_name == WORKSPACE_CLOSED:
         return event_data.get("workspace_id") in targets.workspaces
-    pane = _canonical_pane(event_data)   # pane.closed or an agent exit
+    if event_name in (PANE_CLOSED, PANE_EXITED):
+        pane = _canonical_pane(event_data)
+        return pane is not None and pane in targets.panes
+    pane = _canonical_pane(event_data)   # agent exit status envelope
     return pane is not None and pane in targets.panes
 
 

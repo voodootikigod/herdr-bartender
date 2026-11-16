@@ -28,6 +28,8 @@ from .boundedio import capped_lock_timeout, locked_directory
 from .envelopes import (
     CLOSE_EVENTS,
     MAX_ENVELOPE_BYTES,
+    PANE_EXITED,
+    PANE_MOVED,
     build_envelope,
     is_close_envelope,
     quarantine,
@@ -51,7 +53,7 @@ CLOSE_HARD_CAP = 4096          # R66: distinct containers with a pending close (
 CLOSE_MARK = "_c"               # keyed close envelopes: <enqueued_ns>_<pid>_<mono>_c<key>.json
 CLOSE_KEY_HEX = 32
 CLOSE_FIELD_MAX_CHARS = 1024
-CLOSE_DATA_KEYS = ("pane_id", "workspace_id", "tab_id", "agent", "agent_status", "state", "timestamp", "title", "cwd")
+CLOSE_DATA_KEYS = ("pane_id", "workspace_id", "tab_id", "host", "agent", "agent_status", "state", "timestamp", "title", "cwd")
 EXIT_CONTEXT_KEYS = ("focused_pane_id", "focused_pane_agent", "focused_pane_cwd", "workspace_id", "workspace_cwd",
                      "workspace_label", "tab_id")
 REPLAY_BATCH = 16
@@ -101,11 +103,13 @@ def _is_keyed_close(path: Path) -> bool:
 def _close_key(event_name: str, event_data: dict) -> str:
     """R66: one key per closed container; a newer close for it supersedes (replaces) the spooled one."""
     if event_name == TAB_CLOSED:
-        ids = (event_data.get("tab_id"),)
+        ids: Tuple[object, ...] = (event_data.get("tab_id"),)
     elif event_name == WORKSPACE_CLOSED:
         ids = (event_data.get("workspace_id"),)
-    else:   # pane.closed or an agent exit (a status event): keyed by pane, in separate namespaces
+    else:   # pane.closed, pane.exited, or an agent exit (a status event): keyed by pane, in separate namespaces
         ids = (event_data.get("pane_id"), event_data.get("workspace_id"))
+    if isinstance(event_data.get("host"), str) and event_data["host"].strip():
+        ids = (*ids, event_data["host"])
     raw = json.dumps([event_name, *[i if isinstance(i, str) else None for i in ids]])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:CLOSE_KEY_HEX]
 
@@ -226,15 +230,24 @@ def apply_envelope_locked(data: dict, env: dict, herdr_alive: Callable[[], bool]
     name, event_data, arrival_ns = env["event_name"], env["event_data"], env["arrival_ns"]
     context = env.get("context") or {}
     generation = env.get("generation")
-    if name in (STATUS_EVENT, PANE_CLOSED):
+    if name == PANE_MOVED:
+        from .handlers.pane_move import stage_pane_move
+        moved = stage_pane_move(data, event_data, context, arrival_ns, herdr_alive=herdr_alive,
+                                spool_generation=generation, require_newer=True, can_export_orphans=False)
+        return tuple(t.session_id for t in moved.targets)
+    if name in (STATUS_EVENT, PANE_CLOSED, PANE_EXITED):
         identity, notes = resolve_identity(event_data, context if name == STATUS_EVENT else {}, env={})
         for note in notes:
             log_debug(note)
         if identity is None:
             return ()
-        if name == PANE_CLOSED:
+        if name in (PANE_CLOSED, PANE_EXITED):
             closed = stage_pane_close_result(data, identity.canonical_pane, event_data, arrival_ns, generation,
                                              herdr_alive=herdr_alive)
+            if name == PANE_EXITED:
+                for t in closed.targets:
+                    t.payload["event"] = PANE_EXITED
+                    t.record["desired_payload"] = {**t.record["desired_payload"], "event": PANE_EXITED}
             if closed.recorded:   # Plan §1 L59: the marker goes under the close's lock
                 remove_pane_marker(identity.canonical_pane)
             return tuple(t.session_id for t in closed.targets)

@@ -20,7 +20,10 @@ from .paths import PRIVATE_FILE_MODE, ensure_private_dir
 
 MAX_ENVELOPE_BYTES = 256 * 1024   # R62/R64: spool and results envelopes are refused / unread past this
 
-CLOSE_EVENTS = frozenset({PANE_CLOSED, TAB_CLOSED, WORKSPACE_CLOSED})
+PANE_EXITED = "pane.exited"
+PANE_MOVED = "pane.moved"
+SUPPORTED_ENVELOPE_EVENTS = EVENT_NAMES | frozenset({PANE_EXITED, PANE_MOVED})
+CLOSE_EVENTS = frozenset({PANE_CLOSED, PANE_EXITED, TAB_CLOSED, WORKSPACE_CLOSED})
 BAD_DIR_CAP = 20          # Plan §4.3 L396: spool/bad holds at most 20 files
 ENVELOPE_KEYS = ("event_name", "event_data", "context", "arrival_ns", "enqueued_ns")
 
@@ -45,7 +48,7 @@ def validate_envelope(env: object) -> Optional[str]:
     """None when ``env`` is a replayable R6 envelope, else the reason it is poison."""
     if not isinstance(env, dict):
         return "envelope is not a JSON object"
-    if env.get("event_name") not in EVENT_NAMES:
+    if env.get("event_name") not in SUPPORTED_ENVELOPE_EVENTS:
         return f"unknown event_name {str(env.get('event_name'))[:64]!r}"
     if not isinstance(env.get("event_data"), dict):
         return "event_data is not an object"
