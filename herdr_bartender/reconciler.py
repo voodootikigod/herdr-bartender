@@ -28,7 +28,7 @@ from typing import Callable, List, Mapping, Optional, Tuple
 
 from . import clock
 from .cache import ORPHAN_MIRROR_OWED, BoundedSessionCache, IntegrationDisabled
-from .delivery_state import foreign_lease_open, journal_exports_before_save
+from .delivery_state import foreign_lease_open
 from .dismissals import dismiss_stale_vendor_files, sweep_dismissals
 from .handoff import touch_reconciler_pending
 from .intake import resolve_host
@@ -47,9 +47,21 @@ from .lifecycle import (
 from .log import log_debug, log_warning
 from .markers import remove_pane_marker
 from .multihost import is_local_host, session_id_host
-from .orphans import export_orphan_record, exported_session_records, journaled_export_records, orphan_pane_ids
+from .orphans import (
+    export_orphan_record,
+    exported_session_records,
+    flush_pending_orphan_ops,
+    journaled_export_records,
+    orphan_pane_ids,
+)
 from .process import own_start_time
-from .remote_watcher import SnapshotBundle, sync_local_snapshot, sync_remote_endpoint
+from .remote_watcher import (
+    SnapshotBundle,
+    expire_unreachable_remotes,
+    mark_unconfigured_remotes,
+    sync_local_snapshot,
+    sync_remote_endpoint,
+)
 from .sender import (
     BACKGROUND_POLICY,
     Claim,
@@ -62,6 +74,7 @@ from .sender import (
     warm_step_a_probes,
 )
 from .sender.compensation import valid_entry as valid_compensation
+from .sender.step_a import mirror_pruned_records
 from .snapshot import ProcessSnapshot, take_snapshot
 from .vendor import pending_vendor_panes, resolve_vendor_cleanups, warm_fallback_probe
 
@@ -134,36 +147,47 @@ def _apply_lifecycle(
     cache_mgr: BoundedSessionCache,
     snap: ProcessSnapshot,
     snapshots: Optional[SnapshotBundle] = None,
-) -> Tuple[LifecycleReport, Exports, Exports]:
-    """(report, R12 horizon exports, R52 records whose orphan export is still owed)."""
+) -> Tuple[LifecycleReport, Exports, Exports, Exports]:
+    """(report, R12 horizon exports, R52 records whose orphan export is still owed, R12 cap-pruned exports)."""
     orphan_panes = orphan_pane_ids()  # read outside the cache lock (gap save-reads-orphans-under-lock)
     with cache_mgr as data:
         now = clock.time()
         report = apply_lifecycle(data, snap, now)
         cap_exports: List[Tuple[str, dict]] = []
-        if snapshots is not None and snap.herdr_alive:
+        if snapshots is not None:
             snap_wall = snapshots.fetched_at_wall or now
             snap_ns = snapshots.fetched_at_ns or clock.time_ns()
-            herdr_fn = lambda: snap.herdr_alive
-            if snapshots.local_snapshot is not None:
-                _, loc_exp = sync_local_snapshot(
-                    data, snapshots.local_snapshot, snap_wall, snap_ns, herdr_alive=herdr_fn
-                )
-                cap_exports.extend(loc_exp)
-            for endpoint, remote_snap in snapshots.remote_snapshots:
-                _, rem_exp = sync_remote_endpoint(
-                    data, endpoint, remote_snap, snap_wall, snap_ns, herdr_alive=herdr_fn
-                )
-                cap_exports.extend(rem_exp)
+            if snapshots.remotes_checked:
+                mark_unconfigured_remotes(data, snapshots.enabled_remote_hosts, snap_wall)
+            if snap.herdr_alive:
+                herdr_fn = lambda: snap.herdr_alive
+                if snapshots.local_snapshot is not None:
+                    _, loc_exp = sync_local_snapshot(
+                        data, snapshots.local_snapshot, snap_wall, snap_ns, herdr_alive=herdr_fn
+                    )
+                    cap_exports.extend(loc_exp)
+                for endpoint, remote_snap in snapshots.remote_snapshots:
+                    _, rem_exp = sync_remote_endpoint(
+                        data, endpoint, remote_snap, snap_wall, snap_ns, herdr_alive=herdr_fn
+                    )
+                    cap_exports.extend(rem_exp)
+        remote_expired = expire_unreachable_remotes(data, now)
+        if remote_expired:
+            report = LifecycleReport(
+                expired=report.expired + remote_expired,
+                resynced=report.resynced,
+                bartender_restarted=report.bartender_restarted,
+                herdr_restarted=report.herdr_restarted,
+            )
         for sid, record in data.get("sessions", {}).items():
             if isinstance(record, dict) and not record.get("salvaged"):
                 ensure_payload(sid, record)
-        if cap_exports:
-            journal_exports_before_save(data, tuple(cap_exports))
+        cap_tuple = tuple(cap_exports)
+        mirror_pruned_records(cap_tuple)
         exports = horizon_exports(data, now)
         owed = mirror_owed_records(data)
         cache_mgr.save(data, orphan_panes=orphan_panes)
-    return report, exports, owed
+    return report, exports, owed, cap_tuple
 
 
 def _evict_locked(cache_mgr: BoundedSessionCache, exported) -> Tuple[str, ...]:
@@ -313,7 +337,9 @@ def _reconcile(
     drain_compensations(cache_mgr, bridge_url, policy, between)
     queue_pending_vendor_cleanups(cache_mgr)
     snap = snap or take_snapshot(state_dir)
-    report, exports, owed = _apply_lifecycle(cache_mgr, snap, snapshots=snapshots)
+    report, exports, owed, cap_exports = _apply_lifecycle(cache_mgr, snap, snapshots=snapshots)
+    if cap_exports and not flush_pending_orphan_ops(blocking=policy.orphan_blocking):
+        touch_reconciler_pending()
     evicted = evict_exported_sessions(cache_mgr, exports, "12h past TTL, R12") if exports else ()
     owed = tuple((sid, record) for sid, record in owed if sid not in evicted)
     if owed:

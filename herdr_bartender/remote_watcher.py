@@ -3,21 +3,23 @@
 * ``collect_snapshots`` runs strictly OUTSIDE the cache lock: discovers enabled SSH
   remotes from ``endpoints.json`` (zero subprocesses when absent) and throttles local
   (10s) and remote (3s) ``herdr api snapshot`` queries.
-* ``sync_local_snapshot`` and ``sync_remote_endpoint`` are pure under-lock cache
-  synchronizers (zero subprocess, zero network, zero filesystem reads).
+* ``sync_local_snapshot``, ``sync_remote_endpoint``, ``mark_unconfigured_remotes``, and
+  ``expire_unreachable_remotes`` are pure under-lock cache synchronizers (zero subprocess,
+  zero network, zero filesystem reads).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from . import clock
 from .config import STATUS_MAP
 from .herdr_client import (
     RemoteEndpoint,
     _guard_lock_free,
+    disambiguate_remote_host,
     discover_enabled_remotes,
     fetch_herdr_snapshot,
 )
@@ -32,6 +34,7 @@ from .staging import stage_pane_close_result, stage_status
 REMOTE_UNREACHABLE_GRACE_SECONDS = 300.0
 REMOTE_POLL_SECONDS = 3.0
 LOCAL_SNAPSHOT_INTERVAL_SECONDS = 10.0
+SNAPSHOT_SYNC_EVENT = "snapshot.sync"
 _THROTTLE_TOLERANCE_SECONDS = 1e-3
 
 _last_local_fetch_mono: Optional[float] = None
@@ -43,6 +46,8 @@ class SnapshotBundle:
     local_snapshot: Optional[dict] = None
     remote_snapshots: Tuple[Tuple[RemoteEndpoint, Optional[dict]], ...] = ()
     remotes_configured: bool = False
+    enabled_remote_hosts: Tuple[str, ...] = ()
+    remotes_checked: bool = False
     fetched_at_wall: float = 0.0
     fetched_at_ns: int = 0
 
@@ -91,6 +96,7 @@ def collect_snapshots(
     _guard_lock_free()
     remotes = discover_fn()
     remotes_configured = bool(remotes)
+    enabled_hosts = tuple(ep.host for ep in remotes)
     fetched_wall = clock.time()
     fetched_ns = clock.time_ns()
     mono_now = clock.monotonic()
@@ -113,6 +119,8 @@ def collect_snapshots(
         local_snapshot=local_snap,
         remote_snapshots=tuple(remote_snaps),
         remotes_configured=remotes_configured,
+        enabled_remote_hosts=enabled_hosts,
+        remotes_checked=True,
         fetched_at_wall=fetched_wall,
         fetched_at_ns=fetched_ns,
     )
@@ -242,26 +250,86 @@ def sync_local_snapshot(
             rec["desired_state"] = new_state
             rec["agent"] = new_agent
             rec["raw_agent"] = raw_ag or rec.get("raw_agent")
-            if (new_state, new_agent, new_title, new_cwd) != (old_state, old_agent, old_title, old_cwd):
-                seq = int(rec.get("seq", 0) or 0) + 1
-                rec["seq"] = seq
-                rec["desired_payload"] = {
-                    "state": new_state,
-                    "agent": new_agent,
-                    "session_id": sid,
-                    "title": new_title,
-                    "cwd": new_cwd,
-                    "terminal": "Herdr",
-                    "event": "pane.agent_status_changed",
-                    "seq": seq,
-                }
-                rec["delivery_status"] = "in_flight"
-                rec["delivery_error"] = None
-                rec["delivery_attempts"] = 0
-                rec["next_retry_at"] = None
+            if new_state != old_state:
+                rec["last_event_at"] = now_wall
+            seq = int(rec.get("seq", 0) or 0) + 1
+            rec["seq"] = seq
+            rec["desired_payload"] = {
+                "state": new_state,
+                "agent": new_agent,
+                "session_id": sid,
+                "title": new_title,
+                "cwd": new_cwd,
+                "terminal": "Herdr",
+                "event": SNAPSHOT_SYNC_EVENT,
+                "seq": seq,
+            }
+            rec["delivery_status"] = "in_flight"
+            rec["delivery_error"] = None
+            rec["delivery_attempts"] = 0
+            rec["next_retry_at"] = None
             changed = True
 
     return changed, tuple(exports)
+
+
+def _has_live_for_host(sessions: Mapping, host: str) -> bool:
+    return any(isinstance(rec, Mapping) and is_live(rec) and rec.get("host") == host for rec in sessions.values())
+
+
+def mark_unconfigured_remotes(
+    data: dict,
+    enabled_remote_hosts: Iterable[str],
+    now_wall: float,
+) -> bool:
+    """Stamp ``remote_unreachable_since`` for any cached live remote host no longer enabled in ``endpoints.json``."""
+    local_host = resolve_host(data.get("host"))
+    enabled = {
+        disambiguate_remote_host(h, h, local_host)
+        for h in enabled_remote_hosts
+        if isinstance(h, str) and h
+    }
+    sessions = data.get("sessions", {})
+    if not isinstance(sessions, Mapping) or not sessions:
+        return False
+    unreach = data.setdefault("remote_unreachable_since", {})
+    changed = False
+    for rec in sessions.values():
+        if not isinstance(rec, Mapping) or not is_live(rec):
+            continue
+        rec_host = rec.get("host")
+        if not isinstance(rec_host, str) or is_local_host(rec_host, local_host):
+            continue
+        if rec_host not in enabled and number(unreach.get(rec_host)) is None:
+            unreach[rec_host] = now_wall
+            changed = True
+    return changed
+
+
+def expire_unreachable_remotes(data: dict, now_wall: float) -> Tuple[str, ...]:
+    """Expire live sessions on any remote host unreachable for > 300s and prune drained entries."""
+    unreach = data.get("remote_unreachable_since")
+    if not isinstance(unreach, dict) or not unreach:
+        return ()
+    sessions = data.get("sessions", {})
+    expired: List[str] = []
+    for host, since_raw in list(unreach.items()):
+        if not _has_live_for_host(sessions, host):
+            unreach.pop(host, None)
+            continue
+        since = number(since_raw)
+        if since is None or since > now_wall:
+            unreach[host] = now_wall
+            continue
+        if now_wall - since <= REMOTE_UNREACHABLE_GRACE_SECONDS:
+            continue
+        for sid, rec in list(sessions.items()):
+            if isinstance(rec, dict) and is_live(rec) and rec.get("host") == host:
+                expire_session(sid, rec, now_wall, "remote_unreachable")
+                expired.append(sid)
+        if not _has_live_for_host(sessions, host):
+            unreach.pop(host, None)
+    return tuple(expired)
 
 
 def sync_remote_endpoint(
@@ -274,31 +342,38 @@ def sync_remote_endpoint(
     herdr_alive: Callable[[], bool] = lambda: True,
 ) -> Tuple[bool, Tuple[Tuple[str, dict], ...]]:
     """Reconcile one remote SSH endpoint's snapshot (with 300s flap tolerance) under the cache lock."""
+    local_host = resolve_host(data.get("host"))
+    eff_host = disambiguate_remote_host(endpoint.host, endpoint.id, local_host)
+
     if not isinstance(snapshot, Mapping) or not isinstance(snapshot.get("panes"), list):
+        sessions = data.get("sessions", {})
         unreach = data.setdefault("remote_unreachable_since", {})
-        since = number(unreach.get(endpoint.host))
+        if not _has_live_for_host(sessions, eff_host):
+            popped = unreach.pop(eff_host, None) is not None
+            return popped, ()
+        since = number(unreach.get(eff_host))
         if since is None or since > now_wall:
-            unreach[endpoint.host] = now_wall
+            unreach[eff_host] = now_wall
             return True, ()
         if now_wall - since <= REMOTE_UNREACHABLE_GRACE_SECONDS:
             return False, ()
         expired_any = False
-        for sid, rec in list(data.get("sessions", {}).items()):
-            if isinstance(rec, dict) and is_live(rec) and rec.get("host") == endpoint.host:
+        for sid, rec in list(sessions.items()):
+            if isinstance(rec, dict) and is_live(rec) and rec.get("host") == eff_host:
                 expire_session(sid, rec, now_wall, "remote_unreachable")
                 expired_any = True
+        if not _has_live_for_host(sessions, eff_host):
+            unreach.pop(eff_host, None)
         return expired_any, ()
 
     unreach_map = data.get("remote_unreachable_since")
     changed = False
-    if isinstance(unreach_map, dict) and endpoint.host in unreach_map:
-        unreach_map.pop(endpoint.host, None)
+    if isinstance(unreach_map, dict) and eff_host in unreach_map:
+        unreach_map.pop(eff_host, None)
         changed = True
 
     ws_labels = _workspace_labels(snapshot)
     focused_ctx = {"focused_pane_id": snapshot.get("focused_pane_id")}
-    local_host = resolve_host(data.get("host"))
-    remote_host_arg = endpoint.host if endpoint.host != local_host else None
     active_panes: set[str] = set()
     exports: List[Tuple[str, dict]] = []
 
@@ -315,7 +390,7 @@ def sync_remote_endpoint(
             continue
 
         active_panes.add(ident.canonical_pane)
-        sid = build_session_id(endpoint.host, ident.canonical_pane)
+        sid = build_session_id(eff_host, ident.canonical_pane)
         if not sid:
             continue
 
@@ -337,7 +412,7 @@ def sync_remote_endpoint(
         )
         raw_tab = container_id(p, "tab_id")
         effective_tab = raw_tab or (container_id(existing, "tab_id") if existing_live else None)
-        agent_name = format_agent_name(raw_ag, remote_host=remote_host_arg, display_agent=p.get("display_agent"))
+        agent_name = format_agent_name(raw_ag, remote_host=eff_host, display_agent=p.get("display_agent"))
 
         if existing_live and (
             existing.get("desired_state"),
@@ -357,7 +432,7 @@ def sync_remote_endpoint(
         ev_data: dict = {
             "pane_id": ident.canonical_pane,
             "workspace_id": ident.workspace_id,
-            "host": endpoint.host,
+            "host": eff_host,
             "agent": raw_ag,
             "display_agent": p.get("display_agent"),
             "agent_status": raw_st,
@@ -385,7 +460,7 @@ def sync_remote_endpoint(
     for sid, rec in list(data.get("sessions", {}).items()):
         if not isinstance(rec, dict) or not is_live(rec):
             continue
-        if rec.get("host") != endpoint.host:
+        if rec.get("host") != eff_host:
             continue
         pane_id = rec.get("pane_id")
         if not isinstance(pane_id, str) or not pane_id or pane_id in active_panes:
@@ -397,7 +472,7 @@ def sync_remote_endpoint(
             {
                 "pane_id": pane_id,
                 "workspace_id": rec.get("workspace_id") or pane_id.split(":", 1)[0],
-                "host": endpoint.host,
+                "host": eff_host,
             },
             close_ns,
             herdr_alive=herdr_alive,
@@ -412,9 +487,12 @@ __all__ = [
     "LOCAL_SNAPSHOT_INTERVAL_SECONDS",
     "REMOTE_POLL_SECONDS",
     "REMOTE_UNREACHABLE_GRACE_SECONDS",
+    "SNAPSHOT_SYNC_EVENT",
     "SnapshotBundle",
     "collect_snapshots",
+    "expire_unreachable_remotes",
     "has_local_live_sessions",
+    "mark_unconfigured_remotes",
     "reset_watcher_timers",
     "sync_local_snapshot",
     "sync_remote_endpoint",

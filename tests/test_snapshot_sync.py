@@ -11,7 +11,11 @@ from herdr_bartender.handlers import handle_agent_status_changed
 from herdr_bartender.herdr_client import fetch_herdr_snapshot
 from herdr_bartender.hooks import default_agy_hooks_config_path
 from herdr_bartender.reconciler import reconcile_active_sessions
-from herdr_bartender.remote_watcher import SnapshotBundle, reset_watcher_timers, sync_local_snapshot
+from herdr_bartender.remote_watcher import (
+    SNAPSHOT_SYNC_EVENT,
+    SnapshotBundle,
+    reset_watcher_timers,
+)
 from tests.support import SandboxTestCase
 from tests.support.reconciler_fixtures import pane_file, read_cache
 
@@ -30,7 +34,13 @@ class LocalSnapshotSelfHealingTests(SandboxTestCase):
         reset_watcher_timers()
         self.addCleanup(reset_watcher_timers)
 
-    def _local_bundle(self, snap: dict, *, fetched_ns: int | None = None, fetched_wall: float | None = None) -> SnapshotBundle:
+    def _local_bundle(
+        self,
+        snap: dict,
+        *,
+        fetched_ns: int | None = None,
+        fetched_wall: float | None = None,
+    ) -> SnapshotBundle:
         return SnapshotBundle(
             local_snapshot=snap,
             remote_snapshots=(),
@@ -93,6 +103,7 @@ class LocalSnapshotSelfHealingTests(SandboxTestCase):
         self.assertEqual(posts[0]["cwd"], "/Users/voodoo/Projects/herdr-bartender")
         self.assertEqual(posts[0]["title"], "herdr-bartender")
         self.assertEqual(posts[0]["state"], "Working")
+        self.assertEqual(posts[0]["event"], SNAPSHOT_SYNC_EVENT)
         self.assertEqual(posts[0]["seq"], 2)
 
         updated = read_cache(self.cache_mgr)["sessions"][sid]
@@ -112,6 +123,150 @@ class LocalSnapshotSelfHealingTests(SandboxTestCase):
         )
         self.assertEqual(self.bridge.posts(), [])
         self.assertEqual(read_cache(self.cache_mgr)["sessions"][sid]["seq"], 2)
+
+    def test_sync_local_snapshot_tab_only_refresh_and_waiting_to_working_ttl_reset(self) -> None:
+        handle_agent_status_changed(
+            {
+                "pane_id": "w1:pTab",
+                "workspace_id": "w1",
+                "tab_id": "w1:t1",
+                "agent": "claude",
+                "agent_status": "blocked",
+                "title": "Awaiting approval",
+                "cwd": "/Users/voodoo/Projects/repo",
+            },
+            {},
+            bridge_url=self.mock_url,
+        )
+        sid = self.sid("w1:pTab")
+        self.bridge.requests.clear()
+
+        # 1. tab_id-only change increments seq, sets event="snapshot.sync", and delivers.
+        self.clock.advance(10.0)
+        tab_snap = {
+            "panes": [
+                {
+                    "pane_id": "w1:pTab",
+                    "workspace_id": "w1",
+                    "tab_id": "w1:t9",
+                    "agent": "claude",
+                    "agent_status": "blocked",
+                    "title": "Awaiting approval",
+                    "cwd": "/Users/voodoo/Projects/repo",
+                }
+            ]
+        }
+        reconcile_active_sessions(
+            self.state_dir,
+            bridge_url=self.mock_url,
+            snapshots=self._local_bundle(tab_snap),
+        )
+        posts = self.bridge.posts()
+        self.assertEqual(len(posts), 1, posts)
+        self.assertEqual(posts[0]["event"], SNAPSHOT_SYNC_EVENT)
+        self.assertEqual(posts[0]["seq"], 2)
+        self.assertEqual(read_cache(self.cache_mgr)["sessions"][sid]["tab_id"], "w1:t9")
+
+        # 2. Advance 50,000s (~13.9h: valid under Waiting's 48h TTL, > Working's 12h TTL) and heal to Working.
+        self.bridge.requests.clear()
+        self.clock.advance(50_000.0)
+        heal_time = self.clock.time()
+        working_snap = {
+            "panes": [
+                {
+                    "pane_id": "w1:pTab",
+                    "workspace_id": "w1",
+                    "tab_id": "w1:t9",
+                    "agent": "claude",
+                    "agent_status": "working",
+                    "title": "Awaiting approval",
+                    "cwd": "/Users/voodoo/Projects/repo",
+                }
+            ]
+        }
+        reconcile_active_sessions(
+            self.state_dir,
+            bridge_url=self.mock_url,
+            snapshots=self._local_bundle(working_snap),
+        )
+        posts = self.bridge.posts()
+        self.assertEqual(len(posts), 1, posts)
+        self.assertEqual(posts[0]["state"], "Working")
+        self.assertEqual(posts[0]["event"], SNAPSHOT_SYNC_EVENT)
+        self.assertEqual(posts[0]["seq"], 3)
+        self.assertEqual(read_cache(self.cache_mgr)["sessions"][sid]["last_event_at"], heal_time)
+
+        # Next pass 60s later must NOT expire the newly healed Working session via the old Waiting timestamp!
+        self.bridge.requests.clear()
+        self.clock.advance(60.0)
+        reconcile_active_sessions(self.state_dir, bridge_url=self.mock_url)
+        self.assertEqual(self.bridge.posts(), [])
+        self.assertEqual(read_cache(self.cache_mgr)["sessions"][sid]["desired_state"], "Working")
+
+    def test_sync_local_snapshot_respects_last_arrival_ns_race_guard_on_existing_pane(self) -> None:
+        handle_agent_status_changed(
+            {
+                "pane_id": "w1:pRace",
+                "workspace_id": "w1",
+                "agent": "claude",
+                "agent_status": "working",
+                "title": "Old title",
+                "cwd": "/tmp/old",
+            },
+            {},
+            bridge_url=self.mock_url,
+        )
+        sid = self.sid("w1:pRace")
+
+        # Snapshot begins at t+5s before the live blocked event arrives.
+        self.clock.advance(5.0)
+        snap_wall = self.clock.time()
+        snap_ns = self.clock.time_ns()
+
+        # At t+6s (> snap_ns), a live event updates the existing session (admitted_at_ns < snap_ns < last_arrival_ns).
+        self.clock.advance(1.0)
+        handle_agent_status_changed(
+            {
+                "pane_id": "w1:pRace",
+                "workspace_id": "w1",
+                "agent": "claude",
+                "agent_status": "blocked",
+                "title": "Fresh live title",
+                "cwd": "/tmp/fresh",
+            },
+            {},
+            bridge_url=self.mock_url,
+        )
+        self.bridge.requests.clear()
+
+        # Both metadata-overwrite and idle-shell-exit snapshots predating last_arrival_ns must be ignored!
+        for stale_pane in (
+            {
+                "pane_id": "w1:pRace",
+                "workspace_id": "w1",
+                "agent": "claude",
+                "agent_status": "working",
+                "title": "Stale snapshot title",
+                "cwd": "/tmp/stale",
+            },
+            {
+                "pane_id": "w1:pRace",
+                "workspace_id": "w1",
+                "agent": None,
+                "agent_status": "idle",
+            },
+        ):
+            reconcile_active_sessions(
+                self.state_dir,
+                bridge_url=self.mock_url,
+                snapshots=self._local_bundle({"panes": [stale_pane]}, fetched_ns=snap_ns, fetched_wall=snap_wall),
+            )
+            self.assertEqual(self.bridge.posts(), [])
+            rec = read_cache(self.cache_mgr)["sessions"][sid]
+            self.assertEqual(rec["desired_state"], "Waiting")
+            self.assertEqual(rec["title"], "Fresh live title")
+            self.assertEqual(rec["cwd"], "/tmp/fresh")
+            self.assertEqual(rec["seq"], 2)
 
     def test_sync_local_snapshot_closes_missing_pane_but_preserves_session_admitted_after_snapshot_ns(self) -> None:
         # Admit w1:pGone BEFORE snapshot_ns
@@ -201,7 +356,6 @@ class CliManifestAndHookWiringTests(SandboxTestCase):
     start_bridge = True
 
     def test_cli_dispatches_pane_moved_and_pane_exited(self) -> None:
-        # 1. Admit initial session on w1:p1
         admit = {
             "event": "pane.agent_status_changed",
             "data": {
@@ -219,7 +373,6 @@ class CliManifestAndHookWiringTests(SandboxTestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn(self.sid("w1:p1"), read_cache(self.cache_mgr)["sessions"])
 
-        # 2. Dispatch pane.moved (w1:p1 -> w2:p1) via CLI
         moved = {
             "event": "pane.moved",
             "data": {
@@ -245,7 +398,6 @@ class CliManifestAndHookWiringTests(SandboxTestCase):
         self.assertIn(self.sid("w2:p1"), sessions)
         self.assertEqual(sessions[self.sid("w2:p1")]["cwd"], "/Users/test/repo-v2")
 
-        # 3. Dispatch pane.exited on w2:p1 via CLI
         exited = {
             "event": "pane.exited",
             "data": {"pane_id": "w2:p1", "workspace_id": "w2"},
@@ -261,19 +413,16 @@ class CliManifestAndHookWiringTests(SandboxTestCase):
 
     def test_install_agy_hook_and_health_reporting(self) -> None:
         self.vendor_hooks_dir.mkdir(parents=True, exist_ok=True)
-        # Before installing: agy_hook_intact is False ("missing")
         h1 = json.loads(self.run_cli("--health").stdout)
         self.assertIs(h1["agy_hook_intact"], False)
         self.assertEqual(h1["agy_hook_status"], "missing")
         self.assertNotIn("agy_hooks_json_warnings", h1)
 
-        # Install via --install-agy-hook
         inst = self.run_cli("--install-agy-hook")
         self.assertEqual(inst.returncode, 0, inst.stdout + inst.stderr)
         deployed = self.vendor_hooks_dir / AGY_HOOK_NAME
         self.assertEqual(deployed.read_bytes(), agy_source_path().read_bytes())
 
-        # Seed PreToolUse warning in hooks.json and verify --health reports intact + warning
         cfg_path: Path = default_agy_hooks_config_path()
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(
@@ -286,7 +435,6 @@ class CliManifestAndHookWiringTests(SandboxTestCase):
         self.assertEqual(h2["agy_hooks_json_warnings"], [PRE_TOOL_USE_WARNING])
 
     def test_status_reports_bridge_drift_and_preserves_review_warning_on_line_zero(self) -> None:
-        # Inject 2 phantom zombie sessions directly on MockBridge (0 tracked locally) + HOOK_NEEDS_REVIEW
         self.bridge.sessions["phantom-1"] = {"state": "Working"}
         self.bridge.sessions["phantom-2"] = {"state": "Working"}
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -305,6 +453,21 @@ class CliManifestAndHookWiringTests(SandboxTestCase):
         self.assertEqual(lines[0], REVIEW_WARNING)
         self.assertIn(f"[WARNING] {PRE_TOOL_USE_WARNING}", lines)
         self.assertIn("Bridge sessions: 2 (tracked delivered: 0)", lines)
+
+    def test_status_succeeds_cleanly_when_bartender_is_down_or_unreachable(self) -> None:
+        # 1. Bartender running, bridge listener stopped (unreachable)
+        self.bridge.stop()
+        res_unreach = self.run_cli("--status")
+        self.assertEqual(res_unreach.returncode, 0, res_unreach.stderr)
+        self.assertIn("Active sessions: 0", res_unreach.stdout)
+        self.assertNotIn("Bridge sessions:", res_unreach.stdout)
+
+        # 2. Bartender process absent
+        self.clear_fake_processes()
+        res_absent = self.run_cli("--status")
+        self.assertEqual(res_absent.returncode, 0, res_absent.stderr)
+        self.assertIn("Active sessions: 0", res_absent.stdout)
+        self.assertNotIn("Bridge sessions:", res_absent.stdout)
 
 
 if __name__ == "__main__":

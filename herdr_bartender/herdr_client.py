@@ -11,11 +11,11 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 from . import boundedio, jsonsafe, runtime
 from .log import log_debug
-from .sanitize import sanitize_hostname
+from .sanitize import HOST_MAX, sanitize_hostname, sanitized_hostname
 
 ENDPOINTS_MAX_BYTES = 262144
 DEFAULT_SNAPSHOT_TIMEOUT = 2.5
@@ -28,6 +28,26 @@ class RemoteEndpoint:
     host: str
     machine_arg: str
     label: str
+
+
+def disambiguate_remote_host(
+    raw_host: object,
+    endpoint_id: object,
+    local_host: str,
+    seen_hosts: Optional[Set[str]] = None,
+) -> str:
+    """Sanitize a remote hostname and ensure it never collides with ``local_host`` (<= 32 chars, HOST_RE)."""
+    clean = sanitize_hostname(raw_host)
+    if clean != local_host:
+        return clean
+    candidate = f"{clean[:HOST_MAX - 7]}-remote"
+    if candidate != local_host and (seen_hosts is None or candidate not in seen_hosts):
+        return candidate
+    suffix = sanitize_hostname(endpoint_id)[:6] or "ssh"
+    alt = f"{clean[:HOST_MAX - 1 - len(suffix)]}-{suffix}"
+    if alt != local_host and (seen_hosts is None or alt not in seen_hosts):
+        return alt
+    return f"{clean[:HOST_MAX - 5]}-rem2"
 
 
 def _guard_lock_free() -> None:
@@ -81,6 +101,7 @@ def discover_enabled_remotes(
 
     endpoints: List[RemoteEndpoint] = []
     seen_hosts: set[str] = set()
+    local_host = sanitized_hostname()
     for entry in ssh_entries:
         if not isinstance(entry, dict) or entry.get("enabled") is not True:
             continue
@@ -103,7 +124,8 @@ def discover_enabled_remotes(
         raw_label = entry.get("label")
         label = raw_label.strip()[:MAX_MACHINE_ARG_LEN] if isinstance(raw_label, str) and raw_label.strip() else ""
         target_str = raw_target.strip() if isinstance(raw_target, str) and raw_target.strip() else ""
-        host = sanitize_hostname(label or target_str or ep_id)
+        raw_host = label or target_str or ep_id
+        host = disambiguate_remote_host(raw_host, ep_id, local_host, seen_hosts=seen_hosts)
         if host in seen_hosts:
             continue
         seen_hosts.add(host)
@@ -168,6 +190,7 @@ __all__ = [
     "DEFAULT_SNAPSHOT_TIMEOUT",
     "ENDPOINTS_MAX_BYTES",
     "RemoteEndpoint",
+    "disambiguate_remote_host",
     "discover_enabled_remotes",
     "endpoints_file_path",
     "fetch_herdr_snapshot",

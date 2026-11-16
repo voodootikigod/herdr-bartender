@@ -9,15 +9,18 @@ from pathlib import Path
 from unittest import mock
 
 from herdr_bartender import runtime
-from herdr_bartender.background import run_reconcile_background
+from herdr_bartender.cache import SESSION_CAP
 from herdr_bartender.handlers import handle_agent_status_changed
 from herdr_bartender.herdr_client import (
     RemoteEndpoint,
+    disambiguate_remote_host,
     discover_enabled_remotes,
     endpoints_file_path,
     fetch_herdr_snapshot,
 )
-from herdr_bartender.markers import touch_pane_marker
+from herdr_bartender.intake import HOST_RE
+from herdr_bartender.orphans import read_orphan_records
+from herdr_bartender.paths import get_orphan_path
 from herdr_bartender.reconciler import reconcile_active_sessions
 from herdr_bartender.remote_watcher import (
     REMOTE_POLL_SECONDS,
@@ -25,11 +28,11 @@ from herdr_bartender.remote_watcher import (
     SnapshotBundle,
     collect_snapshots,
     reset_watcher_timers,
-    sync_remote_endpoint,
 )
 from herdr_bartender.schedule import cache_view
+from herdr_bartender.sender.step_a import OrphanMirrorError
 from tests.support import SandboxTestCase
-from tests.support.reconciler_fixtures import LoopRunner, pane_file, read_cache
+from tests.support.reconciler_fixtures import LoopRunner, pane_file, read_cache, seed, session
 
 
 def _remote_4_agent_snapshot(*, include_p2: bool = True) -> dict:
@@ -172,6 +175,28 @@ class EndpointDiscoveryTests(SandboxTestCase):
             ),
         )
 
+    def test_disambiguates_remote_colliding_with_local_host(self) -> None:
+        self._write_endpoints(
+            {
+                "ssh": [
+                    {"id": "ep-same-1", "target": "10.0.0.10", "label": self.host, "enabled": True},
+                    {"id": "ep-same-2", "target": "10.0.0.11", "label": self.host, "enabled": True},
+                ]
+            }
+        )
+        remotes = discover_enabled_remotes()
+        self.assertEqual(len(remotes), 2)
+        for ep in remotes:
+            self.assertNotEqual(ep.host, self.host)
+            self.assertRegex(ep.host, HOST_RE)
+        self.assertNotEqual(remotes[0].host, remotes[1].host)
+
+        # Edge case: 32-char local_host already ending in "-remote"
+        tricky_local = "a" * 25 + "-remote"
+        disambig = disambiguate_remote_host(tricky_local, "ep99", tricky_local)
+        self.assertNotEqual(disambig, tricky_local)
+        self.assertRegex(disambig, HOST_RE)
+
     def test_symlink_endpoints_file_is_rejected(self) -> None:
         real_file = self.tmp / "outside-endpoints.json"
         real_file.write_text(
@@ -213,12 +238,20 @@ class RemoteWatcherEndToEndTests(SandboxTestCase):
             machine_arg="dev-one.taildd69d8.ts.net",
             label="",
         )
+        self.dev_two = RemoteEndpoint(
+            id="ep-dev-two",
+            host="dev-two",
+            machine_arg="dev-two.taildd69d8.ts.net",
+            label="",
+        )
 
     def _bundle(self, snap: dict | None) -> SnapshotBundle:
         return SnapshotBundle(
             local_snapshot=None,
             remote_snapshots=((self.dev_one, snap),),
             remotes_configured=True,
+            enabled_remote_hosts=(self.dev_one.host,),
+            remotes_checked=True,
             fetched_at_wall=self.clock.time(),
             fetched_at_ns=self.clock.time_ns(),
         )
@@ -356,8 +389,219 @@ class RemoteWatcherEndToEndTests(SandboxTestCase):
 
         final_cache = read_cache(self.cache_mgr)
         self.assertEqual(set(final_cache["sessions"]), {local_sid})
+        self.assertNotIn("dev-one", final_cache["remote_unreachable_since"])
         self.assertEqual(final_cache["sessions"][local_sid]["desired_state"], "Working")
         self.assertTrue(local_marker.exists(), "local w18:p1 marker stays intact after remote w18:p1 expired")
+
+    def test_multi_remote_isolation_unconditional_wake_expiry_and_disabled_remote_cleanup(self) -> None:
+        snap_one = {"panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "agent": "agy", "agent_status": "working"}]}
+        snap_two = {"panes": [{"pane_id": "w2:p1", "workspace_id": "w2", "agent": "claude", "agent_status": "working"}]}
+
+        # Admit both dev-one and dev-two.
+        reconcile_active_sessions(
+            self.state_dir,
+            bridge_url=self.mock_url,
+            snapshots=SnapshotBundle(
+                remote_snapshots=((self.dev_one, snap_one), (self.dev_two, snap_two)),
+                remotes_configured=True,
+                enabled_remote_hosts=("dev-one", "dev-two"),
+                remotes_checked=True,
+                fetched_at_wall=self.clock.time(),
+                fetched_at_ns=self.clock.time_ns(),
+            ),
+        )
+        self.assertEqual(
+            set(read_cache(self.cache_mgr)["sessions"]),
+            {"herdr:dev-one:w1:p1", "herdr:dev-two:w2:p1"},
+        )
+        self.bridge.requests.clear()
+
+        # Disconnect ONLY dev-one at t+10s.
+        self.clock.advance(10.0)
+        reconcile_active_sessions(
+            self.state_dir,
+            bridge_url=self.mock_url,
+            snapshots=SnapshotBundle(
+                remote_snapshots=((self.dev_one, None), (self.dev_two, snap_two)),
+                remotes_configured=True,
+                enabled_remote_hosts=("dev-one", "dev-two"),
+                remotes_checked=True,
+                fetched_at_wall=self.clock.time(),
+                fetched_at_ns=self.clock.time_ns(),
+            ),
+        )
+        self.assertEqual(self.bridge.posts(), [])
+
+        # Simulate the 300.001s scheduled wake pass (0.5s after a 300.0s poll) where collect_snapshots
+        # is throttled and passes remote_snapshots=() — expire_unreachable_remotes MUST still fire!
+        self.clock.advance(REMOTE_UNREACHABLE_GRACE_SECONDS + 0.5)
+        reconcile_active_sessions(
+            self.state_dir,
+            bridge_url=self.mock_url,
+            snapshots=SnapshotBundle(
+                remote_snapshots=(),
+                remotes_configured=True,
+                enabled_remote_hosts=("dev-one", "dev-two"),
+                remotes_checked=True,
+                fetched_at_wall=self.clock.time(),
+                fetched_at_ns=self.clock.time_ns(),
+            ),
+        )
+        posts = self.bridge.posts()
+        self.assertEqual([p["session_id"] for p in posts], ["herdr:dev-one:w1:p1"])
+        self.assertEqual(posts[0]["state"], "Ended")
+        mid_cache = read_cache(self.cache_mgr)
+        self.assertNotIn("dev-one", mid_cache["remote_unreachable_since"])
+        self.assertEqual(set(mid_cache["sessions"]), {"herdr:dev-two:w2:p1"})
+
+        # Now disable/remove dev-two in endpoints.json (enabled_remote_hosts=(), remotes_checked=True).
+        self.bridge.requests.clear()
+        self.clock.advance(3.0)
+        disabled_t0 = self.clock.time()
+        reconcile_active_sessions(
+            self.state_dir,
+            bridge_url=self.mock_url,
+            snapshots=SnapshotBundle(
+                remote_snapshots=(),
+                remotes_configured=False,
+                enabled_remote_hosts=(),
+                remotes_checked=True,
+                fetched_at_wall=disabled_t0,
+                fetched_at_ns=self.clock.time_ns(),
+            ),
+        )
+        self.assertEqual(self.bridge.posts(), [])
+        self.assertEqual(read_cache(self.cache_mgr)["remote_unreachable_since"].get("dev-two"), disabled_t0)
+
+        self.clock.advance(REMOTE_UNREACHABLE_GRACE_SECONDS + 1.0)
+        reconcile_active_sessions(self.state_dir, bridge_url=self.mock_url)
+        end_posts = self.bridge.posts()
+        self.assertEqual([p["session_id"] for p in end_posts], ["herdr:dev-two:w2:p1"])
+        self.assertEqual(end_posts[0]["state"], "Ended")
+        after_all = read_cache(self.cache_mgr)
+        self.assertEqual(after_all["sessions"], {})
+        self.assertEqual(after_all["remote_unreachable_since"], {})
+
+    def test_remote_local_hostname_collision_disambiguates_and_preserves_local_isolation(self) -> None:
+        handle_agent_status_changed(
+            {
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "agent": "claude",
+                "agent_status": "working",
+                "title": "Local Mac session",
+            },
+            {},
+            bridge_url=self.mock_url,
+        )
+        local_sid = self.sid("w1:p1")
+        local_marker = pane_file(self.state_dir, "w1:p1")
+        self.assertTrue(local_marker.exists())
+        self.bridge.requests.clear()
+
+        # Pass a RemoteEndpoint whose host collides directly with self.host!
+        colliding_ep = RemoteEndpoint(
+            id="ep-collide",
+            host=self.host,
+            machine_arg="10.0.0.55",
+            label=self.host,
+        )
+        expected_remote_host = disambiguate_remote_host(self.host, "ep-collide", self.host)
+        self.assertNotEqual(expected_remote_host, self.host)
+        remote_sid = f"herdr:{expected_remote_host}:w1:p1"
+
+        self.clock.advance(3.0)
+        reconcile_active_sessions(
+            self.state_dir,
+            bridge_url=self.mock_url,
+            snapshots=SnapshotBundle(
+                remote_snapshots=(
+                    (
+                        colliding_ep,
+                        {"panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "agent": "agy", "agent_status": "working"}]},
+                    ),
+                ),
+                remotes_configured=True,
+                enabled_remote_hosts=(expected_remote_host,),
+                remotes_checked=True,
+                fetched_at_wall=self.clock.time(),
+                fetched_at_ns=self.clock.time_ns(),
+            ),
+        )
+        posts = self.bridge.posts()
+        self.assertEqual(len(posts), 1, posts)
+        self.assertEqual(posts[0]["session_id"], remote_sid)
+        self.assertEqual(posts[0]["agent"], f"Antigravity (Herdr \u00b7 {expected_remote_host})")
+
+        # Close remote w1:p1 -> local marker and local w1:p1 session must remain 100% untouched!
+        self.bridge.requests.clear()
+        self.clock.advance(3.0)
+        reconcile_active_sessions(
+            self.state_dir,
+            bridge_url=self.mock_url,
+            snapshots=SnapshotBundle(
+                remote_snapshots=((colliding_ep, {"panes": []}),),
+                remotes_configured=True,
+                enabled_remote_hosts=(expected_remote_host,),
+                remotes_checked=True,
+                fetched_at_wall=self.clock.time(),
+                fetched_at_ns=self.clock.time_ns(),
+            ),
+        )
+        close_posts = self.bridge.posts()
+        self.assertEqual([p["session_id"] for p in close_posts], [remote_sid])
+        self.assertEqual(close_posts[0]["state"], "Ended")
+        self.assertTrue(local_marker.exists())
+        self.assertEqual(set(read_cache(self.cache_mgr)["sessions"]), {local_sid})
+
+    def test_cap_eviction_orphan_exports_durability_and_rollback_on_journal_failure(self) -> None:
+        now = self.clock.time()
+        seeded = {
+            self.sid(f"w1:pLive{i}"): session(f"w1:pLive{i}", "Working", now=now + i * 0.01)
+            for i in range(SESSION_CAP - 1)
+        }
+        ended_sid = self.sid("w1:pOwedEnded")
+        seeded[ended_sid] = session(
+            "w1:pOwedEnded",
+            "Ended",
+            seq=2,
+            delivered=False,
+            now=now - 100.0,
+            delivery_status="retryable_exhausted",
+        )
+        self.assertEqual(len(seeded), SESSION_CAP)
+        seed(self.cache_mgr, seeded)
+
+        new_remote_snap = SnapshotBundle(
+            remote_snapshots=(
+                (
+                    self.dev_one,
+                    {"panes": [{"pane_id": "w9:p257", "workspace_id": "w9", "agent": "agy", "agent_status": "working"}]},
+                ),
+            ),
+            remotes_configured=True,
+            enabled_remote_hosts=("dev-one",),
+            remotes_checked=True,
+            fetched_at_wall=now + 10.0,
+            fetched_at_ns=int((now + 10.0) * 1e9),
+        )
+
+        # 1. Journal failure raises OrphanMirrorError BEFORE cache_mgr.save: no data loss!
+        with mock.patch("herdr_bartender.sender.step_a.journal_orphan_exports", side_effect=OSError("disk full")):
+            with self.assertRaises(OrphanMirrorError):
+                reconcile_active_sessions(self.state_dir, bridge_url=self.mock_url, snapshots=new_remote_snap)
+        self.assertEqual(self.bridge.posts(), [])
+        intact_sessions = read_cache(self.cache_mgr)["sessions"]
+        self.assertIn(ended_sid, intact_sessions, "undelivered Ended stays intact on disk when journaling fails")
+        self.assertNotIn("herdr:dev-one:w9:p257", intact_sessions)
+
+        # 2. Normal run journals before save, folds into orphan file outside lock, and delivers the 257th session!
+        reconcile_active_sessions(self.state_dir, bridge_url=self.mock_url, snapshots=new_remote_snap)
+        orphans = read_orphan_records(get_orphan_path())
+        self.assertIn(ended_sid, orphans)
+        self.assertEqual(orphans[ended_sid]["desired_state"], "Ended")
+        self.assertIs(orphans[ended_sid]["orphaned_ended"], True)
+        self.assertEqual([p["session_id"] for p in self.bridge.posts()], ["herdr:dev-one:w9:p257"])
 
     def test_background_loop_polls_configured_remotes_every_3s_without_premature_idle_exit(self) -> None:
         ep_path = endpoints_file_path()
@@ -383,7 +627,6 @@ class RemoteWatcherEndToEndTests(SandboxTestCase):
         runner = LoopRunner(self.state_dir, stop=lambda: self.clock.time() - start >= 70.0, max_passes=50)
         runner.run(bridge_url=self.mock_url)
 
-        # Past the 60s idle window, the loop kept running until our 70s stop condition (did NOT idle-exit!).
         self.assertGreaterEqual(self.clock.time() - start, 70.0)
         self.assertTrue((self.state_dir / "DISABLED").exists(), "stopped by LoopRunner at 70s, not idle exit")
         sweeps = runner.sweep_times()
