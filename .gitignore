@@ -3,3 +3,10 @@ __pycache__/
 .DS_Store
 .worktrees/
 .booster/
+.adlc/*
+!.adlc/tickets/
+!.adlc/tickets/**
+!.adlc/ticket-archive/
+!.adlc/ticket-archive/**
+!.adlc/specs/
+!.adlc/config.json
