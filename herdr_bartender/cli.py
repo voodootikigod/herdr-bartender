@@ -16,10 +16,19 @@ from .cleanup import run_cleanup
 from .handlers import (
     handle_agent_status_changed,
     handle_pane_closed,
+    handle_pane_exited,
+    handle_pane_moved,
     handle_tab_closed,
     handle_workspace_closed,
 )
-from .hooks import install_hooks, uninstall_hooks, verify_vendor_hooks_intact
+from .hooks import (
+    audit_agy_hooks_config,
+    install_agy_hook,
+    install_hooks,
+    uninstall_hooks,
+    verify_agy_hook_intact,
+    verify_vendor_hooks_intact,
+)
 from .hooks_integrity import recorded_review_reasons
 from .live_test import run_live_test
 from .log import log_debug, log_warning
@@ -34,6 +43,10 @@ EVENT_HANDLERS = {
         data, context, arrival_time=runtime.PROCESS_ARRIVAL_TIME, arrival_ns=runtime.PROCESS_ARRIVAL_TIME_NS),
     intake.PANE_CLOSED: lambda data, context: handle_pane_closed(
         data, context, arrival_ns=runtime.PROCESS_ARRIVAL_TIME_NS),
+    intake.PANE_EXITED: lambda data, context: handle_pane_exited(
+        data, context, arrival_ns=runtime.PROCESS_ARRIVAL_TIME_NS),
+    intake.PANE_MOVED: lambda data, context: handle_pane_moved(
+        data, context, arrival_time=runtime.PROCESS_ARRIVAL_TIME, arrival_ns=runtime.PROCESS_ARRIVAL_TIME_NS),
     intake.TAB_CLOSED: lambda data, context: handle_tab_closed(
         data, context, arrival_ns=runtime.PROCESS_ARRIVAL_TIME_NS),
     intake.WORKSPACE_CLOSED: lambda data, context: handle_workspace_closed(
@@ -45,7 +58,7 @@ HELP_FLAGS = frozenset({"--help", "-h"})
 EXIT_USAGE = 2
 USAGE = """usage: herdr-bartender <event>                 Herdr plugin event (JSON envelope on stdin)
        herdr-bartender --health | --status | --sessions
-       herdr-bartender --install-hooks | --uninstall-hooks
+       herdr-bartender --install-hooks | --uninstall-hooks | --install-agy-hook
        herdr-bartender --cleanup
        herdr-bartender --replay-orphans <file>
        herdr-bartender --live-test | --unit-test
@@ -169,6 +182,12 @@ def main(launched_at: Optional[Tuple[float, int]] = None):
         result["hooks_guard_intact"] = hooks_ok
         if missing:
             result["hooks_guard_missing"] = missing
+        agy_ok, agy_status = verify_agy_hook_intact()
+        result["agy_hook_intact"] = agy_ok
+        result["agy_hook_status"] = agy_status
+        agy_warnings = audit_agy_hooks_config()
+        if agy_warnings:
+            result["agy_hooks_json_warnings"] = list(agy_warnings)
         print(json.dumps(result, indent=2))
         return
 
@@ -182,15 +201,33 @@ def main(launched_at: Optional[Tuple[float, int]] = None):
         outdated = _warn_if_outdated_reconciler()
         if outdated:
             print(f"[WARNING] {outdated}")
+        for warning in audit_agy_hooks_config():
+            print(f"[WARNING] {warning}")
         data = _read_cache_or_exit(state_dir)
         sessions = data.get("sessions", {})
         print(f"Active sessions: {len(sessions)}")
         for sid, s in sessions.items():
             print(f"  {sid}: state={s.get('desired_state')} status={s.get('delivery_status')}")
+        health = health_report()
+        bridge_sessions = health.get("sessions") if health.get("ok") is True else None
+        if isinstance(bridge_sessions, int) and not isinstance(bridge_sessions, bool):
+            live_delivered = sum(
+                1
+                for s in sessions.values()
+                if isinstance(s, dict)
+                and s.get("desired_state") != "Ended"
+                and s.get("delivery_status") == "delivered"
+            )
+            if bridge_sessions != live_delivered:
+                print(f"Bridge sessions: {bridge_sessions} (tracked delivered: {live_delivered})")
         return
 
     if "--install-hooks" in args:
         ok = install_hooks()
+        sys.exit(0 if ok else 1)
+
+    if "--install-agy-hook" in args:
+        ok = install_agy_hook()
         sys.exit(0 if ok else 1)
 
     if "--uninstall-hooks" in args:

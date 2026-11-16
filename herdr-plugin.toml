@@ -23,3 +23,11 @@ command = ["./bin/herdr-bartender", "tab.closed"]
 [[events]]
 on = "workspace.closed"
 command = ["./bin/herdr-bartender", "workspace.closed"]
+
+[[events]]
+on = "pane.moved"
+command = ["./bin/herdr-bartender", "pane.moved"]
+
+[[events]]
+on = "pane.exited"
+command = ["./bin/herdr-bartender", "pane.exited"]

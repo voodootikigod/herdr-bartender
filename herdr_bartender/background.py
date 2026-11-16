@@ -58,9 +58,11 @@ from .orphans import flush_pending_orphan_ops, journal_waiting
 from .paths import get_orphan_path, get_state_dir
 from .reconciler import evict_exported_sessions, reconcile_active_sessions
 from .reconciler_stamp import clear_stamp, code_version, write_stamp
+from .remote_watcher import REMOTE_POLL_SECONDS, collect_snapshots, has_local_live_sessions
 from .replay import auto_replay_due, run_replay_orphans
 from .results import drain_results_dir
 from .schedule import (
+    ACTIVE_INTERVAL_SECONDS,
     HEARTBEAT_SECONDS,
     CacheView,
     LoopState,
@@ -70,6 +72,7 @@ from .schedule import (
     full_pass_due,
     idle_expired,
     next_wake,
+    sweep_interval,
     terminal_horizon_reached,
     track_idle,
     track_presence,
@@ -95,6 +98,7 @@ class PassOutcome:
     view: CacheView
     bridge_healthy: Optional[bool] = None   # None: not probed this pass
     journal_flushed: bool = True            # False: the orphan journal could not be folded (not idle-blocking)
+    remotes_active: bool = False            # True when enabled SSH remotes exist and Herdr is alive
 
 
 def cache_retry_delay(failures: int) -> float:
@@ -215,13 +219,23 @@ def _sweep_pass(state_dir: Path, cache_mgr: BoundedSessionCache, bridge_url: Opt
     beat = _PassHeartbeat(cache_mgr, snap)
     beat()
     healthy = _bridge_phase(state_dir, cache_mgr, bridge_url, snap, beat)
-    reconcile_active_sessions(state_dir, bridge_url=bridge_url, snapshot=snap, between=beat)
+    snapshots = collect_snapshots(
+        herdr_alive=snap.herdr_alive,
+        has_local_live_sessions=has_local_live_sessions(state_dir),
+    )
+    reconcile_active_sessions(state_dir, bridge_url=bridge_url, snapshot=snap, between=beat, snapshots=snapshots)
     flushed = _flush_orphan_journal(get_orphan_path())   # exports journaled during this pass reach the file now
     view = _read_view(cache_mgr, snap)
     _heartbeat(view, snap)
     sweep_stale_temp_files(state_dir)
     _check_hooks(state_dir)
-    return PassOutcome(snap, view, healthy, flushed)
+    return PassOutcome(
+        snap,
+        view,
+        healthy,
+        flushed,
+        remotes_active=bool(snapshots.remotes_configured and snap.herdr_alive),
+    )
 
 
 def _heartbeat_pass(state_dir: Path, cache_mgr: BoundedSessionCache) -> PassOutcome:
@@ -286,7 +300,9 @@ def _bridge_settled(outcome: PassOutcome) -> bool:
 
 
 def _idle_now(state_dir: Path, outcome: PassOutcome, stuck: Envelopes = frozenset()) -> bool:
-    """Plan §5.1 item 11 (R40): 0 sessions, nothing owed or queued, and a healthy (or absent) bridge."""
+    """Plan §5.1 item 11 (R40): 0 sessions, nothing owed or queued, no active remotes, and a healthy (or absent) bridge."""
+    if outcome.remotes_active:
+        return False
     return _bridge_settled(outcome) and not is_delivery_down() and not _work_waiting(state_dir, outcome, stuck)
 
 
@@ -328,7 +344,11 @@ def _advance(state_dir: Path, state: LoopState, step: _Step, stuck: Envelopes) -
     state = track_presence(state, outcome.snapshot.bartender, now)
     if step.full:
         state = track_idle(state, _idle_now(state_dir, outcome, stuck), now)
-    return after_pass(state, now, step.full, outcome.view.next_due)
+    next_due = outcome.view.next_due
+    if outcome.remotes_active and sweep_interval(state, now) == ACTIVE_INTERVAL_SECONDS:
+        remote_due = now + REMOTE_POLL_SECONDS
+        next_due = remote_due if next_due is None else min(next_due, remote_due)
+    return after_pass(state, now, step.full, next_due)
 
 
 def _pause(state_dir: Path, state: LoopState, stuck: Envelopes, reruns: int) -> int:

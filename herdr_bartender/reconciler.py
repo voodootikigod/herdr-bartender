@@ -28,9 +28,10 @@ from typing import Callable, List, Mapping, Optional, Tuple
 
 from . import clock
 from .cache import ORPHAN_MIRROR_OWED, BoundedSessionCache, IntegrationDisabled
-from .delivery_state import foreign_lease_open
+from .delivery_state import foreign_lease_open, journal_exports_before_save
 from .dismissals import dismiss_stale_vendor_files, sweep_dismissals
 from .handoff import touch_reconciler_pending
+from .intake import resolve_host
 from .lifecycle import (
     LifecycleReport,
     apply_lifecycle,
@@ -45,8 +46,10 @@ from .lifecycle import (
 )
 from .log import log_debug, log_warning
 from .markers import remove_pane_marker
+from .multihost import is_local_host, session_id_host
 from .orphans import export_orphan_record, exported_session_records, journaled_export_records, orphan_pane_ids
 from .process import own_start_time
+from .remote_watcher import SnapshotBundle, sync_local_snapshot, sync_remote_endpoint
 from .sender import (
     BACKGROUND_POLICY,
     Claim,
@@ -127,15 +130,36 @@ def queue_pending_vendor_cleanups(cache_mgr: BoundedSessionCache) -> Tuple[str, 
 Exports = Tuple[Tuple[str, dict], ...]
 
 
-def _apply_lifecycle(cache_mgr: BoundedSessionCache, snap: ProcessSnapshot) -> Tuple[LifecycleReport, Exports, Exports]:
+def _apply_lifecycle(
+    cache_mgr: BoundedSessionCache,
+    snap: ProcessSnapshot,
+    snapshots: Optional[SnapshotBundle] = None,
+) -> Tuple[LifecycleReport, Exports, Exports]:
     """(report, R12 horizon exports, R52 records whose orphan export is still owed)."""
     orphan_panes = orphan_pane_ids()  # read outside the cache lock (gap save-reads-orphans-under-lock)
     with cache_mgr as data:
         now = clock.time()
         report = apply_lifecycle(data, snap, now)
+        cap_exports: List[Tuple[str, dict]] = []
+        if snapshots is not None and snap.herdr_alive:
+            snap_wall = snapshots.fetched_at_wall or now
+            snap_ns = snapshots.fetched_at_ns or clock.time_ns()
+            herdr_fn = lambda: snap.herdr_alive
+            if snapshots.local_snapshot is not None:
+                _, loc_exp = sync_local_snapshot(
+                    data, snapshots.local_snapshot, snap_wall, snap_ns, herdr_alive=herdr_fn
+                )
+                cap_exports.extend(loc_exp)
+            for endpoint, remote_snap in snapshots.remote_snapshots:
+                _, rem_exp = sync_remote_endpoint(
+                    data, endpoint, remote_snap, snap_wall, snap_ns, herdr_alive=herdr_fn
+                )
+                cap_exports.extend(rem_exp)
         for sid, record in data.get("sessions", {}).items():
             if isinstance(record, dict) and not record.get("salvaged"):
                 ensure_payload(sid, record)
+        if cap_exports:
+            journal_exports_before_save(data, tuple(cap_exports))
         exports = horizon_exports(data, now)
         owed = mirror_owed_records(data)
         cache_mgr.save(data, orphan_panes=orphan_panes)
@@ -144,12 +168,17 @@ def _apply_lifecycle(cache_mgr: BoundedSessionCache, snap: ProcessSnapshot) -> T
 
 def _evict_locked(cache_mgr: BoundedSessionCache, exported) -> Tuple[str, ...]:
     with cache_mgr as data:
+        local_host = resolve_host(data.get("host"))
         evicted = evict_exported(data, exported)
-        live_panes = {r.get("pane_id") for r in data.get("sessions", {}).values() if isinstance(r, dict) and is_live(r)}
+        live_panes = {
+            r.get("pane_id")
+            for r in data.get("sessions", {}).values()
+            if isinstance(r, dict) and is_live(r) and is_local_host(r.get("host"), local_host)
+        }
         if evicted:
             cache_mgr.save(data)
-        for _, pane in evicted:
-            if pane and pane not in live_panes:
+        for sid, pane in evicted:
+            if pane and pane not in live_panes and is_local_host(session_id_host(sid), local_host):
                 remove_pane_marker(pane)
     return tuple(sid for sid, _ in evicted)
 
@@ -271,14 +300,20 @@ def _dismissals(cache_mgr: BoundedSessionCache, snap: ProcessSnapshot, bridge_ur
                      lambda uuids: dismiss_vendors(cache_mgr, uuids, policy, bridge_url))
 
 
-def _reconcile(state_dir: Path, bridge_url: Optional[str], snap: Optional[ProcessSnapshot],
-               policy: SendPolicy, between: Between) -> ReconcileReport:
+def _reconcile(
+    state_dir: Path,
+    bridge_url: Optional[str],
+    snap: Optional[ProcessSnapshot],
+    policy: SendPolicy,
+    between: Between,
+    snapshots: Optional[SnapshotBundle] = None,
+) -> ReconcileReport:
     own_start_time()  # the lease-token start time, warmed outside any critical section
     cache_mgr = policy.cache(state_dir)
     drain_compensations(cache_mgr, bridge_url, policy, between)
     queue_pending_vendor_cleanups(cache_mgr)
     snap = snap or take_snapshot(state_dir)
-    report, exports, owed = _apply_lifecycle(cache_mgr, snap)
+    report, exports, owed = _apply_lifecycle(cache_mgr, snap, snapshots=snapshots)
     evicted = evict_exported_sessions(cache_mgr, exports, "12h past TTL, R12") if exports else ()
     owed = tuple((sid, record) for sid, record in owed if sid not in evicted)
     if owed:
@@ -290,15 +325,20 @@ def _reconcile(state_dir: Path, bridge_url: Optional[str], snap: Optional[Proces
     return ReconcileReport(report, evicted, attempted, hand_off)
 
 
-def reconcile_active_sessions(state_dir: Path, bridge_url: Optional[str] = None,
-                              snapshot: Optional[ProcessSnapshot] = None,
-                              policy: SendPolicy = BACKGROUND_POLICY, between: Between = None) -> ReconcileReport:
+def reconcile_active_sessions(
+    state_dir: Path,
+    bridge_url: Optional[str] = None,
+    snapshot: Optional[ProcessSnapshot] = None,
+    policy: SendPolicy = BACKGROUND_POLICY,
+    between: Between = None,
+    snapshots: Optional[SnapshotBundle] = None,
+) -> ReconcileReport:
     """One reconcile pass (raises CacheError for the loop's backoff; DISABLED ends it quietly).
 
     ``between`` runs after every compensation and session send (the loop's marker heartbeat in a long pass).
     """
     try:
-        return _reconcile(Path(state_dir), bridge_url, snapshot, policy, between)
+        return _reconcile(Path(state_dir), bridge_url, snapshot, policy, between, snapshots=snapshots)
     except IntegrationDisabled:
         log_debug("DISABLED under the cache lock; reconcile pass stopped")
         return ReconcileReport()
