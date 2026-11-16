@@ -7,9 +7,10 @@ import unittest
 import copy
 
 from herdr_bartender import cache
+from herdr_bartender.cache import prepare_for_save
 from herdr_bartender.cache_fields import sane_cache_fields
 from herdr_bartender.cache_schema import new_cache, normalize_cache
-from herdr_bartender.delivery_state import Outcome, Transmission, apply_delivery_result
+from herdr_bartender.delivery_state import Outcome, Transmission, apply_delivery_result, stage_compensation
 from herdr_bartender.handlers import (
     handle_agent_status_changed,
     handle_pane_closed,
@@ -19,7 +20,10 @@ from herdr_bartender.handlers import (
 from herdr_bartender.intake import resolve_identity
 from herdr_bartender.markers import touch_pane_marker
 from herdr_bartender.multihost import host_matches_session, is_local_host, pane_scope_key, resolve_event_host
+from herdr_bartender.orphans import export_orphan_record, orphan_pane_ids
+from herdr_bartender.paths import get_orphan_path
 from herdr_bartender.process import get_process_start_time
+from herdr_bartender.replay import run_replay_orphans
 from herdr_bartender.sanitize import AGENT_MAX, format_agent_name, get_hex_pane_id
 from herdr_bartender.staging import SESSION_CAP, stage_pane_close_result, stage_status
 from tests.support import SandboxTestCase
@@ -416,12 +420,80 @@ class MultiHostAndNewTurnStagingTests(SandboxTestCase):
         self.assertEqual(data["pending_vendor_cleanups"], [])
 
     def test_pane_generations_save_prune_handles_remote_scoped_keys(self):
+        export_orphan_record("herdr:dev-two:w9:pOrphan",
+                             {"pane_id": "w9:pOrphan", "host": "dev-two", "desired_state": "Ended"},
+                             blocking=True)
+        scoped_orphans = orphan_pane_ids()
+        self.assertIn("dev-two@w9:pOrphan", scoped_orphans)
+
         with self.cache_mgr as data:
-            data["pane_generations"] = {f"dev-one@w9:p{i}": i + 1 for i in range(520)}
-            data["tombstones"]["dev-one@w9:p0"] = {"closed_at_ns": time.time_ns(), "closed_source_ts": 1.0}
-            self.cache_mgr.save(data, orphan_panes=frozenset())
+            data["sessions"]["herdr:dev-one:w9:p1"] = {
+                "pane_id": "w9:p1", "host": "dev-one", "desired_state": "Working", "seq": 1,
+            }
+            data["pane_generations"] = {
+                "dev-one@w9:p1": 1,       # active remote session: must stay protected despite lowest gen
+                "w9:p1": 2,               # unprotected local key on same pane_id: must be pruned
+                "dev-two@w9:pOrphan": 3,  # remote orphan: must stay protected via orphan_pane_ids()
+                **{f"dev-one@w9:pFill{i}": i + 10 for i in range(520)},
+            }
+            prepare_for_save(data, time.time(), time.time_ns(), orphan_panes=frozenset())
             self.assertEqual(len(data["pane_generations"]), 512)
-            self.assertIn("dev-one@w9:p0", data["pane_generations"], "tombstone-protected remote scope key is retained")
+            self.assertIn("dev-one@w9:p1", data["pane_generations"],
+                          "active remote session protects its <host>@<pane> generation key")
+            self.assertNotIn("w9:p1", data["pane_generations"],
+                             "unprotected local pane key with same pane_id is pruned, not falsely protected")
+
+            # Also verify orphan_pane_ids() protects remote orphan scope keys on save.
+            data["pane_generations"]["dev-two@w9:pOrphan"] = 3
+            data["pane_generations"]["w9:pOrphan"] = 4
+            data["pane_generations"]["dev-one@w9:pExtra"] = 9999
+            self.cache_mgr.save(data, orphan_panes=scoped_orphans)
+            self.assertEqual(len(data["pane_generations"]), 512)
+            self.assertIn("dev-one@w9:p1", data["pane_generations"])
+            self.assertIn("dev-two@w9:pOrphan", data["pane_generations"])
+            self.assertNotIn("w9:pOrphan", data["pane_generations"])
+
+    def test_stage_compensation_and_orphan_replay_respect_host_isolation(self):
+        # 1. stage_compensation never falls back to local pane_generations[pane] for a remote session.
+        data = new_cache(self.host)
+        data["pane_generations"]["w1:pComp"] = 77
+        tx_untracked = Transmission("herdr:dev-one:w1:pComp", "w1:pComp", "Working", 1, generation=None)
+        comp1 = stage_compensation(data, tx_untracked, 100.0)
+        self.assertIsNone(comp1["generation"], "remote compensation must not read local host generation")
+        data["pane_generations"]["dev-one@w1:pComp"] = 12
+        comp2 = stage_compensation(data, tx_untracked, 101.0)
+        self.assertEqual(comp2["generation"], 12)
+
+        # 2. run_replay_orphans does not suppress or resync an active local session for a remote orphan,
+        #    and never removes a local pane marker when replaying a remote orphan.
+        pane = "w1:pReplayIso"
+        local_sid = self.sid(pane)
+        remote_sid = f"herdr:dev-one:{pane}"
+        marker = self.state_dir / "panes" / get_hex_pane_id(pane)
+        handle_agent_status_changed(
+            {"agent_status": "working", "pane_id": pane, "workspace_id": "w1", "agent": "claude"},
+            {}, bridge_url=self.mock_url,
+        )
+        self.assertTrue(marker.exists())
+        export_orphan_record(remote_sid, {"pane_id": pane, "host": "dev-one", "agent": "Codex (Herdr \u00b7 dev-one)"},
+                             blocking=True)
+        self.assertTrue(run_replay_orphans(str(get_orphan_path()), bridge_url=self.mock_url, quiet=True))
+        self.assertEqual([e["state"] for e in self.bridge.events_for(remote_sid)], ["Ended"],
+                         "remote orphan must be replayed even when local host has active session on same pane_id")
+        local_rec = self._data()["sessions"][local_sid]
+        self.assertEqual((local_rec["delivery_status"], local_rec.get("resync_generation", 0)), ("delivered", 0),
+                         "local session must not be forced to resync by remote orphan Ended")
+        self.assertTrue(marker.exists())
+
+        # Even with no cached local session, replaying a remote orphan leaves local pane marker intact.
+        standalone_pane = "w1:pLocalMarkerOnly"
+        touch_pane_marker(standalone_pane)
+        standalone_marker = self.state_dir / "panes" / get_hex_pane_id(standalone_pane)
+        export_orphan_record(f"herdr:dev-one:{standalone_pane}",
+                             {"pane_id": standalone_pane, "host": "dev-one", "agent": "Herdr (dev-one)"},
+                             blocking=True)
+        self.assertTrue(run_replay_orphans(str(get_orphan_path()), bridge_url=self.mock_url, quiet=True))
+        self.assertTrue(standalone_marker.exists(), "replaying remote orphan must never delete local pane marker")
 
     def test_new_turn_does_not_inherit_stale_fields_from_ended_turn(self):
         pane = "w1:pNewTurn"

@@ -196,9 +196,7 @@ def stage_compensation(data: dict, tx: Transmission, now: float) -> dict:
     mark on, so a later re-admission is still re-synced (``sender.compensation``).
     """
     _, scope_key = _tx_scope(data, data.get("sessions", {}).get(tx.session_id), tx)
-    pane_gens = data.get("pane_generations", {})
-    generation = (tx.generation if tx.generation is not None
-                  else pane_gens.get(scope_key, pane_gens.get(tx.pane_id)))
+    generation = tx.generation if tx.generation is not None else data.get("pane_generations", {}).get(scope_key)
     entry = {
         "session_id": tx.session_id,
         "pane_id": tx.pane_id,

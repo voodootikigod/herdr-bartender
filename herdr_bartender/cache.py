@@ -32,7 +32,9 @@ from . import clock, jsonsafe, runtime, watchdog
 from .cache_schema import CorruptCache, new_cache, normalize_cache
 from .config import get_sanitized_hostname
 from .housekeeping import sweep_stale_temp_files
+from .intake import resolve_host
 from .log import log_debug, log_warning
+from .multihost import pane_scope_key, session_id_host
 from .paths import PRIVATE_FILE_MODE
 from .salvage import (
     build_salvaged_cache,
@@ -201,9 +203,24 @@ def prepare_for_save(data: dict, now: float, now_ns: int, orphan_panes: Optional
     for sid in sessions_to_prune(sessions):
         sessions.pop(sid, None)  # in place: callers may hold a reference to data["sessions"]
     if orphan_panes is not None:
+        local_host = resolve_host(data.get("host"))
+        session_keys = set()
+        for sid, s in sessions.items():
+            if not isinstance(s, dict):
+                continue
+            pane = s.get("pane_id")
+            if not isinstance(pane, str) or not pane:
+                continue
+            rec_host = s.get("host")
+            host = rec_host if isinstance(rec_host, str) and rec_host else (session_id_host(sid) or "")
+            session_keys.add(pane if "@" in pane else pane_scope_key(pane, host, local_host))
+        local_prefix = f"{local_host}@"
+        normalized_orphans = {
+            p[len(local_prefix):] if isinstance(p, str) and p.startswith(local_prefix) else p
+            for p in orphan_panes if isinstance(p, str) and p
+        }
         protected = frozenset(
-            {s.get("pane_id") for s in sessions.values()}
-            | set(data["tombstones"]) | set(data.get("agent_exits", {})) | set(orphan_panes)
+            session_keys | set(data["tombstones"]) | set(data.get("agent_exits", {})) | normalized_orphans
         )
         pane_gens = data.setdefault("pane_generations", {})
         for pane in pane_generations_to_prune(pane_gens, protected):

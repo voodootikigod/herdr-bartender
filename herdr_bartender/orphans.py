@@ -31,8 +31,10 @@ from .boundedio import (
     read_regular_file,
 )
 from . import clock, jsonsafe
+from .config import get_sanitized_hostname
 from .envelopes import quarantine
 from .log import log_debug, log_warning
+from .multihost import pane_scope_key, session_id_host
 from .paths import PRIVATE_FILE_MODE, ensure_private_dir, get_orphan_path
 from .handoff import in_reconciler_loop, touch_reconciler_pending
 
@@ -579,8 +581,22 @@ def _pane_ids(records) -> FrozenSet[str]:
     return frozenset(r["pane_id"] for r in records if isinstance(r, dict) and isinstance(r.get("pane_id"), str))
 
 
+def _scoped_pane_ids(pairs: Iterable[Tuple[Optional[str], object]], local_host: str) -> FrozenSet[str]:
+    keys = set()
+    for sid, r in pairs:
+        if not isinstance(r, dict):
+            continue
+        pane = r.get("pane_id")
+        if not isinstance(pane, str) or not pane:
+            continue
+        rec_host = r.get("host")
+        host = rec_host if isinstance(rec_host, str) and rec_host else (session_id_host(sid) or "")
+        keys.add(pane if "@" in pane else pane_scope_key(pane, host, local_host))
+    return frozenset(keys)
+
+
 def orphan_pane_ids(orphan_file: Optional[Path] = None) -> Optional[FrozenSet[str]]:
-    """Pane ids referenced by the orphan file and its pending journal (Plan §1 L107 prune protection).
+    """Pane scope keys referenced by the orphan file and its pending journal (Plan §1 L107 prune protection).
 
     Read under the orphan lock (LOCK_NB, 50ms) and never inside the cache critical
     section; callers pass the result to ``BoundedSessionCache.save(orphan_panes=...)``.
@@ -604,5 +620,9 @@ def orphan_pane_ids(orphan_file: Optional[Path] = None) -> Optional[FrozenSet[st
         return None
     finally:
         release_orphan_lock(lock_fd)
-    exported = [op["session"] for op in ops if op.get("op") == OP_EXPORT]
-    return _pane_ids(list(sessions.values()) + exported)
+    pairs: List[Tuple[Optional[str], object]] = list(sessions.items())
+    pairs.extend(
+        (op.get("sid") or op.get("session_id"), op["session"])
+        for op in ops if op.get("op") == OP_EXPORT
+    )
+    return _scoped_pane_ids(pairs, get_sanitized_hostname())
