@@ -4,14 +4,27 @@ set -u
 # Drain stdin completely to prevent EPIPE to writing agent processes
 RAW_INPUT="$(cat 2>/dev/null || true)"
 
-# Resolve EVENT from AGY_HOOK_EVENT, argv $1, or top-level hook_event_name in JSON
+# Resolve EVENT from AGY_HOOK_EVENT, argv $1, or top-level hookEventName / hook_event_name in JSON
 EVENT="${AGY_HOOK_EVENT:-${1:-}}"
+if [ -z "$EVENT" ]; then
+  EVENT=$(printf '%s' "$RAW_INPUT" | LC_ALL=C grep -o '"hookEventName"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
+fi
 if [ -z "$EVENT" ]; then
   EVENT=$(printf '%s' "$RAW_INPUT" | LC_ALL=C grep -o '"hook_event_name"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null | head -n1 | cut -d'"' -f4 || true)
 fi
 
-# Whitelist EVENT strictly to supported lifecycle status events
+# Whitelist EVENT strictly to supported Antigravity hook events
 case "$EVENT" in
+  PreToolUse)
+    OUTPUT_EMITTED=1
+    printf '{"decision":"allow"}\n'
+    exit 0
+    ;;
+  PostToolUse|SessionStart)
+    OUTPUT_EMITTED=1
+    printf '{}\n'
+    exit 0
+    ;;
   PreInvocation|PostInvocation|Stop|SessionEnd) ;;
   *)
     OUTPUT_EMITTED=1
@@ -49,8 +62,9 @@ emit_lifecycle_response() {
   if [ "${OUTPUT_EMITTED:-0}" -eq 0 ]; then
     OUTPUT_EMITTED=1
     case "${EVENT:-}" in
+      PreToolUse) printf '{"decision":"allow"}\n' ;;
       Stop|SessionEnd) printf '{"decision":""}\n' ;;
-      PreInvocation|PostInvocation) printf '{}\n' ;;
+      PreInvocation|PostInvocation|PostToolUse|SessionStart) printf '{}\n' ;;
     esac
   fi
 }
@@ -682,7 +696,7 @@ SID=""
 payload=""
 
 if [ -n "$PYTHON_BIN" ]; then
-  py_output=$(printf '%s' "$RAW_INPUT" | EVENT="$EVENT" AGENT_PID="${AGENT_PID:-}" AGENT_TTY="${AGENT_TTY:-}" PREV_VENDOR_SID="${PREV_VENDOR_SID:-}" TERM_PROGRAM="${TERM_PROGRAM:-}" "$PYTHON_BIN" -c '
+  py_output=$(printf '%s' "$RAW_INPUT" | EVENT="$EVENT" CANONICAL_PANE="${CANONICAL_PANE:-}" AGENT_PID="${AGENT_PID:-}" AGENT_TTY="${AGENT_TTY:-}" PREV_VENDOR_SID="${PREV_VENDOR_SID:-}" TERM_PROGRAM="${TERM_PROGRAM:-}" "$PYTHON_BIN" -c '
 import hashlib, json, os, re, sys
 
 CSI_RE = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]")
@@ -723,21 +737,41 @@ try:
         sys.stdout.write("SKIP")
         sys.exit(0)
 
+    raw_prompt = d.get("lastUserInput")
+    prompt_title = sanitize_str(raw_prompt, 120) if isinstance(raw_prompt, str) else ""
+    is_herdr_pane = bool((os.environ.get("CANONICAL_PANE") or "").strip())
+
     # Antigravity lifecycle mapping:
     # PreInvocation -> turn starts, model thinking -> Working
-    # PostInvocation -> tool calls finished, model turn complete -> Idle
-    # Stop / SessionEnd -> execution terminated -> Ended
+    # PostInvocation -> tool calls finished mid-turn -> Working (no mid-turn Idle flicker)
+    # Stop -> Herdr fail-open: Ended; Standalone: Working (!fullyIdle), Waiting (error), or Done
+    # SessionEnd -> session terminated -> Ended
     if event == "PreInvocation":
         state = "Working"
-        title = "Thinking..."
+        title = prompt_title or "Thinking..."
     elif event == "PostInvocation":
-        state = "Idle"
-        title = ""
-    elif event in ("Stop", "SessionEnd"):
+        state = "Working"
+        title = prompt_title
+    elif event == "SessionEnd":
         state = "Ended"
         title = ""
+    elif event == "Stop":
+        if is_herdr_pane:
+            state = "Ended"
+            title = ""
+        elif d.get("fullyIdle") is False:
+            state = "Working"
+            title = prompt_title or "Background task running..."
+        elif d.get("terminationReason") == "ERROR" or bool(d.get("error")):
+            state = "Waiting"
+            err_val = d.get("error")
+            err_clean = sanitize_str(err_val, 120) if isinstance(err_val, str) else ""
+            title = err_clean or prompt_title or "Error"
+        else:
+            state = "Done"
+            title = prompt_title
     else:
-        state = "Working" if "Pre" in event else "Idle"
+        state = "Working"
         title = ""
 
     try:
@@ -836,8 +870,15 @@ if [ -z "${payload:-}" ]; then
     exit 0
   fi
   case "$EVENT" in
-    Stop|SessionEnd) FB_STATE="Ended" ;;
-    PostInvocation) FB_STATE="Idle" ;;
+    SessionEnd) FB_STATE="Ended" ;;
+    Stop)
+      if [ -n "$CANONICAL_PANE" ]; then
+        FB_STATE="Ended"
+      else
+        FB_STATE="Done"
+      fi
+      ;;
+    PostInvocation) FB_STATE="Working" ;;
     *) FB_STATE="Working" ;;
   esac
   # Reuse PREV_VENDOR_SID for Stop/SessionEnd if available
@@ -863,8 +904,13 @@ if [ -z "${payload:-}" ]; then
   payload="{\"state\":\"${FB_STATE}\",\"agent\":\"Antigravity\",\"event\":\"${EVENT}\",\"session_id\":\"${FALLBACK_SID}\"}"
 fi
 
-# On non-Stop events, record or update .vendor_active
-if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$EVENT" != "Stop" ] && [ "$EVENT" != "SessionEnd" ]; then
+IS_TERMINAL_EVENT=0
+if [ "$EVENT" = "SessionEnd" ] || { [ "$EVENT" = "Stop" ] && [ -n "$CANONICAL_PANE" ]; }; then
+  IS_TERMINAL_EVENT=1
+fi
+
+# On non-terminal events, record or update .vendor_active
+if [ -n "$VENDOR_ACTIVE" ] && [ -n "$SID" ] && [ "$IS_TERMINAL_EVENT" -eq 0 ]; then
   # Only record if SID matches standard vendor UUID regex (16-64 chars)
   if printf '%s' "$SID" | LC_ALL=C grep -Eq '^[a-zA-Z0-9_-]{16,64}$'; then
     set -f
@@ -964,10 +1010,10 @@ if [ "$BARTENDER_UNREACHABLE" != "1" ] && has_time_remaining && is_bartender_ali
   esac
 fi
 
-# On Stop/SessionEnd, retire .vendor_active ONLY if dismissal was confirmed by HTTP 200, 404, or 410.
+# On terminal event, retire .vendor_active ONLY if dismissal was confirmed by HTTP 200, 404, or 410.
 # If delivery timed out or failed, keep .vendor_active intact so Herdr reconciler retries.
 # If a pending or previous session differs from SID, both must be dismissed before retiring.
-if [ -n "$VENDOR_ACTIVE" ] && { [ "$EVENT" = "Stop" ] || [ "$EVENT" = "SessionEnd" ]; }; then
+if [ -n "$VENDOR_ACTIVE" ] && [ "$IS_TERMINAL_EVENT" -eq 1 ]; then
   set -f
   to_dismiss=""
   local_count=0
