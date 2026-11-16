@@ -51,7 +51,7 @@ class DisabledFlagEventPathTests(SandboxTestCase):
         for name in LOGGED_TOOLS:
             shim = self.log_shims / name
             shim.write_text(
-                "#!/usr/bin/env bash\n"
+                "#!/bin/sh\n"
                 f'echo "{name} $*" >> "$HB_TEST_SANDBOX/tool-calls.log"\n'
                 f'exec "{SHIM_DIR / name}" "$@"\n')
             shim.chmod(shim.stat().st_mode | stat.S_IXUSR)

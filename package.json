@@ -1,0 +1,10 @@
+{
+  "name": "herdr-bartender",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dev/gate task runner for herdr-bartender ADLC builds",
+  "scripts": {
+    "build": "python3 -m compileall -q herdr_bartender tests scripts/run-tests-parallel.py && bash -n scripts/agy-notify-hook.sh herdr_bartender/hook_guard.sh",
+    "test": "python3 scripts/run-tests-parallel.py"
+  }
+}

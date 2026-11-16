@@ -1,0 +1,153 @@
+{
+  "repo": "/Users/voodootikigod/Projects/herdr-bartender",
+  "base": "main",
+  "gate": {
+    "build": "npm run build",
+    "test": "npm test"
+  },
+  "tickets": [
+    {
+      "id": "T1",
+      "title": "Multi-host state isolation, herdr server daemon probe priority, and quarantine/marker housekeeping",
+      "body": "Implement multi-host state isolation, herdr server process-probe selection, and corrupt-quarantine / stale bare-vendor marker housekeeping in /Users/voodootikigod/Projects/herdr-bartender.\n\nExact requirements:\n1. Extend `format_agent_name` in `herdr_bartender/sanitize.py`:\n   - Signature: `format_agent_name(raw_agent: object, *, remote_host: Optional[str] = None, display_agent: Optional[object] = None) -> str` (all existing single-arg positional calls `format_agent_name(x)` MUST behave identically).\n   - Base pretty name: `clean = sanitize_agent(raw_agent).lower()`; if `clean in AGENT_NAME_OVERRIDES`, use `AGENT_NAME_OVERRIDES[clean]`; else if `sanitize_agent(display_agent)` is non-empty, use `sanitize_agent(display_agent)`; else if `clean`, use `clean.capitalize()`; else return `f\"Herdr ({clean_host})\"` when `remote_host` is non-empty or `DEFAULT_AGENT_NAME` ('Herdr').\n   - Suffix: when `remote_host` is non-empty (sanitized via `clean_host = sanitize_hostname(remote_host)`), use `f\" (Herdr \\u00b7 {clean_host})\"` (e.g. 'Antigravity (Herdr · dev-one)'); otherwise use `AGENT_SUFFIX = \" (Herdr)\"`. Truncate base pretty name to `AGENT_MAX - len(suffix)` so total length never exceeds `AGENT_MAX` (64).\n2. Cache schema & field sanity (`herdr_bartender/cache_schema.py`, `herdr_bartender/cache_fields.py`):\n   - Add `'remote_unreachable_since'` to `DICT_FIELDS` in `cache_schema.py` (default `{}`).\n   - In `cache_fields.py` (`sane_cache_fields`), validate `data['remote_unreachable_since']` so keys are non-empty strings and values are finite numbers (`_as_number`), dropping malformed entries.\n3. Create `herdr_bartender/multihost.py` (pure helper module, do NOT modify `intake.py`):\n   - `resolve_event_host(event_data: Mapping, pinned_host: object, current: Callable[[], str] = sanitized_hostname) -> Tuple[str, bool]`: let `local_host = resolve_host(pinned_host, current)`. If `event_data.get('host')` is a non-empty string, sanitize via `ev_host = sanitize_hostname(event_data['host'])` and return `(ev_host, ev_host != local_host)`. Otherwise return `(local_host, False)`.\n   - `pane_scope_key(canonical_pane: str, host: str, local_host: str) -> str`: return `canonical_pane` when `not host or host == local_host`, else `f\"{host}@{canonical_pane}\"`. (Because '@' cannot match `PANE_ID_REGEX`, all local keys `'w1:p1'` stay 100% unchanged for existing tests and `hook_guard.sh`, while remote keys `'dev-one@w1:p1'` never collide!)\n   - `is_local_host(host: object, local_host: str) -> bool`: True when `host in (None, '') or host == local_host`.\n   - `host_matches_session(record: Mapping, target_host: str, local_host: str) -> bool`: let `rec_host = record.get('host') or local_host`; return `rec_host == target_host`.\n4. Multi-host & new_turn staging in `herdr_bartender/staging.py` and `herdr_bartender/delivery_state.py`:\n   - In `stage_status`: compute `local_host = resolve_host(data.get('host'))`, `host, is_remote = resolve_event_host(event_data, data.get('host'))`, and `scope_key = pane_scope_key(pane, host, local_host)`. Use `scope_key` (instead of bare `pane`) for `data['tombstones']`, `data['agent_exits']`, and `data['pane_generations']`!\n   - On `new_turn` (`cached.get('desired_state') == 'Ended' or 'generation' not in cached`), pass `{}` instead of `cached` into `resolve_fields(event_data, context, identity, {} if new_turn else cached)` so starting a new agent turn in a pane never inherits stale `cwd`, `title`, or `tab_id` from a previous Ended turn (while keeping `cached` precedence over `focused_pane_cwd` within an active live turn so `tests/test_events.py` stays green!).\n   - Pass `remote_host=host if is_remote else None` and `display_agent=event_data.get('display_agent')` to `format_agent_name(...)`.\n   - In `stage_pane_close_result` and `stage_container_close`: resolve `local_host = resolve_host(data.get('host'))`, `host, is_remote = resolve_event_host(event_data, data.get('host'))`; filter matching sessions with `host_matches_session(rec, host, local_host)` as well as existing pane/container matchers; record tombstones under `pane_scope_key(..., host, local_host)`; only call `stage_vendor_cleanup` when `not is_remote`.\n   - In `delivery_state.py`: only call `touch_pane_marker`, `remove_pane_marker`, `touch_pane_failed`, `clear_pane_failed`, and `stage_vendor_cleanup` when `is_local_host(session.get('host'), resolve_host(data.get('host')))` and `'@'` not in `str(pane_id or '')`.\n5. Prefer `herdr server` in `herdr_bartender/process.py` (`_probe_herdr`, lines 266-288):\n   - Add `_is_herdr_server(pid: int) -> bool`: inspect `_ps_field(pid, 'args') or ''`, split into tokens, and return True when `len(parts) >= 2` and the first token after `parts[0]` not starting with `'-'` equals `'server'`.\n   - In `_probe_herdr()`, when `not gui` and `len(candidates) > 1`, compute `servers = [p for p in candidates if _is_herdr_server(p)]` and return `ProcessProbe(_earliest(gui or servers or candidates), True)`.\n6. Quarantine & stale bare-touch sweep in `herdr_bartender/housekeeping.py`:\n   - Call `salvage.prune_corrupt_quarantine(state_dir, now)` inside `sweep_stale_temp_files`.\n   - Add `STALE_BARE_VENDOR_SECONDS = 7 * 86400`: scan `state_dir / 'panes'` for `*.vendor_active` regular non-symlink files (`lstat`, `stat.S_ISREG`) with `st_size == 0` and `now - st_mtime > STALE_BARE_VENDOR_SECONDS`, unlinking them and appending to `removed` (never touch non-empty `.vendor_active` files).\n7. Add thorough unit tests in `tests/test_staging.py`, `tests/test_process.py`, and `tests/test_housekeeping.py`. Run `npm run build` and `npm test` to verify 100% green.",
+      "scope": [
+        "herdr_bartender/multihost.py",
+        "herdr_bartender/sanitize.py",
+        "herdr_bartender/staging.py",
+        "herdr_bartender/delivery_state.py",
+        "herdr_bartender/cache_schema.py",
+        "herdr_bartender/cache_fields.py",
+        "herdr_bartender/process.py",
+        "herdr_bartender/housekeeping.py",
+        "tests/test_staging.py",
+        "tests/test_process.py",
+        "tests/test_housekeeping.py"
+      ],
+      "rails": [
+        "package.json",
+        "scripts/run-tests-parallel.py",
+        "herdr_bartender/intake.py",
+        "herdr_bartender/hook_guard.sh",
+        "herdr_bartender/salvage.py",
+        "herdr_bartender/markers.py",
+        "tests/test_invariants_01_17.py",
+        "tests/test_events.py",
+        "tests/test_intake.py",
+        "tests/test_pinned_limits.py",
+        "tests/support/**"
+      ],
+      "edges": [
+        { "to": "T4" },
+        { "to": "T5" }
+      ],
+      "tier": "mid",
+      "pool_hint": "claude"
+    },
+    {
+      "id": "T2",
+      "title": "Antigravity standalone hook stdout hardening and turn lifecycle state machine",
+      "body": "Harden `scripts/agy-notify-hook.sh` and update/expand `tests/test_agy_notify_hook.py` in `/Users/voodootikigod/Projects/herdr-bartender`.\n\nExact requirements:\n1. CamelCase & SnakeCase JSON event resolution (`scripts/agy-notify-hook.sh` lines 7-12):\n   - When `AGY_HOOK_EVENT` and `$1` are empty, extract top-level camelCase `\"hookEventName\"` first from `$RAW_INPUT`, falling back to snake_case `\"hook_event_name\"`.\n2. Defensive stdout contracts for ALL Antigravity hook events (lines 13-21, 47-56):\n   - `PreToolUse`: set `OUTPUT_EMITTED=1`, write `'{\"decision\":\"allow\"}\\n'` to stdout, and `exit 0` immediately before any state, process, dismissal, or network work.\n   - `PostToolUse` | `SessionStart`: set `OUTPUT_EMITTED=1`, write `'{}\\n'` to stdout, and `exit 0` immediately before any state/network work.\n   - `PreInvocation` | `PostInvocation`: active events; `emit_lifecycle_response` writes `'{}\\n'`.\n   - `Stop` | `SessionEnd`: active events; `emit_lifecycle_response` writes `'{\"decision\":\"\"}\\n'`.\n   - Any other unknown event string: set `OUTPUT_EMITTED=1` and `exit 0` immediately with empty stdout and zero network calls.\n3. Standalone vs Herdr fail-open lifecycle state mapping (lines 684-1085):\n   - Pass `CANONICAL_PANE=\"${CANONICAL_PANE:-}\"` into the embedded Python block environment.\n   - Extract `prompt_title = sanitize_str(d.get('lastUserInput'), 120)` when `isinstance(d.get('lastUserInput'), str)` else `''`.\n   - `PreInvocation`: `state = 'Working'`, `title = prompt_title or 'Thinking...'`.\n   - `PostInvocation`: `state = 'Working'`, `title = prompt_title` (prevents mid-turn Working->Idle->Working flicker; also set bash no-Python fallback `FB_STATE='Working'` for `PostInvocation`).\n   - `SessionEnd`: `state = 'Ended'`, `title = ''` in BOTH Herdr fail-open and standalone modes, retiring `.vendor_active` / `.active` on confirmed HTTP 200/404/410.\n   - `Stop`:\n     - When `CANONICAL_PANE` is non-empty (Herdr pane fail-open fallback): keep `state = 'Ended'`, `title = ''`, and run the `.vendor_active` retirement block on HTTP 200/404/410 (so all Herdr fail-open handoff behavior stays identical!).\n     - When `CANONICAL_PANE` is empty (standalone `agy` CLI mode):\n       - If `d.get('fullyIdle') is False`: `state = 'Working'`, `title = prompt_title or 'Background task running...'`.\n       - Else if `d.get('terminationReason') == 'ERROR'` or `bool(d.get('error'))`: `state = 'Waiting'`, `err_val = d.get('error')`, `title = sanitize_str(err_val, 120) if isinstance(err_val, str) and sanitize_str(err_val, 120) else (prompt_title or 'Error')`.\n       - Else: `state = 'Done'`, `title = prompt_title` (and bash no-Python fallback `FB_STATE='Done'` when `CANONICAL_PANE` is empty).\n       - Standalone `.active` file retention on `Stop`: because standalone `Stop` is end-of-turn rather than process exit, run the non-terminal `.active` write/update block (line 867) on standalone `Stop` instead of the retirement block (line 970), while still reusing `PREV_VENDOR_SID` when `conversationId` is absent! Only `SessionEnd` (or Herdr fail-open `Stop` where `CANONICAL_PANE` is non-empty) retires `.vendor_active` / `.active` immediately.\n4. Update existing assertions in `tests/test_agy_notify_hook.py` that previously expected `PreToolUse -> ''`, `PostInvocation -> 'Idle'`, and standalone `Stop -> 'Ended'` (keeping all `HERDR_PANE_ID` fail-open `Stop -> 'Ended'` tests intact!), and add new tests for `PreToolUse` `{\"decision\":\"allow\"}`, `PostToolUse`/`SessionStart` `{}`, camelCase `hookEventName`, `lastUserInput` title extraction/sanitization, `PostInvocation` staying `Working`, standalone `Stop` (`Done` keeping `.active`, `fullyIdle=False -> Working`, `terminationReason='ERROR' -> Waiting`), and standalone `SessionEnd -> Ended` retiring `.active`. Run `npm run build` and `npm test` to confirm 100% green.",
+      "scope": [
+        "scripts/agy-notify-hook.sh",
+        "tests/test_agy_notify_hook.py"
+      ],
+      "rails": [
+        "package.json",
+        "scripts/run-tests-parallel.py",
+        "herdr_bartender/**",
+        "tests/support/**"
+      ],
+      "edges": [
+        { "to": "T3" }
+      ],
+      "tier": "mid",
+      "pool_hint": "claude"
+    },
+    {
+      "id": "T3",
+      "title": "First-party agy-notify-hook.sh installer, uninstaller, and health/config audit",
+      "body": "Add first-class deployment and health verification for `scripts/agy-notify-hook.sh` without altering vendor-hook allowlist invariants in `/Users/voodootikigod/Projects/herdr-bartender`.\n\nExact requirements:\n1. Preserve all vendor-hook invariants: DO NOT add `agy-notify-hook.sh` to `HOOK_NAMES` (`('claude-event-hook.sh', 'codex-notify-hook.sh')`), `vendor-hook-sha.json`, or `check_hook_integrity().hooks`.\n2. Create `herdr_bartender/agy_hook.py`:\n   - `AGY_HOOK_NAME = 'agy-notify-hook.sh'`; source path `repo_root() / 'scripts' / AGY_HOOK_NAME`.\n   - `install_agy_hook(hooks_dir: Optional[Path] = None) -> bool`: reads source bytes via `boundedio.read_regular_file`, validates syntax, and atomically installs/updates `hooks_dir / AGY_HOOK_NAME` with mode `0o755` (`hooks_fs.write_private_atomic` + `os.chmod(target, 0o755)` or `hooks_fs.atomic_replace_hook` when existing) when `hooks_dir` is an existing directory.\n   - `uninstall_agy_hook(hooks_dir: Optional[Path] = None) -> bool`: if `hooks_dir / AGY_HOOK_NAME` does not exist, return True; if it exists as a regular file whose bytes match `scripts/agy-notify-hook.sh` or contain `b'HERDR_PLUGIN_STATE_DIR'`, unlink it and return True; otherwise leave user-custom file untouched and return True.\n   - `verify_agy_hook_intact(hooks_dir: Optional[Path] = None) -> Tuple[bool, str]`: returns `(True, 'intact')` iff `hooks_dir / AGY_HOOK_NAME` is a regular executable file matching `scripts/agy-notify-hook.sh` byte-for-byte; otherwise `(False, reason)` where `reason` is `'hooks_dir_missing'`, `'missing'`, `'not_executable'`, or `'outdated_or_stub'`.\n   - `audit_agy_hooks_config(config_path: Optional[Path] = None) -> Tuple[str, ...]`: read-only inspection of `config_path` (default `Path(os.path.expanduser('~')) / '.gemini' / 'config' / 'hooks.json'`) via `boundedio.read_regular_file` (`max_bytes=262144`) and `jsonsafe.loads`; returns warning strings if `PreToolUse` contains any hook command referencing `agy-notify-hook.sh`. Never mutates user config.\n3. Wire into `herdr_bartender/hooks_install.py`, `herdr_bartender/hooks_integrity.py`, and `herdr_bartender/hooks.py`:\n   - In `install_hooks(state_dir, hooks_dir)`: AFTER `load_template_bytes()` succeeds, when `hook_files` is non-empty OR `(hooks_dir / AGY_HOOK_NAME).exists()`, also deploy `agy-notify-hook.sh` via `install_agy_hook(hooks_dir)` (keep returning `False` when `hooks_dir` does not exist or has neither vendor hooks nor an existing `agy-notify-hook.sh`, and never touch files when `load_template_bytes()` raises `OSError`!).\n   - In `uninstall_hooks(state_dir, hooks_dir)`: when `hooks_dir.is_dir()`, also call `uninstall_agy_hook(hooks_dir)`.\n   - Re-export `AGY_HOOK_NAME`, `install_agy_hook`, `uninstall_agy_hook`, `verify_agy_hook_intact`, and `audit_agy_hooks_config` from `herdr_bartender/hooks.py`.\n4. Add comprehensive unit tests in `tests/test_agy_hook_install.py` covering stub overwrite, idempotency, uninstall, `verify_agy_hook_intact` states, `audit_agy_hooks_config` detecting stale `PreToolUse` entries, and run `npm run build` and `npm test` to verify 100% green.",
+      "scope": [
+        "herdr_bartender/agy_hook.py",
+        "herdr_bartender/hooks_install.py",
+        "herdr_bartender/hooks_integrity.py",
+        "herdr_bartender/hooks.py",
+        "tests/test_agy_hook_install.py"
+      ],
+      "rails": [
+        "package.json",
+        "scripts/run-tests-parallel.py",
+        "scripts/agy-notify-hook.sh",
+        "tests/test_hooks_install.py",
+        "tests/test_hooks_integrity.py",
+        "tests/support/**"
+      ],
+      "edges": [
+        { "to": "T5" }
+      ],
+      "tier": "mid",
+      "pool_hint": "claude"
+    },
+    {
+      "id": "T4",
+      "title": "Herdr 0.9.5 pane.moved and pane.exited handlers and spool envelope replay",
+      "body": "Implement Herdr 0.9.5 `pane.moved` and `pane.exited` handlers and spool replay support in `/Users/voodootikigod/Projects/herdr-bartender` (note: CLI/manifest registration in `cli.py`, `intake.py`, and `herdr-plugin.toml` happens in T5 so `test_cli.py` stays green here!).\n\nExact requirements:\n1. Update `herdr_bartender/handlers/pane_close.py`:\n   - Define `PANE_EXITED = 'pane.exited'` and `handle_pane_exited(event_data: dict, context: dict, bridge_url: Optional[str] = None, arrival_ns: Optional[int] = None, spool_generation: Optional[int] = None) -> None`.\n   - Share the close/tombstone/marker-removal/vendor-cleanup logic of `handle_pane_closed`, updating each returned `CloseTarget`'s `payload['event']` (and `record['desired_payload']['event']`) to `'pane.exited'`.\n2. Create `herdr_bartender/handlers/pane_move.py`:\n   - Define `PANE_MOVED = 'pane.moved'` and `stage_pane_move(data: dict, event_data: Mapping, context: Mapping, arr_ns: int, arr_time: Optional[float] = None, *, herdr_alive: Callable[[], bool] = memoised_herdr_alive, spool_generation: Optional[int] = None) -> Tuple[Tuple[Target, ...], Tuple[Tuple[str, dict], ...], bool]` plus `handle_pane_moved(...)`.\n   - Herdr 0.9.5 `pane.moved` schema: `event_data` has `'previous_pane_id'`, `'previous_workspace_id'`, `'previous_tab_id'`, and `'pane'` (`PaneInfo` dict with `'pane_id'`, `'workspace_id'`, `'tab_id'`, `'agent'`, `'display_agent'`, `'agent_status'`, `'cwd'`, `'foreground_cwd'`, `'title'`, `'label'`, `'terminal_title_stripped'`, `'focused'`).\n   - Resolve old canonical pane via `resolve_identity({'pane_id': event_data.get('previous_pane_id'), 'workspace_id': event_data.get('previous_workspace_id')}, {}, env={})` and destination canonical pane via `resolve_identity(pane_dict, context)` when `isinstance(event_data.get('pane'), dict)`.\n   - Under one Step A lock hold:\n     a) Inspect any live session currently cached for `old_identity.canonical_pane` to capture fallback `(old_raw_agent, old_cwd, old_title)`.\n     b) If `old_identity` is valid and (`dest_identity is None` or `old_identity.canonical_pane != dest_identity.canonical_pane`), stage `stage_pane_close_result` on `old_identity.canonical_pane` and call `remove_pane_marker(old_identity.canonical_pane)` when `recorded` is True.\n     c) If `dest_identity` is valid and `pane_dict` has an active agent (`pane_dict.get('agent')` non-empty, or `old_raw_agent` non-empty and `pane_dict.get('agent_status') in ('working', 'blocked', 'done', 'idle')`), call `stage_status` onto `dest_identity` with synthesized status dict carrying `agent = pane_dict.get('agent') or old_raw_agent`, `display_agent = pane_dict.get('display_agent')`, `agent_status = pane_dict.get('agent_status')`, `cwd = pane_dict.get('foreground_cwd') or pane_dict.get('cwd') or old_cwd`, `title = pane_dict.get('title') or pane_dict.get('label') or pane_dict.get('terminal_title_stripped') or old_title`, `tab_id = pane_dict.get('tab_id')`, `workspace_id = dest_identity.workspace_id`, `can_export_orphans=True`.\n3. Update `herdr_bartender/envelopes.py`, `herdr_bartender/spool.py`, and `herdr_bartender/spool_overflow.py`:\n   - Accept `'pane.moved'` and `'pane.exited'` in `validate_envelope` (`SUPPORTED_ENVELOPE_EVENTS = EVENT_NAMES | frozenset({'pane.moved', 'pane.exited'})`), treat `'pane.exited'` as a close envelope in `CLOSE_EVENTS` and `spool_overflow`, and handle both `'pane.exited'` and `'pane.moved'` in `spool.apply_envelope_locked`.\n4. Export `PANE_EXITED`, `PANE_MOVED`, `handle_pane_exited`, `handle_pane_moved`, and `stage_pane_move` from `herdr_bartender/handlers/__init__.py`.\n5. Add comprehensive unit tests in `tests/test_pane_move_exit.py` covering cross-workspace moves, same-pane-id moves, non-agent pane moves, `pane.exited`, and spool contention replay. Run `npm run build` and `npm test` to confirm 100% green.",
+      "scope": [
+        "herdr_bartender/envelopes.py",
+        "herdr_bartender/spool.py",
+        "herdr_bartender/spool_overflow.py",
+        "herdr_bartender/handlers/__init__.py",
+        "herdr_bartender/handlers/pane_close.py",
+        "herdr_bartender/handlers/pane_move.py",
+        "tests/test_pane_move_exit.py"
+      ],
+      "rails": [
+        "package.json",
+        "scripts/run-tests-parallel.py",
+        "herdr-plugin.toml",
+        "herdr_bartender/intake.py",
+        "herdr_bartender/staging.py",
+        "herdr_bartender/cli.py",
+        "tests/test_cli.py",
+        "tests/support/**"
+      ],
+      "edges": [
+        { "to": "T5" }
+      ],
+      "tier": "mid",
+      "pool_hint": "claude"
+    },
+    {
+      "id": "T5",
+      "title": "Local snapshot self-healing, flap-tolerant remote SSH watcher (Option R1), and CLI/manifest wiring",
+      "body": "Implement local Herdr snapshot self-healing, the Option R1 multi-endpoint remote SSH watcher, and atomic CLI/manifest event registration & diagnostics in `/Users/voodootikigod/Projects/herdr-bartender`.\n\nExact requirements:\n1. Create `herdr_bartender/herdr_client.py` (strictly lock-free: assert `not runtime.IN_CRITICAL_SECTION` before any subprocess or file read):\n   - `@dataclass(frozen=True) class RemoteEndpoint`: `id: str`, `host: str` (via `sanitize_hostname(label or target or id)`), `machine_arg: str` (`target or id`), `label: str`.\n   - `discover_enabled_remotes(xdg_state_home: Optional[Path] = None, home: Optional[Path] = None) -> Tuple[RemoteEndpoint, ...]`: reads `${XDG_STATE_HOME:-${HOME}/.local/state}/herdr/client/endpoints.json` via `boundedio.read_regular_file(path, 262144)`. Returns `()` with ZERO subprocess spawns when the file does not exist (keeping all existing SandboxTestCase runs fast and idle-exiting!). Parses `ssh` list entries where `entry.get('enabled') is True` and `id`/`target` is a safe non-empty string not starting with `'-'`.\n   - `fetch_herdr_snapshot(machine: Optional[str] = None, timeout: float = 2.5) -> Optional[dict]`: runs `['herdr', 'api', 'snapshot']` (or `['herdr', '--machine', machine, 'api', 'snapshot']` when `machine` is set and does not start with `'-'`), `stdin=subprocess.DEVNULL`, `capture_output=True`, `text=True`, `timeout=timeout`, `env={**os.environ, 'LC_ALL': 'C', 'LANG': 'C'}`. Returns `parsed['result']['snapshot']` ONLY when `returncode == 0` and `result.snapshot` is a `dict` whose `'panes'` is a `list` (returns `None` on empty stdout as in `tests/support/shims/herdr`, timeout, non-zero exit, or invalid JSON).\n2. Create `herdr_bartender/remote_watcher.py` (pure under-lock cache sync functions consuming pre-fetched snapshots):\n   - `REMOTE_UNREACHABLE_GRACE_SECONDS = 300.0`.\n   - `sync_local_snapshot(data: dict, snapshot: Optional[dict], now_wall: float, now_ns: int) -> bool`: returns False when `snapshot is None`. Maps `snapshot['panes']` by canonical pane ID (+ workspace labels from `snapshot.get('workspaces', [])`). For each cached local live session (`is_live(rec)` and `is_local_host(rec.get('host'), local_host)` and not `rec.get('salvaged')`):\n     a) If its `pane_id` is absent from `snapshot['panes']` and `int(rec.get('admitted_at_ns') or 0) <= now_ns`, stage `stage_pane_close_result` on `pane_id` and remove its pane marker.\n     b) If present in `snapshot['panes']`: compute fresh `cwd = sanitize_cwd(p.get('foreground_cwd') or p.get('cwd') or '')`, fresh `title = sanitize_title(p.get('title') or p.get('label') or ws_labels.get(ws_id) or p.get('terminal_title_stripped') or '')`, fresh `tab_id = container_id(p, 'tab_id')`. If `p.get('agent_status') == 'idle'` and not `sanitize_agent(p.get('agent'))`, stage `stage_status` to transition to Ended. Otherwise if non-empty `cwd` differs, non-empty `title` differs, non-empty `tab_id` differs, or mapped `STATUS_MAP.get(p.get('agent_status'))` differs on the live session, update the fields, increment `seq`, rebuild `desired_payload` (`state`, `agent`, `session_id`, `title`, `cwd`, `terminal='Herdr'`, `event='snapshot.sync'`, `seq`), and mark `delivery_status = 'in_flight'`, `delivery_attempts = 0`, `next_retry_at = None`.\n   - `sync_remote_endpoint(data: dict, endpoint: RemoteEndpoint, snapshot: Optional[dict], now_wall: float, now_ns: int, herdr_alive: Callable[[], bool] = lambda: True) -> bool`:\n     a) When `snapshot is None`: record `since = data.setdefault('remote_unreachable_since', {}).setdefault(endpoint.host, now_wall)`. If `now_wall - float(since) <= REMOTE_UNREACHABLE_GRACE_SECONDS`, return False (hold cards steady across transient SSH/Tailscale blips!). Once `> REMOTE_UNREACHABLE_GRACE_SECONDS`, expire every live session with `rec.get('host') == endpoint.host` via `lifecycle.expire_session(sid, rec, now_wall, 'remote_unreachable')` and return `bool(expired)`.\n     b) When `snapshot` is a dict: `data.get('remote_unreachable_since', {}).pop(endpoint.host, None)`. Track active remote panes (`sanitize_agent(p.get('agent'))` non-empty and `p.get('agent_status') in STATUS_MAP`): compute desired mapped state, `agent_name = format_agent_name(p.get('agent'), remote_host=endpoint.host, display_agent=p.get('display_agent'))`, `cwd`, `title`. Only call `stage_status` (with `'host': endpoint.host`, `cwd`, `title`, `tab_id`, `display_agent`) when the session is not yet live in `data['sessions']` OR `(rec.get('desired_state'), rec.get('agent'), rec.get('title'), rec.get('cwd')) != (mapped_state, agent_name, title, cwd)` — guaranteeing ZERO `seq` bumps and ZERO HTTP POST churn when remote panes are unchanged across polls! For any cached live session with `rec.get('host') == endpoint.host` whose `pane_id` is absent from active remote panes, stage `stage_pane_close_result` (with `'host': endpoint.host`).\n3. Integrate into `herdr_bartender/reconciler.py`, `herdr_bartender/background.py`, and `herdr_bartender/schedule.py`:\n   - Throttle local snapshot fetches to at most once every `10.0`s (only when `snap.herdr_alive` and local live sessions exist) and remote snapshot fetches to every `REMOTE_POLL_SECONDS = 3.0`s (only when `snap.herdr_alive` and `discover_enabled_remotes()` is non-empty). Fetch ALL snapshots BEFORE acquiring `cache_mgr`, then apply `sync_local_snapshot` and `sync_remote_endpoint` under the lock before `deliver_due_sessions`.\n   - Also guard `_heartbeat` in `background.py` and `cache_view` in `schedule.py` so `heartbeat_panes` only includes local sessions (`is_local_host(rec.get('host'), local_host)`).\n   - When `discover_enabled_remotes()` returns `()` (empty), `_idle_now` and `next_wake` MUST behave 100% identically to before so `run_reconcile_background()` idles out cleanly in existing unit tests! When `discover_enabled_remotes()` is non-empty and `snap.herdr_alive` is True, `_idle_now` returns `False` and `sleep_until` wakes within `REMOTE_POLL_SECONDS` (`3.0`s).\n4. Atomic event & diagnostics wiring across `herdr-plugin.toml`, `herdr_bartender/intake.py`, and `herdr_bartender/cli.py`:\n   - Add `PANE_MOVED = 'pane.moved'` and `PANE_EXITED = 'pane.exited'` to `intake.EVENT_NAMES`, append both `[[events]]` blocks to `herdr-plugin.toml`, and register both in `cli.EVENT_HANDLERS` (`handle_pane_moved`, `handle_pane_exited`) so `tests/test_cli.py` (`set(cli.EVENT_HANDLERS) == set(intake.EVENT_NAMES) == manifest_events`) passes cleanly!\n   - Add `--install-agy-hook` CLI flag in `cli.py`, include `agy_hook_intact` / `agy_hook_status` / `agy_hooks_json_warnings` in `--health`, and surface `agy` warnings + Bartender `/health` session-count drift in `--status` **after** the `HOOK_NEEDS_REVIEW` first line.\n5. Add thorough unit tests in `tests/test_remote_watcher.py` and `tests/test_snapshot_sync.py`. Run `npm run build` and `npm test` to confirm 100% green.",
+      "scope": [
+        "herdr-plugin.toml",
+        "herdr_bartender/intake.py",
+        "herdr_bartender/herdr_client.py",
+        "herdr_bartender/remote_watcher.py",
+        "herdr_bartender/background.py",
+        "herdr_bartender/reconciler.py",
+        "herdr_bartender/schedule.py",
+        "herdr_bartender/cli.py",
+        "tests/test_remote_watcher.py",
+        "tests/test_snapshot_sync.py"
+      ],
+      "rails": [
+        "package.json",
+        "scripts/run-tests-parallel.py",
+        "herdr_bartender/multihost.py",
+        "herdr_bartender/staging.py",
+        "herdr_bartender/agy_hook.py",
+        "herdr_bartender/handlers/**",
+        "tests/test_cli.py",
+        "tests/test_reconciler.py",
+        "tests/test_hooks_integrity.py",
+        "tests/support/**"
+      ],
+      "edges": [],
+      "tier": "mid",
+      "pool_hint": "claude"
+    }
+  ]
+}
