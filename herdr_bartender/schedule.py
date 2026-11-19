@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 from typing import Iterable, List, Mapping, Optional, Tuple
 
 from .delivery_state import LEASE_GRACE_SECONDS, foreign_lease_open
 from .dismissals import earliest_due as dismissal_due
+from .intake import resolve_host
 from .lifecycle import (
     HERDR_DEAD_EXPIRY_SECONDS,
     ORPHAN_HORIZON_SECONDS,
@@ -32,6 +34,8 @@ from .lifecycle import (
     retry_due_at,
     undelivered,
 )
+from .multihost import is_local_host
+from .remote_watcher import REMOTE_UNREACHABLE_GRACE_SECONDS
 from .sender.compensation import next_compensation_wait
 from .snapshot import Instance
 
@@ -125,10 +129,21 @@ def _root_times(data: Mapping, now: float, herdr_alive: bool = True) -> List[flo
     dismissal = dismissal_due(data.get("dismissed_vendor_uuids"), now)
     if dismissal is not None:
         times.append(dismissal)
+    unreachable = data.get("remote_unreachable_since")
+    if isinstance(unreachable, Mapping):
+        for since_val in unreachable.values():
+            since = number(since_val)
+            if since is not None and math.isfinite(since):
+                unreach_expiry = _upcoming(
+                    since + REMOTE_UNREACHABLE_GRACE_SECONDS + EXPIRY_SLACK_SECONDS, now
+                )
+                if unreach_expiry is not None:
+                    times.append(unreach_expiry)
     return times
 
 
 def cache_view(data: Mapping, now: float, herdr_alive: bool) -> CacheView:
+    local_host = resolve_host(data.get("host"))
     records = [r for r in (data.get("sessions") or {}).values() if isinstance(r, dict)]
     times = _session_times(records, herdr_alive, now) + _root_times(data, now, herdr_alive)
     owed = bool(data.get("pending_compensations") or (data.get("pending_vendor_cleanups") and herdr_alive)
@@ -136,7 +151,11 @@ def cache_view(data: Mapping, now: float, herdr_alive: bool) -> CacheView:
     return CacheView(
         sessions=len(records),
         exhausted=sum(1 for r in records if r.get("delivery_status") == "retryable_exhausted"),
-        heartbeat_panes=tuple(r["pane_id"] for r in records if heartbeat_eligible(r) and r.get("pane_id")),
+        heartbeat_panes=tuple(
+            r["pane_id"]
+            for r in records
+            if heartbeat_eligible(r) and r.get("pane_id") and is_local_host(r.get("host"), local_host)
+        ),
         owed=owed,
         next_due=min(times) if times else None,
     )
